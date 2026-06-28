@@ -67,10 +67,16 @@ backends are alternative `IBackend` impls behind aliases.
 - **S0 — portable core (this session).** array + CSR + `IBackend` + pure-Clojure CPU
   reference backend + public API + backend contract suite. WGSL shaders (tiled GEMM,
   CSR SpMV, AXPY, tree reduce) + `IGpuDevice` port + dispatch plan. Tests green.
-- **S1 — live WGSL backend.** A `WgslBackend` deftype that satisfies `IBackend` by
-  dispatching the shaders through an injected device; a cljs host over `navigator.gpu`;
-  run the contract suite on a real GPU (`WgslBackend ≡ CpuBackend`). Host-fallback the
-  not-yet-accelerated ops so it stays complete.
+- **S1 — live WGSL backend (this session).** The **full IBackend contract** (axpy,
+  scal, dot, nrm2, ewise add/sub/mul, reduce sum/max/min, gemv, tiled gemm, csr spmv)
+  is **verified on real Apple M4 Metal** (wgpu via Deno WebGPU) ≡ the CPU reference —
+  `verify/metal_contract.js`, 13/13. The complete shader set lives in `num.wgsl`; the
+  `WgslBackend` deftype (`num.wgsl-backend`) dispatches them through the injected
+  `IGpuDevice` and is compile-checked on the JVM. **Note (sync vs async):** a
+  *synchronous* WgslBackend needs a device with BLOCKING readback (native wgpu binding
+  / vendor backend); the browser/Deno WebGPU path is async, which the JS harness uses.
+  Remaining: a JVM Panama→wgpu-native `IGpuDevice` (blocking) to run the Clojure
+  contract on-GPU, or an async IBackend variant for the cljs host.
 - **S2 — vendor fast paths.** `:cuda` (cuBLAS/cuSPARSE) and `:metal` (MPS) behind the
   same protocol + contract; benchmark vs WGSL.
 - **S3 — consumer wiring.** Inject a num-clj backend into nagare-clj's `linsolve`

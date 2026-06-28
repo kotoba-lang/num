@@ -133,12 +133,89 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   if (lid.x == 0u) { partials[wid.x] = sdata[0]; }
 }")
 
+(def scal-wgsl
+  "Level-1 SCAL: x ← αx, in place."
+  "
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<uniform>             alpha: f32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= arrayLength(&x)) { return; }
+  x[i] = alpha * x[i];
+}")
+
+(def ewise-wgsl
+  "Elementwise z = op(x,y); op ∈ {0:add 1:sub 2:mul 3:div} via a uniform."
+  "
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read>       y: array<f32>;
+@group(0) @binding(2) var<storage, read_write> z: array<f32>;
+@group(0) @binding(3) var<uniform>             op: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= arrayLength(&z)) { return; }
+  let a = x[i]; let b = y[i]; var r: f32 = 0.0;
+  switch op { case 0u { r = a + b; } case 1u { r = a - b; }
+              case 2u { r = a * b; } case 3u { r = a / b; } default { r = 0.0; } }
+  z[i] = r;
+}")
+
+(def reduce-wgsl
+  "Tree reduction with op ∈ {0:sum 1:max 2:min} via a uniform; each 256-wide
+  workgroup writes its partial to `partials[wid]`, the host combines partials with
+  the same op. `dot` = reduce(sum, ewise(mul,x,y)); `nrm2` = √(dot(x,x))."
+  "
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> partials: array<f32>;
+@group(0) @binding(2) var<uniform>             op: u32;
+var<workgroup> s: array<f32, 256>;
+fn cmb(a: f32, b: f32, op: u32) -> f32 {
+  if (op == 1u) { return max(a, b); } if (op == 2u) { return min(a, b); } return a + b;
+}
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>,
+        @builtin(local_invocation_id)  l: vec3<u32>,
+        @builtin(workgroup_id)         w: vec3<u32>) {
+  let ident = select(select(3.4e38, -3.4e38, op == 1u), 0.0, op == 0u);
+  s[l.x] = select(ident, x[g.x], g.x < arrayLength(&x));
+  workgroupBarrier();
+  var d: u32 = 128u;
+  loop { if (d == 0u) { break; }
+         if (l.x < d) { s[l.x] = cmb(s[l.x], s[l.x + d], op); }
+         workgroupBarrier(); d = d / 2u; }
+  if (l.x == 0u) { partials[w.x] = s[0]; }
+}")
+
+(def gemv-wgsl
+  "Dense GEMV: y = A·x, A is m×n row-major. One thread per row."
+  "
+@group(0) @binding(0) var<storage, read>       A: array<f32>;
+@group(0) @binding(1) var<storage, read>       x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform>             d: vec2<u32>;   // (m, n)
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; let m = d.x; let n = d.y;
+  if (i >= m) { return; }
+  var s: f32 = 0.0;
+  for (var j: u32 = 0u; j < n; j = j + 1u) { s = s + A[i * n + j] * x[j]; }
+  y[i] = s;
+}")
+
 (def shaders
-  "All compute kernels by op keyword — the menu a WgslBackend compiles on init."
+  "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
+  Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
+  (axpy/scal/dot/nrm2/ewise/reduce/gemv/gemm/spmv) reproduces the CPU reference —
+  see verify/metal_contract.js."
   {:axpy   axpy-wgsl
-   :spmv   spmv-csr-wgsl
+   :scal   scal-wgsl
+   :ewise  ewise-wgsl
+   :reduce reduce-wgsl
+   :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl
-   :reduce reduce-sum-wgsl})
+   :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------
 ;; IBackend ⇄ shader mapping (what a host-side WgslBackend wires up)
