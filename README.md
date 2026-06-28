@@ -86,5 +86,13 @@ wiring a live device (browser WebGPU or a native wgpu host) and the vendor-nativ
 backends are the next stages — see `docs/adr/0001-architecture.md`.
 
 ```bash
-clojure -X:test     # CPU backend satisfies the full IBackend contract
+clojure -X:test                          # CPU backend satisfies the full IBackend contract (JVM)
+clojure -M:cljs && node target/cljs-verify.js   # PROOF: the same .cljc core runs under ClojureScript
 ```
+
+**Portability is proven, not just claimed.** The `.cljc` core (CPU backend, array/CSR
+types, the full op contract) compiles to JS via ClojureScript and runs green on node —
+`cljs CPU contract: 14 passed, 0 failed`. And the WGSL backend's kernels are verified on
+real **Apple M4 Metal** (`verify/metal_contract.js`, 13/13), including a Jacobi-PCG
+Poisson solve (`verify/metal_pcg.js`). So num-clj genuinely spans pure-Clojure → cljs →
+GPU from one source.

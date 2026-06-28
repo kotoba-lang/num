@@ -16,4 +16,12 @@
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
          :main-opts ["-m" "cognitect.test-runner"]
-         :exec-fn cognitect.test-runner.api/test}}}
+         :exec-fn cognitect.test-runner.api/test}
+  ;; PORTABILITY PROOF: compile the CPU contract to JS and run it on node, proving
+  ;; the .cljc core actually runs under ClojureScript (not just the JVM).
+  ;;   clojure -M:cljs && node target/cljs-verify.js   →  "cljs CPU contract: 14 passed, 0 failed"
+  :cljs {:extra-paths ["test"]
+         :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
+         :main-opts ["-m" "cljs.main"
+                     "-co" "{:optimizations :simple :target :nodejs :main num.cljs-verify :output-to \"target/cljs-verify.js\"}"
+                     "-c" "num.cljs-verify"]}}}

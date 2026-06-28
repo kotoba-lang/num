@@ -2,3 +2,5 @@
 /.clj-kondo/
 /target/
 .DS_Store
+.cljs_node_repl/
+/out/
