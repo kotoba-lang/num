@@ -82,7 +82,11 @@ backends are alternative `IBackend` impls behind aliases.
 - **S3 — consumer wiring.** Inject a num-clj backend into nagare-clj's `linsolve`
   (PCG/BiCGStab → device `SpMV`/`AXPY`/`dot`) and kudaki-clj's element/assembly loops,
   so the existing portable solvers run on GPU unchanged. Register under the `cae-solver`
-  contract as accelerated backends.
+  contract as accelerated backends. **Demonstrated on Metal** (`verify/metal_pcg.js`): a
+  Jacobi-preconditioned CG — the same Krylov loop nagare's `linsolve` runs — solves a
+  2-D Poisson system (N=1024) **entirely with num-clj's GPU kernels on Apple M4**,
+  converging in 64 iterations to ‖r‖/‖b‖ ≈ 9e-6 ≡ the analytic solution. Remaining: the
+  Clojure-side injection once a blocking native `IGpuDevice` (S1 tail) exists.
 - **S4 — breadth.** f16/bf16, batched GEMM, more sparse formats (ELL/blocked), fused
   kernels, a small JIT for elementwise chains.
 
