@@ -1,0 +1,99 @@
+# ADR-0001 — num-clj architecture: portable BLAS/sparse contract + injected GPU backends
+
+- Status: Accepted
+- Date: 2026-06-28
+- Context tags: gpu, compute, blas, sparse, webgpu, wgsl, portable-cljc, backend-dispatch
+
+## Decision
+
+Build num-clj as a **BLAS-level dense + sparse** numerical library whose *core* (array
+type, op protocol, public API, a pure-Clojure CPU reference backend) is
+**zero-dependency, all `.cljc`**, and whose GPU acceleration is delivered by **backends
+injected behind a single protocol** `num.protocol/IBackend`. The **portable-primary** GPU
+backend is **WGSL compute via WebGPU/wgpu** (one shader → Metal/Vulkan/DX12/WebGPU);
+**vendor-native** backends (cuBLAS / Metal Performance Shaders / rocBLAS) are optional
+fast paths behind the same protocol.
+
+## Why this shape
+
+- **Portability is the franchise.** kudaki-clj / nagare-clj are valuable because the
+  *same* `.cljc` kernel runs on JVM / SCI / cljs / GraalVM / WASM. A GPU library that
+  forced a native dep would break that. So native code lives ONLY in injected backends;
+  the core and the CPU reference stay pure and portable, and a host with no GPU still
+  runs everything (slowly) on the CPU backend.
+- **One seam, many backends** mirrors the org: `MemStore ‖ DatomicStore`, the
+  `cae-solver` `[:solver :kind]` dispatch, the actors' injected Store/Advisor. The seam
+  here is `IBackend`; a `handle` is an opaque buffer per backend.
+- **WGSL-first reaches every GPU without three kernels.** wgpu compiles one WGSL compute
+  shader to MSL (Apple), SPIR-V (Vulkan → AMD/ROCm-class, NVIDIA, Intel), DXIL (D3D12),
+  and WebGPU (browser). The driver does per-GPU codegen/scheduling, so "optimized for
+  each GPU" comes from writing the kernel *well once* (tiling, coalescing), not from
+  vendor lock-in. Vendor-native backends exist for the last increment of throughput.
+- **BLAS-level + sparse is the right scope** for the consumers: nagare/kudaki need
+  `SpMV` + `AXPY` + `dot` (Krylov) and dense `GEMM`/`GEMV` (element/operator kernels).
+  Not a full autodiff tensor framework — that is a different, larger library.
+
+## Module boundaries
+
+```
+num.protocol  IBackend — the seam (alloc/copy, level-1, ewise/reduce, gemv/gemm, spmv)
+num.array     NDArray {:backend :handle :shape} — the value users hold
+num.sparse    CSR (host structure; backends upload indices on first spmv)
+num.cpu       CpuBackend — pure .cljc over double-array; the ORACLE + fallback
+num.core      public API; reads operands' backend, dispatches through IBackend
+num.wgsl      WGSL compute shaders + IGpuDevice host port + IBackend⇄shader plan
+```
+
+The invariant: **the CPU backend is the reference oracle**, and the backend **contract
+suite** (`num.contract`) asserts any GPU backend reproduces it to f32 tolerance —
+`WgslBackend ≡ CpuBackend`, exactly like `MemStore ≡ DatomicStore`.
+
+## Backends
+
+| kind | mechanism | host | role |
+|---|---|---|---|
+| `:cpu` | pure Clojure / `double-array` | any | reference oracle + fallback |
+| `:wgsl` | WGSL compute via wgpu/WebGPU (host-injected `IGpuDevice`) | browser (cljs) / native wgpu | **portable primary** |
+| `:cuda` | cuBLAS / cuSPARSE via Panama or JCuda | JVM + NVIDIA | fast path |
+| `:metal` | Metal Performance Shaders via FFM | JVM + Apple | fast path |
+| `:rocm` | rocBLAS / hipSPARSE via Panama | JVM + AMD | fast path |
+
+num-clj ships no native code: `:wgsl` execution is the host-injected `IGpuDevice` port
+(browser fills it from `navigator.gpu`; a native host from a wgpu binding); the vendor
+backends are alternative `IBackend` impls behind aliases.
+
+## Staged roadmap (multi-session)
+
+- **S0 — portable core (this session).** array + CSR + `IBackend` + pure-Clojure CPU
+  reference backend + public API + backend contract suite. WGSL shaders (tiled GEMM,
+  CSR SpMV, AXPY, tree reduce) + `IGpuDevice` port + dispatch plan. Tests green.
+- **S1 — live WGSL backend.** A `WgslBackend` deftype that satisfies `IBackend` by
+  dispatching the shaders through an injected device; a cljs host over `navigator.gpu`;
+  run the contract suite on a real GPU (`WgslBackend ≡ CpuBackend`). Host-fallback the
+  not-yet-accelerated ops so it stays complete.
+- **S2 — vendor fast paths.** `:cuda` (cuBLAS/cuSPARSE) and `:metal` (MPS) behind the
+  same protocol + contract; benchmark vs WGSL.
+- **S3 — consumer wiring.** Inject a num-clj backend into nagare-clj's `linsolve`
+  (PCG/BiCGStab → device `SpMV`/`AXPY`/`dot`) and kudaki-clj's element/assembly loops,
+  so the existing portable solvers run on GPU unchanged. Register under the `cae-solver`
+  contract as accelerated backends.
+- **S4 — breadth.** f16/bf16, batched GEMM, more sparse formats (ELL/blocked), fused
+  kernels, a small JIT for elementwise chains.
+
+## Consequences
+
+- The core is provably portable (a portability-guard test, like kudaki/nagare, can lint
+  the kernel namespaces); GPU specifics never leak into it.
+- A program written today on `:cpu` runs unchanged on a GPU tomorrow — caller code names
+  no vendor.
+- num-clj becomes the shared GPU substrate the CAE solvers (and any other com-junkawasaki
+  numerics) accelerate through, instead of each growing its own native path.
+
+## Rejected alternatives
+
+- **A single vendor backend (CUDA-only).** Locks out Apple/AMD/browser and breaks WASM
+  portability; WGSL-first reaches all of them from one kernel.
+- **A full autodiff tensor framework (JAX-like).** Larger and orthogonal; the consumers
+  need BLAS + sparse, not reverse-mode AD. Can layer on later.
+- **Native code in the core.** Would forfeit the cljs/WASM portability that is the
+  reason the sibling solvers exist. Native lives only in injected backends.
