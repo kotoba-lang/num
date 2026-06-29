@@ -1,5 +1,7 @@
 # num-clj (数)
 
+[![CI](https://github.com/kotoba-lang/num/actions/workflows/ci.yml/badge.svg)](https://github.com/kotoba-lang/num/actions/workflows/ci.yml)
+
 A **GPU-accelerated numerical compute library** for Clojure — BLAS-level dense and
 sparse linear algebra (the NumPy/cuBLAS layer) with a **portable contract + injected
 backends** so the *same* program runs on a pure-Clojure CPU, a WebGPU compute pipeline
