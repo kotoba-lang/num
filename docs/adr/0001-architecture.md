@@ -67,16 +67,25 @@ backends are alternative `IBackend` impls behind aliases.
 - **S0 — portable core (this session).** array + CSR + `IBackend` + pure-Clojure CPU
   reference backend + public API + backend contract suite. WGSL shaders (tiled GEMM,
   CSR SpMV, AXPY, tree reduce) + `IGpuDevice` port + dispatch plan. Tests green.
-- **S1 — live WGSL backend (this session).** The **full IBackend contract** (axpy,
-  scal, dot, nrm2, ewise add/sub/mul, reduce sum/max/min, gemv, tiled gemm, csr spmv)
-  is **verified on real Apple M4 Metal** (wgpu via Deno WebGPU) ≡ the CPU reference —
-  `verify/metal_contract.js`, 13/13. The complete shader set lives in `num.wgsl`; the
+- **S1 — live WGSL backend.** The **full IBackend contract** (axpy, scal, dot, nrm2,
+  ewise add/sub/mul, reduce sum/max/min, gemv, tiled gemm, csr spmv) is **verified on
+  real Apple M4 Metal** (wgpu via Deno WebGPU) ≡ the CPU reference — `verify/
+  metal_contract.js`, 13/13. The complete shader set lives in `num.wgsl`; the
   `WgslBackend` deftype (`num.wgsl-backend`) dispatches them through the injected
   `IGpuDevice` and is compile-checked on the JVM. **Note (sync vs async):** a
   *synchronous* WgslBackend needs a device with BLOCKING readback (native wgpu binding
-  / vendor backend); the browser/Deno WebGPU path is async, which the JS harness uses.
-  Remaining: a JVM Panama→wgpu-native `IGpuDevice` (blocking) to run the Clojure
-  contract on-GPU, or an async IBackend variant for the cljs host.
+  / vendor backend); the browser/Deno WebGPU path is async, which the JS harness
+  originally used standalone.
+  **Update (ADR-2607051400 §Phase 2 — the async IBackend variant is now real, not
+  remaining):** `num.deno-gpu` implements a live `IGpuDevice` over Deno's native
+  `navigator.gpu`, plus `WgslBackendAsync` — an `IBackend` that dispatches `num.core`'s
+  ops through it. Verified on real Apple M1 Max Metal, cross-checked against `num.cpu`'s
+  oracle THROUGH `num.core`/`num.array` (not a standalone JS harness this time):
+  `clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs` →
+  `Deno WgslBackendAsync ≡ CPU oracle: 14 passed, 0 failed`. Still remaining: a JVM
+  Panama→wgpu-native `IGpuDevice` (blocking) so the *synchronous* `WgslBackend` can run
+  the Clojure contract on-GPU from the JVM — the async/cljs half of this line item is
+  done, the JVM/native-blocking half is not.
 - **S2 — vendor fast paths.** `:cuda` (cuBLAS/cuSPARSE) and `:metal` (MPS) behind the
   same protocol + contract; benchmark vs WGSL.
 - **S3 — consumer wiring.** Inject a num-clj backend into nagare-clj's `linsolve`

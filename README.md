@@ -152,23 +152,88 @@ without leaving the device) is **Phase 2** work per ADR-2607051400, not this pas
   currently only exercises `num.contract` against `num.cpu`, not `num.tensor`; that
   wiring wasn't extended in this pass).
 
+## Live GPU backend (Deno + WebGPU → Metal, ADR-2607051400 §Phase 2)
+
+`num.deno-gpu` promotes `verify/metal_contract.js`'s raw JS harness into a REAL
+`num.wgsl/IGpuDevice` + `num.protocol/IBackend` implementation — `num.core`'s ops
+(`axpy!`/`scal!`/`add`/`sub`/`mul`/`div`/`sum`/`amax`/`amin`/`dot`/`nrm2`/`matvec`/
+`matmul`/`spmv`) now dispatch through the SAME WGSL kernels on real GPU hardware from
+real Clojure code (ClojureScript compiled for Deno), not only from a standalone script.
+
+```clojure
+(require '[num.array :as a] '[num.core :as nm] '[num.deno-gpu :as dg])
+(-> (dg/gpu-backend)                              ; async: device negotiation is Promise-based
+    (.then (fn [gpu]
+             (let [x (a/from-vec gpu [1 2 3] [3])
+                   y (a/from-vec gpu [4 5 6] [3])]
+               (.then (nm/dot x y) println)))))   ; host-value ops (dot/nrm2/sum/amax/amin,
+                                                   ; arr/->vec) return a JS Promise on this
+                                                   ; backend — see num.deno-gpu docstring
+```
+
+**Sync vs. async, resolved (not hand-waved):** a single WebGPU queue processes
+submitted commands strictly in order, so `-alloc`/`-copy-from-host`/`-axpy`/`-scal`/
+`-ewise`/`-gemv`/`-gemm`/`-spmv` are fully synchronous end-to-end — dispatching
+`axpy!`/`scal!`/`add`/`sub`/`mul`/`div`/`matvec`/`matmul`/`spmv` through the Deno GPU
+backend behaves exactly like a fully-synchronous backend would. Only the four ops that
+read a value back to the host (`-copy-to-host`/`-reduce`/`-dot`/`-nrm2` — i.e.
+`arr/->vec`, `sum`, `amax`, `amin`, `dot`, `nrm2`) are unavoidably async (`GPUBuffer.
+mapAsync`) and return a JS `Promise` instead of an immediate value — a deliberate,
+documented deviation from `IBackend`'s normal contract for this one host. Native
+ClojureScript `async`/`await` (`^:async`/`js-await`) was tried first and confirmed NOT
+supported by this repo's plain `clojure -M -m cljs.main` pipeline (no shadow-cljs); the
+backend uses plain JS Promise `.then` interop instead, the same style
+`kotoba-lang/host`'s `kami.backend.browser` already uses for its own browser GPU host
+bring-up.
+
+**Run it for real** (the only host with GPU access — confirmed working with Deno ≥ 2,
+no `--unstable-webgpu` flag needed):
+
+```bash
+clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
+```
+
+This cross-checks the live GPU backend against `num.cpu`'s reference oracle (dispatched
+through `num.core`/`num.array`, i.e. through `IBackend`, the same seam any real caller
+uses) — **verified passing on real Apple M1 Max Metal hardware while building this**:
+`Deno WgslBackendAsync ≡ CPU oracle: 14 passed, 0 failed` (all 14 `num.core` ops:
+axpy!/scal!/add/sub/mul/div/dot/nrm2/sum/amax/amin/matvec/matmul/spmv).
+
 ## Status
 
 S0 is real and tested: the array/CSR types, the `IBackend` protocol, the **pure-Clojure
 CPU reference backend**, the public API, and the **backend contract suite** (every op
-checked against reference values — `CpuBackend ≡` any future GPU backend). The WGSL
-backend ships its compute **shaders + the `IGpuDevice` host port + the dispatch plan**;
-wiring a live device (browser WebGPU or a native wgpu host) and the vendor-native
-backends are the next stages — see `docs/adr/0001-architecture.md`.
+checked against reference values — `CpuBackend ≡` any future GPU backend).
+
+**S1 (live WGSL backend) is now real, not just shipped shaders.** `num.wgsl` ships the
+compute shaders + the `IGpuDevice` host port + the dispatch plan; `num.wgsl-backend`
+dispatches them through an injected device (synchronous variant, for a future native/
+blocking device — not yet implemented); and **`num.deno-gpu` is a live, working
+`IGpuDevice` + `IBackend` for Deno's native WebGPU**, verified end-to-end against the CPU
+oracle through `num.core` on real Apple Metal hardware (previous section). What's still
+NOT done: a JVM-side blocking device (Panama/FFM → wgpu-native) so the *synchronous*
+`WgslBackend` can run the Clojure contract suite on-GPU from the JVM, and the
+vendor-native (`:cuda`/`:metal`/`:rocm`) fast-path backends — see
+`docs/adr/0001-architecture.md`.
 
 ```bash
-clojure -X:test                          # CPU backend satisfies the full IBackend contract (JVM)
-clojure -M:cljs && node target/cljs-verify.js   # PROOF: the same .cljc core runs under ClojureScript
+clojure -X:test                                  # CPU backend satisfies the full IBackend contract (JVM)
+clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript
+clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs   # PROOF: live GPU ≡ CPU oracle, real Metal
 ```
 
 **Portability is proven, not just claimed.** The `.cljc` core (CPU backend, array/CSR
 types, the full op contract) compiles to JS via ClojureScript and runs green on node —
-`cljs CPU contract: 14 passed, 0 failed`. And the WGSL backend's kernels are verified on
-real **Apple M4 Metal** (`verify/metal_contract.js`, 13/13), including a Jacobi-PCG
-Poisson solve (`verify/metal_pcg.js`). So num-clj genuinely spans pure-Clojure → cljs →
-GPU from one source.
+`cljs CPU contract: 14 passed, 0 failed`. The WGSL kernels are verified on real
+**Apple M4/M1 Metal** three separate ways now: the standalone harness
+(`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
+(`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
+`num.core` Clojure code (`deno-gpu-verify`, 14/14 against the CPU oracle). So num-clj
+genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
+longer only exercised by a script outside the Clojure dispatch seam.
+
+**Honest gap:** `num.tensor`'s N-D ops (broadcast/reshape/axis-reduce/batched-matmul,
+ADR-2607051400 §Phase 1) do not yet dispatch through `num.deno-gpu` or any GPU backend —
+they are host-materialized (round-trip through `arr/->vec`/`arr/from-vec`) regardless of
+which `IBackend` is injected. Extending the WGSL kernel set to N-D broadcast/batched-
+matmul dispatch is unimplemented net-new shader work, not attempted in this pass.

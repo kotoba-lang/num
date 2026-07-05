@@ -24,4 +24,15 @@
          :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
          :main-opts ["-m" "cljs.main"
                      "-co" "{:optimizations :simple :target :nodejs :main num.cljs-verify :output-to \"target/cljs-verify.js\"}"
-                     "-c" "num.cljs-verify"]}}}
+                     "-c" "num.cljs-verify"]}
+  ;; LIVE GPU (ADR-2607051400 §Phase 2): compile num.deno-gpu-verify to a .cjs file
+  ;; and run it under Deno, the only host here with WebGPU access (navigator.gpu →
+  ;; wgpu → Metal). `:output-to` ends in `.cjs` on purpose — Deno 2 refuses to run
+  ;; cljs.main's CommonJS (`:target :nodejs`) output as plain `.js` (ES-module-by-
+  ;; default); `.cjs` opts it into Deno's CommonJS loader with no other flags.
+  ;;   clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
+  :deno-verify {:extra-paths ["test"]
+                :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
+                :main-opts ["-m" "cljs.main"
+                            "-co" "{:optimizations :simple :target :nodejs :main num.deno-gpu-verify :output-to \"target/deno-gpu-verify.cjs\"}"
+                            "-c" "num.deno-gpu-verify"]}}}

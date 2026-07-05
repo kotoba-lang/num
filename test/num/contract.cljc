@@ -7,8 +7,14 @@
             [num.core :as nm]
             [num.sparse :as sp]))
 
-(defn- approx? [a b] (< (Math/abs (- (double a) (double b))) 1e-5))
-(defn- approx-vec? [u v] (and (= (count u) (count v)) (every? true? (map approx? u v))))
+(defn approx?
+  "Scalar tolerance check (~1e-5). Public: reused by num.deno-gpu-verify (ADR-2607051400
+  §Phase 2) so the live-GPU-vs-CPU-oracle cross-check uses the identical tolerance."
+  [a b] (< (Math/abs (- (double a) (double b))) 1e-5))
+
+(defn approx-vec?
+  "Elementwise tolerance check. Public: see `approx?`."
+  [u v] (and (= (count u) (count v)) (every? true? (map approx? u v))))
 
 (defn verify
   "Exercise every op against `backend`, reporting via `(check pass? label)`."
