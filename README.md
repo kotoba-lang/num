@@ -78,6 +78,80 @@ JVM/native only, never required.
 
 Ops: `axpy! scal! dot nrm2 add sub mul div sum amax amin matvec matmul spmv`.
 
+## N-D tensors (`num.tensor`, ADR-2607051400 §Phase 1)
+
+`num.core` above is deliberately 1-D-vector/2-D-matrix only (BLAS-shaped). `num.tensor`
+sits on top and adds a real, arbitrary-rank, shape-aware layer: broadcasting, shape
+manipulation, axis reductions, and batched matmul. It **extends `num.array/NDArray`**
+rather than introducing a new type — `NDArray` is already `{:backend :handle :shape}`
+with an arbitrary-length `shape` vector, and `nelems`/`from-vec`/`->vec` already work for
+rank 0 (scalar) through arbitrary rank with no changes; what was missing was the
+*operations*, not the type. `num.core` itself is untouched — same fast, non-broadcasting,
+direct-to-`IBackend` dispatch as before, zero behavior change.
+
+```clojure
+(require '[num.cpu :as cpu] '[num.array :as a] '[num.tensor :as t])
+(def b (cpu/cpu-backend))
+
+;; broadcasting (NumPy-style: align from the trailing dim, size-1 stretches)
+(def col (a/from-vec b [1 2 3] [3 1]))
+(def row (a/from-vec b [10 20 30 40] [1 4]))
+(a/->vec (t/add col row))                 ;=> [3 4] outer-sum, row i + col j per cell
+(t/broadcast-shapes [3 4] [2 1 4])        ;=> [2 3 4]
+(t/broadcast-shapes [2 3] [2 4])          ;=> throws (incompatible, non-1 mismatch)
+
+;; reshape / transpose / squeeze / unsqueeze (data-preserving)
+(def m (a/from-vec b (range 1 7) [2 3]))  ; [[1 2 3][4 5 6]]
+(:shape (t/reshape m [3 2]))              ;=> [3 2]              (zero-copy relabel)
+(a/->vec (t/transpose m))                 ;=> [1 4 2 5 3 6]      ([3 2], real data move)
+(:shape (t/squeeze (a/from-vec b [1] [1 1 1])))    ;=> []
+(:shape (t/unsqueeze m 0))                ;=> [1 2 3]
+
+;; axis-parameterized reductions (nil axis = reduce everything; NumPy keepdims convention)
+(a/->vec (t/sum m 0))                     ;=> [5 7 9]            (down columns)
+(a/->vec (t/sum m 1))                     ;=> [6 15]             (across rows)
+(:shape (t/sum m 1 {:keepdims? true}))    ;=> [2 1]
+(a/->vec (t/mean m 0))                    ;=> [2.5 3.5 4.5]
+(a/->scalar (t/amax m))                   ;=> 6.0                (full reduction)
+
+;; batched matmul: last two dims are the matrix dims, leading dims broadcast
+(def A (a/from-vec b (range 1 13) [2 2 3]))   ; 2 batches of 2×3
+(def B (a/from-vec b (range 1 13) [2 3 2]))   ; 2 batches of 3×2
+(:shape (t/matmul A B))                   ;=> [2 2 2]
+```
+
+**Host-materialized, not device-native (an explicit, documented tradeoff):**
+`num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
+flat contiguous buffer. So `broadcast-to`/`transpose`/axis-reductions/`matmul` here read
+operands back via `arr/->vec`, compute with plain `double-array` loops (same style as
+`num.cpu`'s reference loops), and re-upload via `arr/from-vec` — correct on ANY backend
+today, but a host round-trip. `reshape`/`squeeze`/`unsqueeze` are the exception: for a
+row-major contiguous layout they never move data, so they're zero-copy metadata edits.
+Pushing the round-tripping ops into `IBackend` itself (so a GPU backend executes them
+without leaving the device) is **Phase 2** work per ADR-2607051400, not this pass.
+
+**Phase-1 scope vs. what's deferred, honestly:**
+- Done: arbitrary-rank shape (the shape math — `row-major-strides`/`unravel`/`ravel`/
+  `broadcast-shapes` — is plain `(count shape)`-generic with no rank ceiling anywhere;
+  explicitly TESTED, not just asserted generic, at 0-D/1-D/2-D/3-D and at rank 4 per the
+  ADR's "at least 4-D": `rank-4-reshape-and-transpose`, `rank-4-axis-reduction-matches-naive`,
+  and `rank-4-batched-matmul-matches-naive` exercise reshape/transpose/axis-sum/batched-matmul
+  on 4-D tensors against independently-written naive references), NumPy-style
+  broadcasting (`broadcast-shapes`/`broadcast-to`) with the exact trailing-align/size-1
+  rule, `reshape`/`transpose`/`squeeze`/`unsqueeze` (data-preserving, tested against
+  hand-computed layouts), axis-parameterized `sum`/`amax`/`amin`/`mean` with `:keepdims?`
+  (single axis, multiple axes, or all axes), and batched N-D `matmul` with batch-dim
+  broadcasting.
+- Deferred (not attempted this pass, left to Phase 2 per the ADR): a live GPU dispatch
+  path for any of the above (everything here runs through the CPU-materialized
+  `->vec`/`from-vec` seam regardless of which `IBackend` is injected); new WGSL kernels
+  for N-D broadcast/batched-matmul (the ADR explicitly calls this out as Phase 2 net-new
+  shader work); and proving `num.tensor` under ClojureScript via the `cljs-verify`
+  harness (it's written in the same portable `.cljc` style — `Math/…`, `double-array`,
+  `aget`/`aset`, `ex-info` — as the rest of this repo, but `test/num/cljs_verify.cljs`
+  currently only exercises `num.contract` against `num.cpu`, not `num.tensor`; that
+  wiring wasn't extended in this pass).
+
 ## Status
 
 S0 is real and tested: the array/CSR types, the `IBackend` protocol, the **pure-Clojure
