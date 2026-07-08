@@ -14,9 +14,7 @@
   Every op is EAGER and explicit (no lazy graph at this layer); dims travel
   alongside handles BLAS-style so a backend never has to infer shape. Dense
   matrices are row-major. Reductions/dot return host scalars; everything else
-  returns a handle (often mutated in place, BLAS convention)."
-  #?(:cljs (:require-macros))
-  )
+  returns a handle (often mutated in place, BLAS convention).")
 
 (defprotocol IBackend
   ;; identity / lifecycle ----------------------------------------------------
