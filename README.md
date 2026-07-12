@@ -232,6 +232,14 @@ optional JNA adapter and runs all 14 `num.contract` operations; the manual
 an explicitly labelled NVIDIA self-hosted runner and fails when CUDA is absent.
 This repository's current Apple host cannot supply the final NVIDIA evidence.
 
+`num.solver/pcg` is the first production consumer of the complete backend
+contract. CSR SpMV and vector updates stay resident on the selected backend;
+only dot-product convergence scalars return to the host. It explicitly releases
+temporary device buffers, reports iterations/residual/backend provenance and
+fails on non-positive-definite systems. The same solver passes on the CPU oracle
+and injected CUDA driver, where tests confirm cuSPARSE SpMV plus cuBLAS
+SDOT/SAXPY dispatch rather than a hidden CPU solve.
+
 ```bash
 clojure -M:test                                  # CPU + injected CUDA dispatch contracts (JVM)
 clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript

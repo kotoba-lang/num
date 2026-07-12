@@ -1,7 +1,7 @@
 (ns num.cuda-test
   (:require [clojure.test :refer [deftest is]]
-            [num.contract :as contract] [num.cuda :as cuda]
-            [num.protocol :as p]))
+            [num.array :as arr] [num.contract :as contract] [num.cuda :as cuda]
+            [num.protocol :as p] [num.solver :as solver] [num.sparse :as sparse]))
 
 (defrecord FakeCudaDriver [next-ptr memory calls]
   cuda/ICudaDriver
@@ -84,3 +84,15 @@
                            (-cuda-nrm2 [_ _ _] 0) (-cuda-ewise! [_ _ _ _ _ _]) (-cuda-reduce [_ _ _ _] 0)
                            (-cublas-gemv! [_ _ _ _ _ _ _ _]) (-cublas-gemm! [_ _ _ _ _ _ _ _ _])
                            (-cusparse-spmv! [_ _ _ _]))))))
+
+(deftest pcg-stays-on-injected-cuda-backend
+  (let [driver (fake-driver) backend (cuda/cuda-backend driver)
+        matrix (sparse/csr 3 [[[0 2.0] [1 -1.0]] [[0 -1.0] [1 2.0] [2 -1.0]] [[1 -1.0] [2 2.0]]])
+        rhs (arr/from-vec backend [1 0 1] [3])
+        result (solver/pcg backend matrix rhs {:tolerance 1.0e-6 :max-iterations 20})]
+    (is (= :converged (:solver/status result)))
+    (is (= :cuda (:solver/backend result)))
+    (is (every? #(< (Math/abs (- % 1.0)) 1.0e-5) (arr/->vec (:solver/x result))))
+    (is (>= (count (filter #{:cusparse-spmv} @(:calls driver))) 2))
+    (is (some #{:cublas-sdot} @(:calls driver)))
+    (is (some #{:cublas-saxpy} @(:calls driver)))))
