@@ -12,8 +12,10 @@ all seven generated kernels. Artifact generation and verification fail before
 native device work if operator semantics, resource bounds, seal or regenerated
 code differ. Runtime buffers and cuBLAS/cuSPARSE remain owned by `num`.
 
-The current native bridge still contains bootstrap elementwise/reduction
-implementations. A subsequent NVRTC loader may consume the verified CUDA source
-directly, but it must preserve these hashes in qualification evidence. WGSL
-pipeline replacement follows the same registry; cross-target tests already
+The JNA native driver compiles every verified CUDA artifact with NVRTC, loads
+its PTX through the CUDA Driver API, caches the CUmodule/CUfunction and launches
+it for elementwise/reduction operations. Modules are explicitly unloaded with
+the driver. Bootstrap functions remain only for minimal/non-compiled driver
+implementations and are not selected when `ICompiledCudaDriver` is available.
+WGSL pipeline replacement follows the same registry; cross-target tests already
 require identical KIR identity and distinct target code identity.

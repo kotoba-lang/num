@@ -17,6 +17,11 @@ norm, reduction, elementwise addition, row-major GEMM and CSR SpMV. Production
 qualification then runs all 14 `num.contract` operations through the JNA JVM
 host binding and the same native library.
 
+During JVM backend creation the JNA adapter passes the seven compiler-sealed
+CUDA sources to NVRTC. `libnum_cuda` loads the resulting PTX with the CUDA
+Driver API and returns opaque kernel handles; ewise/reduction calls launch those
+handles. Kernel modules are unloaded before the CUDA context is destroyed.
+
 No CPU fallback exists inside this library. Every exported function returns a
 stable status and stores native diagnostics in the context. Dense storage is
 row-major at the public ABI; the bridge applies the cuBLAS operand convention.

@@ -247,6 +247,10 @@ targets share the same typed KIR SHA-256 while retaining distinct code hashes.
 CUDA backend provenance embeds every generated KIR/code hash, allowing CAE
 qualification to identify the exact compiler output rather than merely saying
 "CUDA". The compiler has no dependency back to `num`.
+The native JNA driver sends those verified CUDA sources to NVRTC, loads PTX via
+the CUDA Driver API, caches seven functions and launches generated ewise/reduce
+kernels. Its contract asserts seven NVRTC compilations, compiled-kernel
+execution and zero bootstrap ewise/reduction calls.
 
 ```bash
 clojure -M:test                                  # CPU + injected CUDA dispatch contracts (JVM)

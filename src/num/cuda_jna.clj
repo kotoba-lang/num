@@ -8,9 +8,12 @@
 (defn- function [^NativeLibrary library name] (.getFunction library name))
 (defn- invoke-int [^Function f args] (.invokeInt f (object-array args)))
 
-(defrecord JnaCudaDriver [^NativeLibrary library ^Pointer context info]
+(defrecord JnaCudaDriver [^NativeLibrary library ^Pointer context info kernels]
   java.io.Closeable
   (close [_]
+    (doseq [kernel @kernels]
+      (invoke-int (function library "num_cuda_kernel_destroy") [context kernel]))
+    (reset! kernels [])
     (let [status (invoke-int (function library "num_cuda_destroy") [context])]
       (when-not (zero? status) (throw (ex-info "CUDA context destroy failed" {:status status}))))
     (.close library))
@@ -67,6 +70,33 @@
           s (invoke-int (function library "num_cuda_spmv_csr")
                         [context (int rows) (int cols) (int nnz) rp ci values x y])]
       (when-not (zero? s) (throw (ex-info "cuSPARSE SpMV failed" {:status s})))))
+  cuda/ICompiledCudaDriver
+  (-compile-kernel [_ artifact]
+    (let [out (PointerByReference.) name (get-in artifact [:kir :kernel/name])
+          s (invoke-int (function library "num_cuda_compile_kernel")
+                        [context (:code artifact) name out])]
+      (when-not (zero? s) (throw (ex-info "NVRTC kernel compilation failed"
+                                           {:status s :kernel name :code-sha256 (:code-sha256 artifact)})))
+      (let [kernel (.getValue out)] (swap! kernels conj kernel) kernel)))
+  (-compiled-ewise! [_ kernel x y z n workgroup-size]
+    (let [s (invoke-int (function library "num_cuda_launch_ewise")
+                        [context kernel x y z (int n) (int workgroup-size)])]
+      (when-not (zero? s) (throw (ex-info "compiled CUDA ewise launch failed" {:status s})))))
+  (-compiled-reduce [_ kernel op x n workgroup-size]
+    (let [parts-count (long (Math/ceil (/ (double n) workgroup-size)))
+          parts-out (PointerByReference.)
+          alloc-status (invoke-int (function library "num_cuda_malloc_f32") [context parts-count parts-out])]
+      (when-not (zero? alloc-status) (throw (ex-info "compiled reduction parts allocation failed" {:status alloc-status})))
+      (let [parts (.getValue parts-out) values (float-array parts-count)]
+        (try
+          (let [launch-status (invoke-int (function library "num_cuda_launch_reduce")
+                                          [context kernel x parts (int n) (int workgroup-size)])]
+            (when-not (zero? launch-status) (throw (ex-info "compiled CUDA reduction launch failed" {:status launch-status})))
+            (let [copy-status (invoke-int (function library "num_cuda_d2h_f32")
+                                          [context values parts parts-count])]
+              (when-not (zero? copy-status) (throw (ex-info "compiled reduction readback failed" {:status copy-status})))
+              (reduce ({:sum + :max max :min min} op) (vec values))))
+          (finally (invoke-int (function library "num_cuda_free") [context parts]))))))
   )
 
 (defn jna-driver
@@ -93,7 +123,8 @@
                          :cuda/runtime-version (str (.getValue runtime))
                          :cuda/driver-version (str (.getValue driver-version))
                          :cuda/cublas-version (str (.getValue cublas))
-                         :cuda/cusparse-version (str (.getValue cusparse))})))))
+                         :cuda/cusparse-version (str (.getValue cusparse))}
+                        (atom []))))))
 
 (defn backend
   "Create {:driver Closeable :backend num.cuda/CudaBackend}."

@@ -53,7 +53,17 @@
              (mapv (fn [row]
                      (reduce + (for [i (range (aget rp row) (aget rp (inc row)))]
                                  (* (aget vals i) (nth xv (aget ci i))))))
-                   (range (:n-rows csr)))))))
+                   (range (:n-rows csr))))))
+  cuda/ICompiledCudaDriver
+  (-compile-kernel [_ artifact] (swap! calls conj :nvrtc-compile) artifact)
+  (-compiled-ewise! [_ kernel x y z n _]
+    (swap! calls conj :nvrtc-ewise)
+    (let [op (get-in kernel [:kir :kernel/operator]) f ({:add + :sub - :mul * :div /} op)]
+      (swap! memory assoc z (mapv f (subvec (get @memory x) 0 n) (subvec (get @memory y) 0 n)))))
+  (-compiled-reduce [_ kernel _ x n _]
+    (swap! calls conj :nvrtc-reduce)
+    (let [op (get-in kernel [:kir :kernel/operator])]
+      (reduce ({:sum + :max max :min min} op) (subvec (get @memory x) 0 n)))))
 
 (defn fake-driver [] (->FakeCudaDriver (atom 0) (atom {}) (atom [])))
 
@@ -67,7 +77,10 @@
                 (vals (:cuda/compiler-artifacts (cuda/backend-info backend)))))
     (is (every? (set @(:calls driver))
                 [:cublas-saxpy :cublas-sscal :cublas-sdot :cublas-snrm2
-                 :cublas-sgemv :cublas-sgemm :cusparse-spmv :cuda-ewise-kernel :cub-reduce]))))
+                 :cublas-sgemv :cublas-sgemm :cusparse-spmv :nvrtc-ewise :nvrtc-reduce]))
+    (is (= :nvrtc (:cuda/compiler-mode (cuda/backend-info backend))))
+    (is (= 7 (count (filter #{:nvrtc-compile} @(:calls driver)))))
+    (is (not-any? #{:cuda-ewise-kernel :cub-reduce} @(:calls driver)))))
 
 (deftest cuda-handle-ownership-and-lifecycle-fail-closed
   (let [a (cuda/cuda-backend (fake-driver)) b (cuda/cuda-backend (fake-driver))

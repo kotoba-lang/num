@@ -3,7 +3,7 @@ project(num_cuda LANGUAGES CXX CUDA)
 find_package(CUDAToolkit 12 REQUIRED)
 add_library(num_cuda SHARED num_cuda.cu)
 target_compile_features(num_cuda PRIVATE cxx_std_17)
-target_link_libraries(num_cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cusparse)
+target_link_libraries(num_cuda PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::nvrtc CUDA::cublas CUDA::cusparse)
 set_target_properties(num_cuda PROPERTIES CUDA_ARCHITECTURES "70;75;80;86;89;90"
   POSITION_INDEPENDENT_CODE ON)
 add_executable(num_cuda_smoke smoke.cu)

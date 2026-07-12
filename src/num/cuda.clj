@@ -25,6 +25,11 @@
   (-cublas-gemm! [driver alpha A m k B n beta C])
   (-cusparse-spmv! [driver csr x y]))
 
+(defprotocol ICompiledCudaDriver
+  (-compile-kernel [driver artifact] "Compile and cache a verified compiler artifact.")
+  (-compiled-ewise! [driver kernel x y z n workgroup-size])
+  (-compiled-reduce [driver kernel op x n workgroup-size]))
+
 (defrecord CudaHandle [owner ptr n released?])
 
 (defn- checked-handle [backend handle required]
@@ -39,7 +44,7 @@
 
 (declare ->CudaBackend)
 
-(deftype CudaBackend [driver device-info]
+(deftype CudaBackend [driver device-info compiled-kernels]
   p/IBackend
   (-backend-name [_] :cuda)
   (-alloc [this n]
@@ -64,11 +69,16 @@
   (-nrm2 [this x n] (double (-cuda-nrm2 driver (checked-handle this x n) n)))
   (-ewise [this op x y n]
     (when-not (#{:add :sub :mul :div} op) (throw (ex-info "unsupported CUDA ewise op" {:op op})))
-    (let [z (p/-alloc this n)]
-      (-cuda-ewise! driver op (checked-handle this x n) (checked-handle this y n) (:ptr z) n) z))
+    (let [z (p/-alloc this n) kernel (get compiled-kernels [:ewise op])]
+      (if kernel
+        (-compiled-ewise! driver kernel (checked-handle this x n) (checked-handle this y n)
+                          (:ptr z) n 256)
+        (-cuda-ewise! driver op (checked-handle this x n) (checked-handle this y n) (:ptr z) n)) z))
   (-reduce [this op x n]
     (when-not (#{:sum :max :min} op) (throw (ex-info "unsupported CUDA reduction" {:op op})))
-    (double (-cuda-reduce driver op (checked-handle this x n) n)))
+    (if-let [kernel (get compiled-kernels [:reduce op])]
+      (double (-compiled-reduce driver kernel op (checked-handle this x n) n 256))
+      (double (-cuda-reduce driver op (checked-handle this x n) n))))
   (-gemv [this alpha A m n x beta y]
     (-cublas-gemv! driver (float alpha) (checked-handle this A (* m n)) m n
                    (checked-handle this x n) (float beta) (checked-handle this y m)) y)
@@ -93,9 +103,15 @@
           (into (sorted-map)
                 (for [[[kind operator] _] gpu-compiler/kernel-specs
                       :let [compiled (gpu-compiler/compile-kernel kind operator :cuda-v1)]]
-                  [[kind operator] (select-keys compiled [:kir-sha256 :code-sha256 :limits])]))]
+                  [[kind operator] (select-keys compiled [:kir-sha256 :code-sha256 :limits])]))
+          compiled (if (satisfies? ICompiledCudaDriver driver)
+                     (into {} (for [[[kind operator] _] gpu-compiler/kernel-specs]
+                                [[kind operator]
+                                 (-compile-kernel driver (gpu-compiler/compile-kernel kind operator :cuda-v1))])) {})]
       (->CudaBackend driver (assoc info :cuda/compiler-target :cuda-v1
-                                       :cuda/compiler-artifacts compiler-artifacts)))))
+                                       :cuda/compiler-mode (if (seq compiled) :nvrtc :bootstrap)
+                                       :cuda/compiler-artifacts compiler-artifacts)
+                     compiled))))
 
 (defn backend-info [backend]
   (when-not (instance? CudaBackend backend) (throw (ex-info "not a CUDA backend" {})))

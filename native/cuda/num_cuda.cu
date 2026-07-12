@@ -1,7 +1,9 @@
 #include "num_cuda.h"
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <cublas_v2.h>
 #include <cusparse.h>
+#include <nvrtc.h>
 #include <thrust/device_ptr.h>
 #include <thrust/reduce.h>
 #include <thrust/extrema.h>
@@ -15,6 +17,7 @@ struct num_cuda_context {
   cusparseHandle_t sparse;
   std::string error;
 };
+struct num_cuda_kernel { CUmodule module; CUfunction function; };
 
 static int fail(num_cuda_context *c, int code, const char *where, int status) {
   if (c) c->error = std::string(where) + " status=" + std::to_string(status);
@@ -75,6 +78,28 @@ extern "C" int num_cuda_reduce(num_cuda_context*c,int op,const float*x,int n,flo
   } catch(...) { return fail(c,NUM_CUDA_RUNTIME,"thrust reduction",-1); }
   return NUM_CUDA_OK;
 }
+extern "C" int num_cuda_compile_kernel(num_cuda_context*c,const char*source,const char*name,num_cuda_kernel**out) {
+  if(!c||!source||!name||!out)return NUM_CUDA_INVALID;
+  nvrtcProgram program; nvrtcResult nr=nvrtcCreateProgram(&program,source,name,0,nullptr,nullptr);
+  if(nr!=NVRTC_SUCCESS)return fail(c,NUM_CUDA_RUNTIME,"nvrtcCreateProgram",(int)nr);
+  cudaDeviceProp prop{}; CUDA(c,cudaGetDeviceProperties(&prop,c->device));
+  std::string arch="--gpu-architecture=compute_"+std::to_string(prop.major)+std::to_string(prop.minor);
+  const char*options[]={"--std=c++17",arch.c_str()}; nr=nvrtcCompileProgram(program,2,options);
+  if(nr!=NVRTC_SUCCESS){size_t size=0;nvrtcGetProgramLogSize(program,&size);std::string log(size,'\0');
+    if(size)nvrtcGetProgramLog(program,log.data());c->error="NVRTC compile "+log;nvrtcDestroyProgram(&program);return NUM_CUDA_RUNTIME;}
+  size_t size=0;nvrtcGetPTXSize(program,&size);std::string ptx(size,'\0');nvrtcGetPTX(program,ptx.data());nvrtcDestroyProgram(&program);
+  CUresult cr=cuInit(0);if(cr!=CUDA_SUCCESS)return fail(c,NUM_CUDA_RUNTIME,"cuInit",(int)cr);
+  CUmodule module;cr=cuModuleLoadData(&module,ptx.data());if(cr!=CUDA_SUCCESS)return fail(c,NUM_CUDA_RUNTIME,"cuModuleLoadData",(int)cr);
+  CUfunction function;cr=cuModuleGetFunction(&function,module,name);if(cr!=CUDA_SUCCESS){cuModuleUnload(module);return fail(c,NUM_CUDA_RUNTIME,"cuModuleGetFunction",(int)cr);}
+  *out=new num_cuda_kernel{module,function};return NUM_CUDA_OK;
+}
+extern "C" int num_cuda_kernel_destroy(num_cuda_context*c,num_cuda_kernel*k){if(!c||!k)return NUM_CUDA_INVALID;CUresult r=cuModuleUnload(k->module);delete k;return r==CUDA_SUCCESS?NUM_CUDA_OK:fail(c,NUM_CUDA_RUNTIME,"cuModuleUnload",(int)r);}
+extern "C" int num_cuda_launch_ewise(num_cuda_context*c,num_cuda_kernel*k,const float*x,const float*y,float*z,uint32_t n,uint32_t wg){
+  if(!c||!k||!x||!y||!z||!n||!wg)return NUM_CUDA_INVALID;void*args[]={&x,&y,&z,&n};
+  CUresult r=cuLaunchKernel(k->function,(n+wg-1)/wg,1,1,wg,1,1,0,0,args,nullptr);return r==CUDA_SUCCESS?NUM_CUDA_OK:fail(c,NUM_CUDA_RUNTIME,"cuLaunchKernel ewise",(int)r);}
+extern "C" int num_cuda_launch_reduce(num_cuda_context*c,num_cuda_kernel*k,const float*x,float*parts,uint32_t n,uint32_t wg){
+  if(!c||!k||!x||!parts||!n||!wg)return NUM_CUDA_INVALID;void*args[]={&x,&parts,&n};
+  CUresult r=cuLaunchKernel(k->function,(n+wg-1)/wg,1,1,wg,1,1,wg*sizeof(float),0,args,nullptr);return r==CUDA_SUCCESS?NUM_CUDA_OK:fail(c,NUM_CUDA_RUNTIME,"cuLaunchKernel reduce",(int)r);}
 extern "C" int num_cuda_gemv_row_major(num_cuda_context*c,float a,const float*A,int m,int n,const float*x,float b,float*y) {
   // Row-major A(m,n) is column-major A^T(n,m); transpose it back for y=A*x.
   BLAS(c,cublasSgemv(c->blas,CUBLAS_OP_T,n,m,&a,A,n,x,1,&b,y,1)); return NUM_CUDA_OK;
