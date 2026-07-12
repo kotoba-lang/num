@@ -1,0 +1,21 @@
+name: CUDA native qualification
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cuda-contract:
+    runs-on: [self-hosted, linux, x64, nvidia-gpu]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify CUDA device and native bridge
+        run: bash scripts/verify-cuda.sh
+      - name: Upload native evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-native-evidence-${{ github.sha }}
+          path: |
+            target/cuda/CMakeCache.txt
+            target/cuda/num_cuda_smoke

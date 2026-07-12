@@ -223,6 +223,15 @@ NVIDIA host adapter and real-GPU contract run remain required before performance
 or hardware qualification claims; see `docs/adr/0002-cuda-native-backend.md`.
 Metal/ROCm vendor-native fast paths and JVM Panama/wgpu-native remain unimplemented.
 
+The native side is implemented under `native/cuda`: a stable C ABI backed by
+CUDA Runtime, cuBLAS, cuSPARSE, Thrust reductions and a custom elementwise
+kernel. `scripts/verify-cuda.sh` builds it and runs allocation/copy, reduction,
+GEMM and CSR SpMV smoke checks, then loads the shared library through the
+optional JNA adapter and runs all 14 `num.contract` operations; the manual
+`cuda-native.yml` workflow requires
+an explicitly labelled NVIDIA self-hosted runner and fails when CUDA is absent.
+This repository's current Apple host cannot supply the final NVIDIA evidence.
+
 ```bash
 clojure -M:test                                  # CPU + injected CUDA dispatch contracts (JVM)
 clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript

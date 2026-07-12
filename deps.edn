@@ -12,7 +12,11 @@
  ;; a native NVIDIA driver package remains opt-in. Metal/ROCm aliases remain specs.
  :deps {}
  :aliases
- {:test {:extra-paths ["test"]
+ {:cuda-jna {:extra-deps {net.java.dev.jna/jna {:mvn/version "5.16.0"}}}
+  :cuda-verify {:extra-paths ["test" "native/cuda"]
+                :extra-deps {net.java.dev.jna/jna {:mvn/version "5.16.0"}}
+                :main-opts ["-m" "num.cuda-native-verify"]}
+  :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
          :main-opts ["-m" "cognitect.test-runner"]
