@@ -210,14 +210,21 @@ compute shaders + the `IGpuDevice` host port + the dispatch plan; `num.wgsl-back
 dispatches them through an injected device (synchronous variant, for a future native/
 blocking device — not yet implemented); and **`num.deno-gpu` is a live, working
 `IGpuDevice` + `IBackend` for Deno's native WebGPU**, verified end-to-end against the CPU
-oracle through `num.core` on real Apple Metal hardware (previous section). What's still
-NOT done: a JVM-side blocking device (Panama/FFM → wgpu-native) so the *synchronous*
-`WgslBackend` can run the Clojure contract suite on-GPU from the JVM, and the
-vendor-native (`:cuda`/`:metal`/`:rocm`) fast-path backends — see
-`docs/adr/0001-architecture.md`.
+oracle through `num.core` on real Apple Metal hardware (previous section).
+
+**S2 CUDA dispatch is now implemented, but NVIDIA qualification is not yet
+claimed.** `num.cuda/CudaBackend` implements every `IBackend` operation through
+an injected `ICudaDriver`: CUDA allocation/transfer, cuBLAS level 1/2/3,
+cuSPARSE CSR SpMV and CUDA elementwise/reduction kernels. Handles enforce owner,
+size and explicit-free lifecycle; device/runtime/cuBLAS/cuSPARSE provenance is
+mandatory. The complete fake-driver contract passes, proving dispatch and
+lifecycle behavior without requiring CUDA on every developer machine. A native
+NVIDIA host adapter and real-GPU contract run remain required before performance
+or hardware qualification claims; see `docs/adr/0002-cuda-native-backend.md`.
+Metal/ROCm vendor-native fast paths and JVM Panama/wgpu-native remain unimplemented.
 
 ```bash
-clojure -X:test                                  # CPU backend satisfies the full IBackend contract (JVM)
+clojure -M:test                                  # CPU + injected CUDA dispatch contracts (JVM)
 clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript
 clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs   # PROOF: live GPU ≡ CPU oracle, real Metal
 ```

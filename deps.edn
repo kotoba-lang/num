@@ -8,8 +8,8 @@
  ;;   :cuda  → cuBLAS / cuSPARSE via JNI/Panama        (NVIDIA, JVM-only fast path)
  ;;   :metal → Metal Performance Shaders via FFM       (Apple, JVM-only fast path)
  ;;   :rocm  → rocBLAS / hipSPARSE via Panama          (AMD, JVM-only fast path)
- ;; Those aliases are specs for now (they need the native SDKs); the core + CPU
- ;; reference backend below are real and tested.
+ ;; `num.cuda/CudaBackend` and its injected ICudaDriver host port are implemented;
+ ;; a native NVIDIA driver package remains opt-in. Metal/ROCm aliases remain specs.
  :deps {}
  :aliases
  {:test {:extra-paths ["test"]
