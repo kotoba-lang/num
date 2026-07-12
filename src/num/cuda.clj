@@ -6,7 +6,8 @@
   cuSPARSE. Dense matrices are row-major at this boundary; a cuBLAS adapter is
   responsible for the conventional operand/transpose swap required by its
   column-major API."
-  (:require [num.protocol :as p]))
+  (:require [num.gpu-compiler :as gpu-compiler]
+            [num.protocol :as p]))
 
 (defprotocol ICudaDriver
   (-device-info [driver] "Map containing device/runtime/library versions.")
@@ -88,7 +89,13 @@
                    (string? (:cuda/cublas-version info))
                    (string? (:cuda/cusparse-version info)))
       (throw (ex-info "CUDA driver did not report required provenance" {:device-info info})))
-    (->CudaBackend driver info)))
+    (let [compiler-artifacts
+          (into (sorted-map)
+                (for [[[kind operator] _] gpu-compiler/kernel-specs
+                      :let [compiled (gpu-compiler/compile-kernel kind operator :cuda-v1)]]
+                  [[kind operator] (select-keys compiled [:kir-sha256 :code-sha256 :limits])]))]
+      (->CudaBackend driver (assoc info :cuda/compiler-target :cuda-v1
+                                       :cuda/compiler-artifacts compiler-artifacts)))))
 
 (defn backend-info [backend]
   (when-not (instance? CudaBackend backend) (throw (ex-info "not a CUDA backend" {})))

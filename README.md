@@ -240,6 +240,14 @@ fails on non-positive-definite systems. The same solver passes on the CPU oracle
 and injected CUDA driver, where tests confirm cuSPARSE SpMV plus cuBLAS
 SDOT/SAXPY dispatch rather than a hidden CPU solve.
 
+`num.gpu-compiler` now depends on a pinned `kotoba-lang/compiler` accelerator
+backend. Seven numerical kernel specifications produce 14 independently
+verified artifacts: WGSL and CUDA for add/sub/mul/div and sum/max/min. Both
+targets share the same typed KIR SHA-256 while retaining distinct code hashes.
+CUDA backend provenance embeds every generated KIR/code hash, allowing CAE
+qualification to identify the exact compiler output rather than merely saying
+"CUDA". The compiler has no dependency back to `num`.
+
 ```bash
 clojure -M:test                                  # CPU + injected CUDA dispatch contracts (JVM)
 clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript

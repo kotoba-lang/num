@@ -62,6 +62,9 @@
     (contract/verify backend (fn [pass? label] (is pass? (str "CUDA contract op: " label))))
     (is (= :cuda (p/-backend-name backend)))
     (is (= "contract-fake-sm80" (:cuda/device (cuda/backend-info backend))))
+    (is (= 7 (count (:cuda/compiler-artifacts (cuda/backend-info backend)))))
+    (is (every? #(re-matches #"[0-9a-f]{64}" (:code-sha256 %))
+                (vals (:cuda/compiler-artifacts (cuda/backend-info backend)))))
     (is (every? (set @(:calls driver))
                 [:cublas-saxpy :cublas-sscal :cublas-sdot :cublas-snrm2
                  :cublas-sgemv :cublas-sgemm :cusparse-spmv :cuda-ewise-kernel :cub-reduce]))))
