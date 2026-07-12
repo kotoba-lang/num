@@ -24,7 +24,7 @@
 
 (defn artifact-registry []
   (into (sorted-map)
-        (for [[[kind operator] _] kernel-specs target [:wgsl-v1 :cuda-v1]
+        (for [[[kind operator] _] kernel-specs target [:wgsl-v1 :cuda-v1 :msl-v1]
               :let [compiled (compile-kernel kind operator target)]]
           [[kind operator target]
            (select-keys compiled [:format :target :kir-sha256 :code-sha256 :limits :code])])))

@@ -12,12 +12,13 @@
  ;; a native NVIDIA driver package remains opt-in. Metal/ROCm aliases remain specs.
  :deps {io.github.kotoba-lang/compiler
         {:git/url "https://github.com/kotoba-lang/compiler.git"
-         :git/sha "36bba349798545b14b9413d2e54fd19f123d5fa6"}}
+         :git/sha "1ed977a6c43206326fa36c1870f05b2ce878f660"}}
  :aliases
  {:cuda-jna {:extra-deps {net.java.dev.jna/jna {:mvn/version "5.16.0"}}}
   :cuda-verify {:extra-paths ["test" "native/cuda"]
                 :extra-deps {net.java.dev.jna/jna {:mvn/version "5.16.0"}}
                 :main-opts ["-m" "num.cuda-native-verify"]}
+  :metal-verify {:extra-paths ["verify"] :main-opts ["-m" "metal-compiler-verify"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}

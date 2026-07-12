@@ -252,6 +252,14 @@ the CUDA Driver API, caches seven functions and launches generated ewise/reduce
 kernels. Its contract asserts seven NVRTC compilations, compiled-kernel
 execution and zero bootstrap ewise/reduction calls.
 
+Native Metal now uses the same architecture. `num.metal/MetalBackend` defines
+buffer lifecycle, vector operations, MPS GEMV/GEMM, CSR SpMV and compiled MSL
+kernel ports, with mandatory Apple device/family/OS/compiler provenance. The
+complete injected-driver contract passes. `clojure -M:metal-verify` runtime-
+compiles compiler-generated MSL and executes ewise add plus reduction sum on an
+actual Apple M1 Max GPU; WGSL/WebGPU→Metal remains the fully hardware-tested
+portable backend while the remaining native MPS host methods are implemented.
+
 ```bash
 clojure -M:test                                  # CPU + injected CUDA dispatch contracts (JVM)
 clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript
