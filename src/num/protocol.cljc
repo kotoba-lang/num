@@ -65,7 +65,8 @@
   "Optional N-D compute operations over physical typed storage."
   (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])
   (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype])
-  (-embedding-dtype [b indices-h weight-h params dtype]))
+  (-embedding-dtype [b indices-h weight-h params dtype])
+  (-rms-norm-dtype [b input-h weight-h params dtype]))
 
 (defprotocol ITensorBackend
   "Optional device-native N-D operations. Backends that do not implement this
@@ -77,6 +78,8 @@
     "NCHW GroupNorm with optional affine parameters; returns a new handle.")
   (-embedding [b indices-h weight-h params]
     "Gather embedding rows for contiguous f32 token indices.")
+  (-rms-norm [b input-h weight-h params]
+    "RMS-normalize contiguous rows over their final dimension.")
   (-upsample-nearest2d [b input-h params]
     "Integer nearest-neighbor NCHW upsampling; returns a new handle.")
   (-cat [b input-handles params]

@@ -1416,6 +1416,79 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[word] = pack2x16float(vec2<f32>(gather(base), second));
 }")
 
+(def rms-norm-wgsl
+  "One workgroup per row RMSNorm. Each lane accumulates strided features and
+  the workgroup reduction avoids recomputing row statistics per output."
+  "
+struct Params { rows: u32, dim: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+@group(0) @binding(4) var<uniform> eps: f32;
+var<workgroup> sums: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wid.x;
+  let lane = lid.x;
+  if (row >= p.rows) { return; }
+  var sum = 0.0;
+  for (var f = lane; f < p.dim; f += 64u) {
+    let v = input[row * p.dim + f]; sum += v * v;
+  }
+  sums[lane] = sum;
+  workgroupBarrier();
+  var stride = 32u;
+  loop {
+    if (lane < stride) { sums[lane] += sums[lane + stride]; }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  let inv_rms = inverseSqrt(sums[0] / f32(p.dim) + eps);
+  for (var f = lane; f < p.dim; f += 64u) {
+    output[row * p.dim + f] = input[row * p.dim + f] * inv_rms * weight[f];
+  }
+}")
+
+(def rms-norm-f16-wgsl
+  "Packed f16 RMSNorm. Requires an even final dimension so packed words never
+  straddle rows; accumulation remains f32 like mixed-precision frameworks."
+  "
+struct Params { rows: u32, dim: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+@group(0) @binding(3) var<uniform> p: Params;
+@group(0) @binding(4) var<uniform> eps: f32;
+var<workgroup> sums: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wid.x; let lane = lid.x; let words = p.dim / 2u;
+  if (row >= p.rows) { return; }
+  var sum = 0.0;
+  for (var w = lane; w < words; w += 64u) {
+    let v = unpack2x16float(input[row * words + w]); sum += dot(v, v);
+  }
+  sums[lane] = sum;
+  workgroupBarrier();
+  var stride = 32u;
+  loop {
+    if (lane < stride) { sums[lane] += sums[lane + stride]; }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  let inv_rms = inverseSqrt(sums[0] / f32(p.dim) + eps);
+  for (var w = lane; w < words; w += 64u) {
+    let v = unpack2x16float(input[row * words + w]);
+    let gamma = unpack2x16float(weight[w]);
+    output[row * words + w] = pack2x16float(v * inv_rms * gamma);
+  }
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -1432,6 +1505,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :conv2d-nchw-oc4 conv2d-nchw-oc4-wgsl
    :group-norm-nchw group-norm-nchw-wgsl
    :embedding embedding-wgsl
+   :rms-norm rms-norm-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
@@ -1453,6 +1527,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :conv2d-nchw-f16 conv2d-nchw-f16-wgsl
    :group-norm-nchw-f16 group-norm-nchw-f16-wgsl
    :embedding-f16 embedding-f16-wgsl
+   :rms-norm-f16 rms-norm-f16-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------

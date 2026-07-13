@@ -171,6 +171,13 @@
                     (uni dev (u32-tag [tokens rows dim 0]))]
                    [(ceil-div total 64) 1 1])
       output))
+  (-rms-norm [_ input-h weight-h {:keys [rows dim eps]}]
+    (let [output (w/-create-buffer dev (* rows dim) :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :rms-norm)
+                   [input-h weight-h output (uni dev (u32-tag [rows dim 0 0]))
+                    (uni dev [(double eps)])]
+                   [rows 1 1])
+      output))
   (-upsample-nearest2d [_ input-h {:keys [n c h width oh ow scale-h scale-w]}]
     (let [total (* n c oh ow)
           output (w/-create-buffer dev total :storage)

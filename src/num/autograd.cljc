@@ -640,6 +640,44 @@
                                            (:shape weight-data)
                                            (or (:dtype weight-data) :f32)))))))))
 
+(defn rms-norm-last*
+  "Differentiable RMSNorm over the final dimension."
+  ([x weight] (rms-norm-last* x weight 1.0e-5))
+  ([x weight eps]
+   (let [input-data (:data x) weight-data (:data weight)
+         shape (:shape input-data) dim (long (peek shape))
+         rows (quot (arr/nelems shape) dim)
+         output (t/rms-norm-last input-data weight-data eps)]
+     (node output [x weight]
+           (fn [self]
+             (when-let [g @(:grad self)]
+               (let [xs (vec (arr/->vec input-data))
+                     ws (vec (arr/->vec weight-data))
+                     gs (vec (arr/->vec g))
+                     dx (double-array (* rows dim))
+                     dw (double-array dim)]
+                 (dotimes [row rows]
+                   (let [base (* row dim)
+                         square-sum (reduce + (map (fn [f]
+                                                    (let [v (nth xs (+ base f))]
+                                                      (* v v)))
+                                                  (range dim)))
+                         inv-rms (/ 1.0 (Math/sqrt (+ (/ square-sum dim) eps)))
+                         dot-zx (reduce + (map (fn [f]
+                                                (* (nth gs (+ base f)) (nth ws f)
+                                                   (nth xs (+ base f))))
+                                              (range dim)))
+                         correction (/ (* dot-zx inv-rms inv-rms inv-rms) dim)]
+                     (dotimes [f dim]
+                       (let [i (+ base f) upstream (nth gs i) value (nth xs i)]
+                         (aset dx i (- (* upstream (nth ws f) inv-rms)
+                                      (* value correction)))
+                         (aset dw f (+ (aget dw f) (* upstream value inv-rms)))))))
+                 (accumulate! x (arr/from-vec (:backend input-data) (vec dx) shape))
+                 (accumulate! weight
+                              (arr/from-vec (:backend weight-data) (vec dw)
+                                            (:shape weight-data))))))))))
+
 (defn cat*
   "Differentiable `num.tensor/cat`. Backward slices the upstream gradient
   along the concatenation axis and accumulates one contiguous gradient per

@@ -1032,6 +1032,51 @@
                               ids)
                       (conj index-shape dim) dtype)))))
 
+(defn rms-norm-last
+  "Llama/Ollama-style RMSNorm over the final dimension: `x / rms(x) * weight`.
+  Unlike LayerNorm it does not subtract the mean and has no bias. GPU kernels
+  use one 64-lane workgroup per row with f32 accumulation."
+  ([input weight] (rms-norm-last input weight 1.0e-5))
+  ([input weight eps]
+   (require-same-dtype! "num.tensor/rms-norm-last" [input weight])
+   (let [shape (vec (:shape input))]
+     (when (empty? shape)
+       (throw (ex-info "rms norm requires rank >= 1" {:shape shape})))
+     (let [dim (long (peek shape))
+           rows (quot (arr/nelems shape) dim)
+           backend (:backend input)
+           dtype (array-dtype input)
+           params {:rows rows :dim dim :eps eps}]
+       (when-not (= [dim] (:shape weight))
+         (throw (ex-info "rms norm weight must match the final dimension"
+                         {:input shape :weight (:shape weight)})))
+       (cond
+         (and (= dtype :f32) (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray backend
+                               (p/-rms-norm backend (:handle input)
+                                            (:handle weight) params)
+                               shape) :dtype :f32)
+
+         (and (not= dtype :f32) (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray backend
+                               (p/-rms-norm-dtype backend (:handle input)
+                                                  (:handle weight) params dtype)
+                               shape) :dtype dtype)
+
+         :else
+         (let [xs (vec (arr/->vec input)) ws (vec (arr/->vec weight))]
+           (arr/from-vec
+            backend
+            (mapcat (fn [row]
+                      (let [start (* row dim)
+                            values (subvec xs start (+ start dim))
+                            inv-rms (/ 1.0 (Math/sqrt
+                                            (+ eps (/ (reduce + (map #(* % %) values))
+                                                      dim))))]
+                        (mapv #(* %1 inv-rms %2) values ws)))
+                    (range rows))
+            shape dtype)))))))
+
 (defn upsample-nearest2d
   "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.
   ITensorBackend implementations execute it device-native."

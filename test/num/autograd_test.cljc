@@ -423,6 +423,36 @@
         (is (approx-vec-tol? (arr/->vec @(:grad (:weight result)))
                              (arr/->vec numeric) 1.0e-4))))))
 
+(deftest rmsnorm-gradients-match-finite-differences
+  (testing "RMSNorm differentiates rank-3 inputs and its scale vector"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1, -0.3 0.8 1.4 -0.9]
+                           [1 2 4])
+          wd (arr/from-vec backend [0.8 1.1 -0.7 1.3] [4])
+          target (arr/from-vec backend (repeat 8 0.15) [1 2 4])
+          loss-of (fn [xd' wd']
+                    (let [[loss _]
+                          (ag/with-tape
+                            (ag/mse-loss*
+                             (ag/rms-norm-last* (ag/value xd') (ag/value wd') 1.0e-5)
+                             target))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) w (ag/value wd)
+                  loss (ag/mse-loss* (ag/rms-norm-last* x w 1.0e-5) target)]
+              {:loss loss :x x :weight w}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["weight" :weight wd]]]
+        (let [numeric (numerical-grad
+                       (fn [perturbed]
+                         (loss-of (if (= key :x) perturbed xd)
+                                  (if (= key :weight) perturbed wd)))
+                       data 1.0e-5)]
+          (is (approx-vec-tol? (arr/->vec @(:grad (get result key)))
+                               (arr/->vec numeric) 1.0e-4)
+              label))))))
+
 (deftest upsample-cat-skip-gradients-match-finite-differences
   (testing "a branched UNet-style upsample + channel skip concatenation graph
             propagates gradients into both source tensors"
