@@ -371,3 +371,36 @@
           V (arr/from-vec backend [10 20 30 40] [2 2])
           out (arr/->vec (t/attention Q K V))]
       (is (contract/approx-vec? [(/ 50.0 3) (/ 80.0 3)] out)))))
+
+(deftest multi-head-attention-matches-hand-computed
+  (testing "zero queries -> uniform attention PER HEAD independently: with
+            d_model=4, num-heads=2 (d_head=2), head 0 reads V's first 2
+            columns, head 1 reads V's last 2 — each head's output is the
+            mean of its own slice of V, for BOTH query rows (Q is zero)"
+    (let [Q (arr/from-vec backend [0 0 0 0  0 0 0 0] [2 4])
+          K (arr/from-vec backend [1 2 3 4  5 6 7 8] [2 4]) ; irrelevant when Q=0
+          V (arr/from-vec backend [10 20 30 40
+                                    50 60 70 80] [2 4])
+          out (arr/->vec (t/multi-head-attention Q K V 2))
+          ;; head0 = mean([10 20],[50 60]) = [30 40]; head1 = mean([30 40],[70 80]) = [50 60]
+          row [30.0 40.0 50.0 60.0]]
+      (is (contract/approx-vec? (into row row) out))))
+  (testing "num-heads=1 reduces to EXACTLY t/attention's own result — cross-
+            checked against attention directly, not re-derived by hand.
+            (t/attention allows V's last dim to differ from Q/K's, since it
+            never splits into heads; multi-head-attention needs V to share
+            Q/K's d_model — the standard transformer convention, and the
+            reason this fixture uses matching dims where t/attention's own
+            single-head test fixtures above don't need to.)"
+    (let [Q (arr/from-vec backend [1 2] [1 2])
+          K (arr/from-vec backend [3 4 5 6] [2 2])
+          V (arr/from-vec backend [10 20 30 40] [2 2])
+          single-head-out (arr/->vec (t/attention Q K V))
+          multi-head-out (arr/->vec (t/multi-head-attention Q K V 1))]
+      (is (contract/approx-vec? single-head-out multi-head-out))))
+  (testing "num-heads not dividing d_model throws"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/multi-head-attention (arr/from-vec backend (range 4) [1 4])
+                                         (arr/from-vec backend (range 4) [1 4])
+                                         (arr/from-vec backend (range 4) [1 4])
+                                         3)))))
