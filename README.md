@@ -192,7 +192,12 @@ attention kernel accepts different query/key sequence lengths, performs stable
 per-head softmax, and emits concatenated heads without materializing transpose,
 batched-matmul, or probability tensors on the host. Both kernels match the CPU
 oracle on Apple M4 Metal and allow learned Q/K/V/output projection attention to
-remain GPU-resident through its complete forward pass.
+remain GPU-resident through its complete forward pass. Its fused backward kernel
+recomputes the stable softmax on-device and returns gradients for Q, K, and V;
+`num.autograd/multi-head-attention*` selects that kernel automatically for an f32
+`ITensorBackend`. A two-head cross-attention fixture (`seqQ=2`, `seqK=3`) verifies
+forward plus all three gradients against the independently decomposed CPU autograd
+graph on real Apple M4 Metal: 4/4 checks pass without gradient readback between ops.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
@@ -333,6 +338,7 @@ vendor-native (`:cuda`/`:metal`/`:rocm`) fast-path backends — see
 clojure -X:test                                  # CPU backend satisfies the full IBackend contract (JVM)
 clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript
 clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs   # PROOF: live GPU ≡ CPU oracle, real Metal
+clojure -M:deno-attention-backward-verify && deno run --allow-all target/deno-attention-backward-verify.cjs # fused attention gradients on Metal
 ```
 
 **Portability is proven, not just claimed.** The `.cljc` core (CPU backend, array/CSR
@@ -341,7 +347,7 @@ types, the full op contract) compiles to JS via ClojureScript and runs green on 
 **Apple M4/M1 Metal** three separate ways now: the standalone harness
 (`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
 (`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
-`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 24/24 against the CPU
+`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 26/26 against the CPU
 oracle). So num-clj
 genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
 longer only exercised by a script outside the Clojure dispatch seam.

@@ -81,4 +81,6 @@
   (-add-last-axis-bias [b input-h bias-h params]
     "Broadcast-add a rank-1 bias over every contiguous last-axis row.")
   (-multi-head-attention [b query-h key-h value-h params]
-    "Fused unmasked scaled dot-product attention over rank-2 Q/K/V."))
+    "Fused unmasked scaled dot-product attention over rank-2 Q/K/V.")
+  (-multi-head-attention-backward [b query-h key-h value-h grad-output-h params]
+    "Fused attention backward; returns {:query :key :value} gradient handles."))

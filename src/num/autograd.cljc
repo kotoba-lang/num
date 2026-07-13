@@ -5,10 +5,10 @@
   against numerical/finite-difference gradients, the standard autograd
   correctness check — see test/num/autograd_test.cljc) for exactly the ops a
   tiny linear/relu/linear/softmax(+mse-loss) network needs, matching
-  torch-clj's own README example architecture. CPU-backend only (`num.cpu`)
-  — num.tensor's sync-only host-round-trip design (see its own docstring)
-  means this doesn't reach the async Deno GPU backend either, same
-  documented gap as the rest of the tensor layer.
+  torch-clj's own README example architecture. Most general tensor gradients
+  remain host-materialized on GPU backends, but multi-head-attention has a fused
+  `ITensorBackend` forward/backward path verified through async Deno WebGPU on
+  Apple Metal; its Q/K/V tensors and gradients stay device-resident.
 
   Design: a small tape-based (Wengert-list) autograd. `with-tape` binds a
   fresh tape; every op below (`matmul*`/`add-bias*`/`relu*`/`softmax*`/
@@ -23,6 +23,7 @@
   autograd needs and this one deliberately does not attempt."
   (:require [num.array :as arr]
             [num.core :as nm]
+            [num.protocol :as p]
             [num.tensor :as t]))
 
 (def ^:dynamic *tape* nil)
@@ -290,15 +291,38 @@
                        :v-shape (:shape (:data V))
                        :num-heads heads})))
     (let [d-head (quot (long d-model) heads)
-          split-heads (fn [x seq-len]
-                        (transpose* (reshape* x [seq-len heads d-head]) [1 0 2]))
-          qh (split-heads Q seq-q)
-          kh (split-heads K seq-k)
-          vh (split-heads V seq-k)
-          scores (matmul* qh (transpose* kh [0 2 1]))
-          weights (softmax* (scale* (/ 1.0 (Math/sqrt d-head)) scores))
-          heads-out (matmul* weights vh)]
-      (reshape* (transpose* heads-out [1 0 2]) [seq-q d-model]))))
+          q-data (:data Q) k-data (:data K) v-data (:data V)
+          backend (:backend q-data)
+          fused? (and (= backend (:backend k-data) (:backend v-data))
+                      (= :f32 (:dtype q-data :f32)
+                         (:dtype k-data :f32) (:dtype v-data :f32))
+                      (satisfies? p/ITensorBackend backend))]
+      (if fused?
+        (node
+         (t/multi-head-attention q-data k-data v-data heads)
+         [Q K V]
+         (fn [self]
+           (when-let [g @(:grad self)]
+             (let [params {:seq-q seq-q :seq-k seq-k :d-model d-model
+                           :heads heads :head-dim d-head}
+                   gradients (p/-multi-head-attention-backward
+                              backend (:handle q-data) (:handle k-data)
+                              (:handle v-data) (:handle g) params)
+                   ndarray (fn [handle shape]
+                             (assoc (arr/->NDArray backend handle shape)
+                                    :dtype :f32))]
+               (accumulate! Q (ndarray (:query gradients) [seq-q d-model]))
+               (accumulate! K (ndarray (:key gradients) [seq-k d-model]))
+               (accumulate! V (ndarray (:value gradients) [seq-k d-model]))))))
+        (let [split-heads (fn [x seq-len]
+                            (transpose* (reshape* x [seq-len heads d-head]) [1 0 2]))
+              qh (split-heads Q seq-q)
+              kh (split-heads K seq-k)
+              vh (split-heads V seq-k)
+              scores (matmul* qh (transpose* kh [0 2 1]))
+              weights (softmax* (scale* (/ 1.0 (Math/sqrt d-head)) scores))
+              heads-out (matmul* weights vh)]
+          (reshape* (transpose* heads-out [1 0 2]) [seq-q d-model]))))))
 (defn- pair-option [value]
   (mapv long (if (sequential? value) value [value value])))
 

@@ -614,6 +614,97 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[i] = result / denominator;
 }")
 
+(def multi-head-attention-backward-wgsl
+  "Recompute stable softmax and produce Q/K/V gradients without host tensors."
+  "
+struct Params { seq_q: u32, seq_k: u32, model: u32, heads: u32,
+                head_dim: u32, total_q: u32, total_k: u32, total: u32 }
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key: array<f32>;
+@group(0) @binding(2) var<storage, read> value: array<f32>;
+@group(0) @binding(3) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> grad_query: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_key: array<f32>;
+@group(0) @binding(6) var<storage, read_write> grad_value: array<f32>;
+@group(0) @binding(7) var<uniform> p: Params;
+fn score(row: u32, head: u32, token: u32) -> f32 {
+  let qb = row * p.model + head * p.head_dim;
+  let kb = token * p.model + head * p.head_dim;
+  var sum: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    sum = sum + query[qb + d] * key[kb + d];
+  }
+  return sum * inverseSqrt(f32(p.head_dim));
+}
+fn softmax_max(row: u32, head: u32) -> f32 {
+  var maximum: f32 = -3.402823e38;
+  for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
+    maximum = max(maximum, score(row, head, k));
+  }
+  return maximum;
+}
+fn softmax_denominator(row: u32, head: u32, maximum: f32) -> f32 {
+  var denominator: f32 = 0.0;
+  for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
+    denominator = denominator + exp(score(row, head, k) - maximum);
+  }
+  return denominator;
+}
+fn probability(row: u32, head: u32, token: u32,
+               maximum: f32, denominator: f32) -> f32 {
+  return exp(score(row, head, token) - maximum) / denominator;
+}
+fn grad_probability(row: u32, head: u32, token: u32) -> f32 {
+  let ob = row * p.model + head * p.head_dim;
+  let vb = token * p.model + head * p.head_dim;
+  var sum: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    sum = sum + grad_output[ob + d] * value[vb + d];
+  }
+  return sum;
+}
+fn grad_expectation(row: u32, head: u32,
+                    maximum: f32, denominator: f32) -> f32 {
+  var expected: f32 = 0.0;
+  for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
+    expected = expected + probability(row, head, k, maximum, denominator) *
+                          grad_probability(row, head, k);
+  }
+  return expected;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; let scale = inverseSqrt(f32(p.head_dim));
+  if (i < p.total_q) {
+    let row = i / p.model; let component = i % p.model;
+    let head = component / p.head_dim;
+    let maximum = softmax_max(row, head);
+    let denominator = softmax_denominator(row, head, maximum);
+    let expected = grad_expectation(row, head, maximum, denominator);
+    var dq: f32 = 0.0;
+    for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
+      let prob = probability(row, head, token, maximum, denominator);
+      let ds = prob * (grad_probability(row, head, token) - expected);
+      dq = dq + ds * key[token * p.model + component] * scale;
+    }
+    grad_query[i] = dq;
+  }
+  if (i < p.total_k) {
+    let token = i / p.model; let component = i % p.model;
+    let head = component / p.head_dim; var dk: f32 = 0.0; var dv: f32 = 0.0;
+    for (var row: u32 = 0u; row < p.seq_q; row = row + 1u) {
+      let maximum = softmax_max(row, head);
+      let denominator = softmax_denominator(row, head, maximum);
+      let prob = probability(row, head, token, maximum, denominator);
+      let expected = grad_expectation(row, head, maximum, denominator);
+      let ds = prob * (grad_probability(row, head, token) - expected);
+      dk = dk + ds * query[row * p.model + component] * scale;
+      dv = dv + prob * grad_output[row * p.model + component];
+    }
+    grad_key[i] = dk; grad_value[i] = dv;
+  }
+}")
+
 (def add-bias-rows-wgsl
   "Add one shared bias vector to every matrix row."
   "
@@ -1038,6 +1129,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :cat-copy cat-copy-wgsl
    :add-last-axis-bias add-last-axis-bias-wgsl
    :multi-head-attention multi-head-attention-wgsl
+   :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl
    :ewise1-f16 ewise1-f16-wgsl
    :gemm-f16 gemm-f16-wgsl

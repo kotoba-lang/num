@@ -36,6 +36,12 @@
                 :main-opts ["-m" "cljs.main"
                             "-co" "{:optimizations :simple :target :nodejs :main num.deno-gpu-verify :output-to \"target/deno-gpu-verify.cjs\"}"
                             "-c" "num.deno-gpu-verify"]}
+  :deno-attention-backward-verify
+  {:extra-paths ["test"]
+   :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
+   :main-opts ["-m" "cljs.main"
+               "-co" "{:optimizations :simple :target :nodejs :main num.deno-attention-backward-verify :output-to \"target/deno-attention-backward-verify.cjs\"}"
+               "-c" "num.deno-attention-backward-verify"]}
   :deno-benchmark {:extra-paths ["test"]
                    :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
                    :main-opts ["-m" "cljs.main"

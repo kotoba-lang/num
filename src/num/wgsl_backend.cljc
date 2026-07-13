@@ -180,7 +180,22 @@
                     (uni dev (u32-tag [seq-q seq-k d-model heads
                                        head-dim total 0 0]))]
                    [(ceil-div total 64) 1 1])
-      output)))
+      output))
+  (-multi-head-attention-backward [_ query-h key-h value-h grad-output-h
+                                   {:keys [seq-q seq-k d-model heads head-dim]}]
+    (let [total-q (* seq-q d-model)
+          total-k (* seq-k d-model)
+          total (max total-q total-k)
+          grad-query (w/-create-buffer dev total-q :storage)
+          grad-key (w/-create-buffer dev total-k :storage)
+          grad-value (w/-create-buffer dev total-k :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :multi-head-attention-backward)
+                   [query-h key-h value-h grad-output-h
+                    grad-query grad-key grad-value
+                    (uni dev (u32-tag [seq-q seq-k d-model heads head-dim
+                                       total-q total-k total]))]
+                   [(ceil-div total 64) 1 1])
+      {:query grad-query :key grad-key :value grad-value})))
 
 (defn wgsl-backend
   "Construct a WgslBackend over an injected `IGpuDevice` (native, blocking

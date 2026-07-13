@@ -13,7 +13,8 @@
                 :ewise-f16 :ewise1-f16 :gemm-f16
                 :conv2d-nchw-f16 :group-norm-nchw-f16
                 :conv2d-nchw :group-norm-nchw :upsample-nearest2d :cat-copy
-                :add-last-axis-bias :multi-head-attention :spmv]]
+                :add-last-axis-bias :multi-head-attention
+                :multi-head-attention-backward :spmv]]
       (is (string? (get w/shaders op)) (str "missing shader: " op))
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"
@@ -22,6 +23,13 @@
     (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"var sum: f32" (:gemm-f16 w/shaders)))))
+
+(deftest attention-backward-shader-covers-all-three-gradients
+  (let [shader (:multi-head-attention-backward w/shaders)]
+    (is (re-find #"grad_query" shader))
+    (is (re-find #"grad_key" shader))
+    (is (re-find #"grad_value" shader))
+    (is (re-find #"grad_expectation" shader))))
 
 (deftest backend-namespaces-load
   (testing "the WgslBackend constructor and IGpuDevice port compile on the JVM"
