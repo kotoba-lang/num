@@ -1936,8 +1936,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   return d * f32(quant);
 }"
    "fn value_at(row: u32, column: u32) -> f32 {
-  let block_index = row * p.blocks_per_row + column / 32u;
-  let block = block_index * 22u; let local = column % 32u;
+  let linear = row * p.k + column;
+  let block = (linear / 32u) * 22u; let local = linear % 32u;
   let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
   let packed = byte_at(block + 6u + local % 16u);
   let low = select(packed & 15u, packed >> 4u, local >= 16u);
@@ -2025,8 +2025,8 @@ fn value_at(row: u32, column: u32) -> f32 {
 (def q5-0-embedding-wgsl
   (packed-embedding-wgsl
    "fn value_at(row: u32, column: u32) -> f32 {
-  let block = (row * p.blocks_per_row + column / 32u) * 22u;
-  let local = column % 32u;
+  let linear = row * p.dim + column;
+  let block = (linear / 32u) * 22u; let local = linear % 32u;
   let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
   let packed = byte_at(block + 6u + local % 16u);
   let low = select(packed & 15u, packed >> 4u, local >= 16u);

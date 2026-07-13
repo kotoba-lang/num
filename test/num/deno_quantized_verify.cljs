@@ -48,11 +48,11 @@
 (defn q5-block [d]
   (vec (concat (half-bytes d) [1 0 0 128] (repeat 16 0xf0))))
 
-(def q5-bytes (vec (concat (q5-block 0.5) (q5-block -0.25))))
+(def q5-bytes (q5-block 0.5))
 
 (defn run-q5 [backend]
-  (q/matmul (arr/from-vec backend (take (* 5 32) inputs) [5 32])
-            (q/matrix backend q5-bytes [2 32] :q5-0)))
+  (q/matmul (arr/from-vec backend (take (* 5 16) inputs) [5 16])
+            (q/matrix backend q5-bytes [2 16] :q5-0)))
 
 (defn run-embedding [backend bytes shape quant-type]
   (q/embedding (arr/from-vec backend [1 0 1] [3])
@@ -68,7 +68,7 @@
         q6-expected (arr/->vec (run-q6 cpu))
         q8-expected (arr/->vec (run-q8 cpu))
         embedding-expected
-        [(arr/->vec (run-embedding cpu q5-bytes [2 32] :q5-0))
+        [(arr/->vec (run-embedding cpu q5-bytes [2 16] :q5-0))
          (arr/->vec (run-embedding cpu packed-bytes [2 256] :q4-k))
          (arr/->vec (run-embedding cpu q6-bytes [2 256] :q6-k))
          (arr/->vec (run-embedding cpu q8-bytes [2 32] :q8-0))]]
@@ -81,7 +81,7 @@
                          (arr/->vec (run-q4 gpu))
                          (arr/->vec (run-q6 gpu))
                          (arr/->vec (run-q8 gpu))
-                         (arr/->vec (run-embedding gpu q5-bytes [2 32] :q5-0))
+                         (arr/->vec (run-embedding gpu q5-bytes [2 16] :q5-0))
                          (arr/->vec (run-embedding gpu packed-bytes [2 256] :q4-k))
                          (arr/->vec (run-embedding gpu q6-bytes [2 256] :q6-k))
                          (arr/->vec (run-embedding gpu q8-bytes [2 32] :q8-0))]))))

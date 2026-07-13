@@ -102,9 +102,10 @@
     (* d quant)))
 
 (defn- q5-0-value [bytes row cols column]
-  (let [block-index (+ (* row (quot cols 32)) (quot column 32))
+  (let [linear (+ (* row cols) column)
+        block-index (quot linear 32)
         block-offset (* block-index 22)
-        local (mod column 32)
+        local (mod linear 32)
         d (dtype/f16-bits->f32 (packed-u16 bytes block-offset))
         high-word (reduce (fn [value index]
                             (bit-or value

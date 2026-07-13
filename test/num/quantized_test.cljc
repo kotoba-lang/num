@@ -58,6 +58,21 @@
           (reduce + (q5-dense-row -0.25))]
          (arr/->vec (q/matmul input weight))))))
 
+(deftest q5-zero-blocks-can-span-logical-rows
+  (let [backend (cpu/cpu-backend)
+        bytes (q5-block 0.5)
+        table (q/table backend bytes [2 16] :q5-0)
+        matrix (q/matrix backend bytes [2 16] :q5-0)
+        indices (arr/from-vec backend [1 0] [2])
+        input (arr/from-vec backend (repeat 16 1.0) [1 16])
+        dense (q5-dense-row 0.5)]
+    (is (contract/approx-vec?
+         (vec (concat (subvec dense 16) (subvec dense 0 16)))
+         (arr/->vec (q/embedding indices table))))
+    (is (contract/approx-vec?
+         [(reduce + (subvec dense 0 16)) (reduce + (subvec dense 16))]
+         (arr/->vec (q/matmul input matrix))))))
+
 (deftest q4-k-matmul-matches-dense-oracle-without-expanding-weight
   (let [backend (cpu/cpu-backend)
         bytes (vec (concat (block 0.5 0.25) (block -0.125 0.5)))
