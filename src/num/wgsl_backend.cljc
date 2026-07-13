@@ -34,6 +34,19 @@
   [xs]
   (with-meta (vec xs) {:num.wgsl/dtype :u32}))
 
+(defn pack-bytes-u32
+  "Pack unsigned bytes into little-endian u32 words for storage shaders."
+  [bytes]
+  (u32-tag
+   (mapv (fn [offset]
+           (reduce (fn [word lane]
+                     (bit-or word
+                             (bit-shift-left
+                              (bit-and 0xff (nth bytes (+ offset lane) 0))
+                              (* lane 8))))
+                   0 (range 4)))
+         (range 0 (count bytes) 4))))
+
 (defn uni
   "Create + fill a uniform buffer from host seq `xs` (device pads to alignment).
   `xs` defaults to f32; pass it through `u32-tag` first for a u32 uniform (dims,
@@ -53,7 +66,10 @@
   p/IBackend
   (-backend-name [_] :wgsl)
   (-alloc [_ n] (w/-create-buffer dev n :storage))
-  (-free [_ _] nil)
+  (-free [_ h]
+    (when (satisfies? w/IGpuDeviceLifecycle dev)
+      (w/-destroy-buffer dev h))
+    nil)
   (-copy-from-host [_ xs]
     ;; Force `double` here exactly like num.cpu's -copy-from-host does: callers
     ;; routinely pass literal integers (e.g. `(arr/from-vec b [1 2 3 4] [4])`
@@ -86,7 +102,11 @@
   (-ewise1 [_ op xh n]
     (let [z (w/-create-buffer dev n :storage)]
       (w/-dispatch dev (get-pipeline dev pipes :ewise1)
-                   [xh z (uni dev (u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)]))]
+                   [xh z (uni dev (u32-tag
+                                   [({:exp 0 :relu 1 :neg 2 :silu 3
+                                      :sigmoid 4 :tanh 5
+                                      :sigmoid-gradient 6 :tanh-gradient 7
+                                      :gelu 8 :gelu-gradient 9} op)]))]
                    [(ceil-div n 64) 1 1])
       z))
 
@@ -124,6 +144,50 @@
       (w/-dispatch dev (get-pipeline dev pipes :spmv) [rp ci v xh y] [(ceil-div m 64) 1 1])
       y))
 
+  p/IQuantizedOps
+  (-quantized-from-host [_ bytes _params]
+    (let [words (pack-bytes-u32 bytes)
+          buffer (w/-create-buffer dev (count words) :storage)]
+      (w/-write-buffer dev buffer words)
+      buffer))
+  (-quantized-matmul [_ input-h weight-h
+                      {:keys [quant-type m k n blocks-per-row]}]
+    (when-not (#{:q4-k :q6-k :q8-0} quant-type)
+      (throw (ex-info "unsupported WGSL quantized matmul" {:quant-type quant-type})))
+    (let [output (w/-create-buffer dev (* m n) :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes
+                                     ({:q4-k :q4-k-matmul
+                                       :q6-k :q6-k-matmul
+                                       :q8-0 :q8-0-matmul} quant-type))
+                   [input-h weight-h output
+                    (uni dev (u32-tag [m k n blocks-per-row]))]
+                   [(* (ceil-div m 4) n) 1 1])
+      output))
+  (-quantized-embedding [_ indices-h table-h
+                         {:keys [quant-type rows dim count blocks-per-row total]}]
+    (let [pipeline ({:q4-k :q4-k-embedding :q6-k :q6-k-embedding
+                     :q8-0 :q8-0-embedding} quant-type)]
+      (when-not pipeline
+        (throw (ex-info "unsupported WGSL quantized embedding"
+                        {:quant-type quant-type})))
+      (let [output (w/-create-buffer dev total :storage)]
+        (w/-dispatch dev (get-pipeline dev pipes pipeline)
+                     [indices-h table-h output
+                      (uni dev (u32-tag [rows dim count blocks-per-row
+                                         total 0 0 0]))]
+                     [(ceil-div total 64) 1 1])
+        output)))
+
+  p/IMutableBufferOps
+  (-copy-into! [_ destination source offset n dtype*]
+    (when-not (= dtype* :f32)
+      (throw (ex-info "synchronous WGSL copy-into supports f32 only"
+                      {:dtype dtype*})))
+    (w/-dispatch dev (get-pipeline dev pipes :copy-into)
+                 [destination source (uni dev (u32-tag [offset n 0 0]))]
+                 [(ceil-div n 64) 1 1])
+    destination)
+
   p/ITensorBackend
   (-conv2d-nchw [_ input-h weight-h bias-h
                  {:keys [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw groups]}]
@@ -132,12 +196,16 @@
           bias (or bias-h (w/-create-buffer dev cout :storage))
           params [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw
                   groups 0 0 0]]
-      (w/-dispatch dev (get-pipeline dev pipes :conv2d-nchw)
-                   [input-h weight-h bias output (uni dev (u32-tag params))]
-                   [(ceil-div total 64) 1 1])
+      (let [oc4? (and (= groups 1) (zero? (mod cout 4)))
+            invocations (if oc4? (quot total 4) total)]
+        (w/-dispatch dev (get-pipeline dev pipes
+                                      (if oc4? :conv2d-nchw-oc4 :conv2d-nchw))
+                     [input-h weight-h bias output (uni dev (u32-tag params))]
+                     [(ceil-div invocations 64) 1 1]))
       output))
   (-group-norm-nchw [_ input-h weight-h bias-h
-                     {:keys [n c h width groups channels-group group-size eps]}]
+                     {:keys [n c h width groups channels-group group-size eps]
+                      :as params}]
     (let [total (* n c h width)
           output (w/-create-buffer dev total :storage)
           weight (or weight-h
@@ -145,10 +213,50 @@
                        (w/-write-buffer dev buffer (repeat c 1.0)) buffer))
           bias (or bias-h (w/-create-buffer dev c :storage))
           dims [n c h width groups channels-group group-size (* h width)]]
-      (w/-dispatch dev (get-pipeline dev pipes :group-norm-nchw)
+      (w/-dispatch dev (get-pipeline dev pipes
+                                    (if (:silu? params)
+                                      :group-norm-silu-nchw :group-norm-nchw))
                    [input-h weight bias output (uni dev (u32-tag dims))
                     (uni dev [(double eps)])]
                    [(* n groups) 1 1])
+      output))
+  (-embedding [_ indices-h weight-h {:keys [tokens rows dim]}]
+    (let [total (* tokens dim)
+          output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :embedding)
+                   [indices-h weight-h output
+                    (uni dev (u32-tag [tokens rows dim 0]))]
+                   [(ceil-div total 64) 1 1])
+      output))
+  (-rms-norm [_ input-h weight-h {:keys [rows dim eps]}]
+    (let [output (w/-create-buffer dev (* rows dim) :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :rms-norm)
+                   [input-h weight-h output (uni dev (u32-tag [rows dim 0 0]))
+                    (uni dev [(double eps)])]
+                   [rows 1 1])
+      output))
+  (-rotary-embedding [_ input-h {:keys [batch sequence embed heads head-dim
+                                         position-offset theta direction]}]
+    (let [total (* batch sequence embed)
+          output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :rotary-embedding)
+                   [input-h output
+                    (uni dev (u32-tag [batch sequence embed heads head-dim
+                                       position-offset 0 0]))
+                    (uni dev [(double theta)]) (uni dev [(double direction)])]
+                   [(ceil-div total 64) 1 1])
+      output))
+  (-rgb-image-to-nchw [_ input-h {:keys [height width total]}]
+    (let [output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :rgb-image-to-nchw)
+                   [input-h output (uni dev (u32-tag [height width total 0]))]
+                   [(ceil-div total 64) 1 1])
+      output))
+  (-nchw-to-rgb-image [_ input-h {:keys [height width total]}]
+    (let [output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :nchw-to-rgb-image)
+                   [input-h output (uni dev (u32-tag [height width total 0]))]
+                   [(ceil-div total 64) 1 1])
       output))
   (-upsample-nearest2d [_ input-h {:keys [n c h width oh ow scale-h scale-w]}]
     (let [total (* n c oh ow)
@@ -166,6 +274,19 @@
                      [input-h output (uni dev (u32-tag [total block output-block axis-offset]))]
                      [(ceil-div total 64) 1 1]))
       output))
+  (-slice-axis [_ input-h {:keys [total input-block output-block input-offset]}]
+    (let [output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :slice-axis)
+                   [input-h output
+                    (uni dev (u32-tag [total input-block output-block input-offset]))]
+                   [(ceil-div total 64) 1 1])
+      output))
+  (-pad-right-bottom-nchw [_ input-h {:keys [total h width output-width]}]
+    (let [output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :pad-right-bottom-nchw)
+                   [input-h output (uni dev (u32-tag [total h width output-width]))]
+                   [(ceil-div total 64) 1 1])
+      output))
   (-add-last-axis-bias [_ input-h bias-h {:keys [total width]}]
     (let [output (w/-create-buffer dev total :storage)]
       (w/-dispatch dev (get-pipeline dev pipes :add-last-axis-bias)
@@ -177,6 +298,28 @@
       (w/-dispatch dev (get-pipeline dev pipes :transpose-2d)
                    [input-h output (uni dev (u32-tag [rows cols]))]
                    [(ceil-div cols 16) (ceil-div rows 16) 1])
+      output))
+  (-transpose-nd [_ input-h {:keys [rank total input-shape output-shape perm]}]
+    (let [pad4 #(vec (take 4 (concat % (repeat 0))))
+          params (concat [rank total 0 0] (pad4 input-shape)
+                         (pad4 output-shape) (pad4 perm))
+          output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :transpose-nd)
+                   [input-h output (uni dev (u32-tag params))]
+                   [(ceil-div total 64) 1 1])
+      output))
+  (-batched-matmul [_ a-h b-h {:keys [batch-shape batch-a batch-b batch-rank
+                                       batches m k n total]}]
+    (let [align (fn [shape]
+                  (vec (concat (repeat (- batch-rank (count shape)) 1) shape
+                               (repeat (- 4 batch-rank) 1))))
+          out-shape (vec (concat batch-shape (repeat (- 4 batch-rank) 1)))
+          params (concat [batch-rank batches m n] [k total 0 0]
+                         out-shape (align batch-a) (align batch-b))
+          output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :batched-matmul)
+                   [a-h b-h output (uni dev (u32-tag params))]
+                   [(ceil-div total 64) 1 1])
       output))
   (-sum-rows [_ input-h {:keys [rows cols]}]
     (let [output (w/-create-buffer dev cols :storage)]
@@ -205,25 +348,53 @@
                     (uni dev (u32-tag [count]))]
                    [(ceil-div count 64) 1 1])
       output))
+  (-adamw-step [_ parameter-h gradient-h moment-h variance-h
+                {:keys [count learning-rate beta1 beta2 eps weight-decay
+                        correction1 correction2]}]
+    (let [moment (or moment-h (w/-create-buffer dev count :storage))
+          variance (or variance-h (w/-create-buffer dev count :storage))
+          next-parameter (w/-create-buffer dev count :storage)
+          next-moment (w/-create-buffer dev count :storage)
+          next-variance (w/-create-buffer dev count :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :adamw-step)
+                   [parameter-h gradient-h moment variance
+                    next-parameter next-moment next-variance
+                    (uni dev (mapv double
+                                   [learning-rate beta1 beta2 eps weight-decay
+                                    correction1 correction2 0.0]))
+                    (uni dev (u32-tag [count]))]
+                   [(ceil-div count 64) 1 1])
+      {:parameter next-parameter :moment next-moment
+       :variance next-variance}))
+  (-unscale-gradient [_ gradient-h {:keys [count inverse-scale]}]
+    (let [output (w/-create-buffer dev count :storage)
+          found-inf (w/-create-buffer dev 1 :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :unscale-gradient)
+                   [gradient-h output found-inf
+                    (uni dev [(double inverse-scale)])
+                    (uni dev (u32-tag [count]))]
+                   [(ceil-div count 64) 1 1])
+      {:gradient output :found-inf found-inf}))
   (-multi-head-attention [_ query-h key-h value-h key-padding-mask-h
-                          {:keys [batch seq-q seq-k d-model heads head-dim total
+                          {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim total
                                   causal? has-key-padding-mask?]}]
     (let [output (w/-create-buffer dev total :storage)
           mask (or key-padding-mask-h
                    (w/-create-buffer dev (* batch seq-k) :storage))]
       (w/-dispatch dev (get-pipeline dev pipes :multi-head-attention)
                    [query-h key-h value-h mask output
-                    (uni dev (u32-tag [batch seq-q seq-k d-model heads
-                                       head-dim total (if causal? 1 0)
-                                       (if has-key-padding-mask? 1 0) 0 0 0]))]
+                    (uni dev (u32-tag [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total
+                                       (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0]))]
                    [(ceil-div total 64) 1 1])
       output))
   (-multi-head-attention-backward [_ query-h key-h value-h key-padding-mask-h
                                    grad-output-h
-                                   {:keys [batch seq-q seq-k d-model heads head-dim
+                                   {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim
                                            causal? has-key-padding-mask?]}]
     (let [total-q (* batch seq-q d-model)
-          total-k (* batch seq-k d-model)
+          total-k (* batch seq-k kv-d-model)
           total (max total-q total-k)
           mask (or key-padding-mask-h
                    (w/-create-buffer dev (* batch seq-k) :storage))
@@ -233,9 +404,10 @@
       (w/-dispatch dev (get-pipeline dev pipes :multi-head-attention-backward)
                    [query-h key-h value-h mask grad-output-h
                     grad-query grad-key grad-value
-                    (uni dev (u32-tag [batch seq-q seq-k d-model heads head-dim
-                                       total-q total-k total (if causal? 1 0)
-                                       (if has-key-padding-mask? 1 0) 0]))]
+                    (uni dev (u32-tag [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total-q total-k total
+                                       (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0 0 0]))]
                    [(ceil-div total 64) 1 1])
       {:query grad-query :key grad-key :value grad-value})))
 

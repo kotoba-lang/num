@@ -11,19 +11,51 @@
   (testing "every accelerated IBackend op has a non-empty WGSL kernel"
     (doseq [op [:axpy :scal :ewise :ewise1 :reduce :gemv :gemm
                 :ewise-f16 :ewise1-f16 :gemm-f16
-                :conv2d-nchw-f16 :group-norm-nchw-f16
-                :conv2d-nchw :group-norm-nchw :upsample-nearest2d :cat-copy
+                :conv2d-nchw-f16 :conv2d-nchw-f16-oc4 :group-norm-nchw-f16
+                :conv2d-nchw :conv2d-nchw-oc4
+                :group-norm-nchw :group-norm-silu-nchw
+                :upsample-nearest2d :cat-copy
+                :slice-axis :pad-right-bottom-nchw
+                :rgb-image-to-nchw :nchw-to-rgb-image
                 :add-last-axis-bias :multi-head-attention
                 :multi-head-attention-backward :transpose-2d :bias-gradient
-                :mse-loss :mse-gradient :sgd-step :spmv]]
+                :transpose-nd
+                :batched-matmul
+                :mse-loss :mse-gradient :sgd-step :adamw-step
+                :unscale-gradient :spmv
+                :q4-k-matmul :q6-k-matmul :q8-0-matmul
+                :q4-k-embedding :q6-k-embedding :q8-0-embedding]]
       (is (string? (get w/shaders op)) (str "missing shader: " op))
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"
     (is (re-find #"var<workgroup>" (:gemm w/shaders))))
+  (testing "fused GroupNorm applies SiLU in the normalization kernel"
+    (is (re-find #"exp\(-normalized\)" (:group-norm-silu-nchw w/shaders))))
   (testing "typed kernels use packed physical halves and accumulate GEMM in f32"
     (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"var sum: f32" (:gemm-f16 w/shaders)))))
+
+(deftest packed-f16-convolution-reuses-input-across-four-output-channels
+  (let [shader (:conv2d-nchw-f16-oc4 w/shaders)]
+    (is (re-find #"fn convolve4" shader))
+    (is (re-find #"vec4<f32>\(x\) \* weights" shader))
+    (is (re-find #"pack2x16float" shader))))
+
+(deftest image-boundary-shaders-fuse-layout-and-range-conversion
+  (is (re-find #"let source" (:rgb-image-to-nchw w/shaders)))
+  (is (re-find #"2\.0 \* input\[source\] - 1\.0"
+               (:rgb-image-to-nchw w/shaders)))
+  (is (re-find #"clamp" (:nchw-to-rgb-image w/shaders))))
+
+(deftest quantized-matmul-parallelizes-k-with-workgroup-reduction
+  (doseq [op [:q4-k-matmul :q6-k-matmul :q8-0-matmul]
+          :let [shader (get w/shaders op)]]
+    (is (re-find #"var<workgroup> partial" shader))
+    (is (re-find #"inner = inner \+ 64u" shader))
+    (is (re-find #"tile \* 4u" shader))
+    (is (re-find #"var sums = vec4<f32>" shader))
+    (is (re-find #"workgroupBarrier" shader))))
 
 (deftest attention-backward-shader-covers-all-three-gradients
   (let [shader (:multi-head-attention-backward w/shaders)]
@@ -83,3 +115,15 @@
   (is (re-find #"preactivation\[i\] > 0.0" w/relu-backward-wgsl))
   (is (re-find #"for \(var row" w/bias-gradient-wgsl))
   (is (re-find #"learning_rate \* gradient" w/sgd-update-wgsl)))
+
+(deftest adamw-kernel-updates-all-state-out-of-place
+  (is (re-find #"next_parameter\[i\]" w/adamw-step-wgsl))
+  (is (re-find #"next_moment\[i\] = m" w/adamw-step-wgsl))
+  (is (re-find #"next_variance\[i\] = v" w/adamw-step-wgsl))
+  (is (re-find #"weight_decay \* parameter\[i\]" w/adamw-step-wgsl)))
+
+(deftest unscale-kernel-atomically-reports-nonfinite-values
+  (is (re-find #"value != value" w/unscale-gradient-wgsl))
+  (is (re-find #"abs\(value\) >" w/unscale-gradient-wgsl))
+  (is (re-find #"atomicOr\(&found_inf, 1u\)" w/unscale-gradient-wgsl))
+  (is (re-find #"value \* inverse_scale" w/unscale-gradient-wgsl)))

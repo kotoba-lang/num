@@ -220,6 +220,89 @@
                           (arr/->vec parameter) (arr/->vec gradient))
                     (:shape parameter) (array-dtype parameter)))))
 
+(defn adamw-step
+  "Immutable fused AdamW update of parameter, first moment, and variance.
+
+  `moment` and `variance` may be nil on the first step. Device backends allocate
+  zero slots without host transfer; the portable oracle has identical math."
+  [parameter gradient moment variance step
+   {:keys [learning-rate beta1 beta2 eps weight-decay]}]
+  (let [shape (:shape parameter)
+        backend (:backend parameter)
+        dtype (array-dtype parameter)
+        inputs (remove nil? [parameter gradient moment variance])]
+    (when-not (and (pos-int? step)
+                   (every? #(= shape (:shape %)) inputs)
+                   (every? #(= backend (:backend %)) inputs)
+                   (every? #(= dtype (array-dtype %)) inputs))
+      (throw (ex-info "num.tensor/adamw-step: incompatible tensors or step"
+                      {:shape shape :step step})))
+    (when-not (and (pos? learning-rate) (< 0.0 beta1 1.0)
+                   (< 0.0 beta2 1.0) (pos? eps)
+                   (not (neg? weight-decay)))
+      (throw (ex-info "num.tensor/adamw-step: invalid options"
+                      {:options {:learning-rate learning-rate :beta1 beta1
+                                 :beta2 beta2 :eps eps
+                                 :weight-decay weight-decay}})))
+    (let [count (arr/nelems shape)
+          correction1 (- 1.0 (Math/pow beta1 step))
+          correction2 (- 1.0 (Math/pow beta2 step))]
+      (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+        (let [{:keys [parameter moment variance]}
+              (p/-adamw-step backend (:handle parameter) (:handle gradient)
+                             (:handle moment) (:handle variance)
+                             {:count count :learning-rate learning-rate
+                              :beta1 beta1 :beta2 beta2 :eps eps
+                              :weight-decay weight-decay
+                              :correction1 correction1
+                              :correction2 correction2})
+              array #(assoc (arr/->NDArray backend % shape) :dtype :f32)]
+          {:parameter (array parameter) :moment (array moment)
+           :variance (array variance)})
+        (let [ps (arr/->vec parameter) gs (arr/->vec gradient)
+              ms (if moment (arr/->vec moment) (repeat count 0.0))
+              vs (if variance (arr/->vec variance) (repeat count 0.0))
+              next-m (mapv #(+ (* beta1 %1) (* (- 1.0 beta1) %2)) ms gs)
+              next-v (mapv #(+ (* beta2 %1) (* (- 1.0 beta2) %2 %2)) vs gs)
+              next-p (mapv (fn [p m v]
+                             (let [m-hat (/ m correction1)
+                                   v-hat (/ v correction2)]
+                               (- p (* learning-rate
+                                       (+ (/ m-hat (+ (Math/sqrt v-hat) eps))
+                                          (* weight-decay p))))))
+                           ps next-m next-v)]
+          {:parameter (arr/from-vec backend next-p shape dtype)
+           :moment (arr/from-vec backend next-m shape dtype)
+           :variance (arr/from-vec backend next-v shape dtype)})))))
+
+(defn unscale-gradient
+  "Divide one gradient by `scale` and return a device-readable overflow flag.
+
+  The result is `{:gradient NDArray :found-inf NDArray-scalar}`. The scalar is
+  zero when all source values are finite and positive otherwise. GPU backends
+  perform both operations in one dispatch without downloading the gradient."
+  [gradient scale]
+  (when-not (and (number? scale) (pos? scale))
+    (throw (ex-info "num.tensor/unscale-gradient: scale must be positive"
+                    {:scale scale})))
+  (let [backend (:backend gradient) shape (:shape gradient)
+        dtype (array-dtype gradient) count (arr/nelems shape)]
+    (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+      (let [{:keys [gradient found-inf]}
+            (p/-unscale-gradient backend (:handle gradient)
+                                 {:count count :inverse-scale (/ 1.0 scale)})]
+        {:gradient (assoc (arr/->NDArray backend gradient shape) :dtype :f32)
+         :found-inf (assoc (arr/->NDArray backend found-inf []) :dtype :f32)})
+      (let [found? (volatile! false)
+            values (mapv (fn [value]
+                           (when-not #?(:clj (Double/isFinite (double value))
+                                        :cljs (js/isFinite value))
+                             (vreset! found? true))
+                           (/ value scale))
+                         (arr/->vec gradient))]
+        {:gradient (arr/from-vec backend values shape dtype)
+         :found-inf (arr/from-vec backend [(if @found? 1.0 0.0)] [] :f32)}))))
+
 ;; --- reshape / transpose / squeeze / unsqueeze --------------------------------
 
 (defn reshape
@@ -275,15 +358,21 @@
                         {:shape shape :perm perm})))
      (let [out-shape (mapv shape perm)
            backend (:backend a)]
-       (if (and (= r 2) (= perm [1 0]) (= :f32 (array-dtype a))
+       (if (and (<= 1 r 4) (= :f32 (array-dtype a))
                 (satisfies? p/ITensorBackend backend))
-         (assoc (arr/->NDArray
-                 backend
-                 (p/-transpose-2d backend (:handle a)
-                                  {:rows (long (first shape))
-                                   :cols (long (second shape))})
-                 out-shape)
-                :dtype :f32)
+         (assoc
+          (arr/->NDArray
+           backend
+           (if (and (= r 2) (= perm [1 0]))
+             (p/-transpose-2d backend (:handle a)
+                              {:rows (long (first shape))
+                               :cols (long (second shape))})
+             (p/-transpose-nd backend (:handle a)
+                              {:rank r :total (arr/nelems out-shape)
+                               :input-shape shape :output-shape out-shape
+                               :perm perm}))
+           out-shape)
+          :dtype :f32)
          (let [in-strides (row-major-strides shape)
                out-strides (row-major-strides out-shape)
                xs (double-array (arr/->vec a))
@@ -393,23 +482,36 @@
               batch-b (vec (drop-last 2 sb))
               batch-shape (broadcast-shapes batch-a batch-b)
               nb (long (arr/nelems batch-shape))
-              A' (broadcast-to A (into batch-shape [m ka]))
-              B' (broadcast-to B (into batch-shape [ka n]))
-              xa (double-array (arr/->vec A'))
-              xb (double-array (arr/->vec B'))
-              out (double-array (* nb m n))]
-          (dotimes [bi nb]
-            (let [a-off (* bi m ka) b-off (* bi ka n) c-off (* bi m n)]
-              (dotimes [i m]
-                (dotimes [j n]
-                  (let [s (loop [l 0 s 0.0]
-                            (if (< l ka)
-                              (recur (inc l)
-                                     (+ s (* (aget xa (+ a-off (* i ka) l))
-                                             (aget xb (+ b-off (* l n) j)))))
-                              s))]
-                    (aset out (+ c-off (* i n) j) s))))))
-          (arr/from-vec (:backend A) (vec out) (into batch-shape [m n])))))))
+              backend (:backend A)
+              out-shape (into batch-shape [m n])]
+          (if (and (= backend (:backend B)) (= :f32 (array-dtype A))
+                   (= :f32 (array-dtype B)) (<= (count batch-shape) 2)
+                   (satisfies? p/ITensorBackend backend))
+            (assoc (arr/->NDArray
+                    backend
+                    (p/-batched-matmul
+                     backend (:handle A) (:handle B)
+                     {:batch-shape batch-shape :batch-a batch-a :batch-b batch-b
+                      :batch-rank (count batch-shape) :batches nb
+                      :m m :k ka :n n :total (* nb m n)})
+                    out-shape) :dtype :f32)
+            (let [A' (broadcast-to A (into batch-shape [m ka]))
+                  B' (broadcast-to B (into batch-shape [ka n]))
+                  xa (double-array (arr/->vec A'))
+                  xb (double-array (arr/->vec B'))
+                  out (double-array (* nb m n))]
+              (dotimes [bi nb]
+                (let [a-off (* bi m ka) b-off (* bi ka n) c-off (* bi m n)]
+                  (dotimes [i m]
+                    (dotimes [j n]
+                      (let [s (loop [l 0 s 0.0]
+                                (if (< l ka)
+                                  (recur (inc l)
+                                         (+ s (* (aget xa (+ a-off (* i ka) l))
+                                                 (aget xb (+ b-off (* l n) j)))))
+                                  s))]
+                        (aset out (+ c-off (* i n) j) s))))))
+              (arr/from-vec backend (vec out) out-shape))))))))
 
 ;; --- softmax (ADR-2607131500 Phase 1) ------------------------------------------
 ;; Everything below reuses ONLY the primitives already real above (amax/sub/sum/
@@ -644,6 +746,61 @@
   [input]
   (nm/silu input))
 
+(defn rgb-image-to-nchw
+  "Convert contiguous `[batch,height,width,3]` RGB `[0,1]` to
+  `[batch,3,height,width]` in `[-1,1]`, device-native when available."
+  [input]
+  (let [[batch height width channels :as shape] (:shape input)
+        backend (:backend input) total (arr/nelems shape)
+        output-shape [batch channels height width]]
+    (when-not (and (= 4 (count shape)) (= 3 channels))
+      (throw (ex-info "rgb-image-to-nchw requires NHWC RGB" {:shape shape})))
+    (if (and (= :f32 (array-dtype input)) (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray backend
+                            (p/-rgb-image-to-nchw
+                             backend (:handle input)
+                             {:batch batch :height height :width width :total total})
+                            output-shape) :dtype :f32)
+      (let [source (vec (arr/->vec input))]
+        (arr/from-vec
+         backend
+         (mapv (fn [index]
+                 (let [spatial (mod index (* height width))
+                       channel (mod (quot index (* height width)) 3)
+                       b (quot index (* 3 height width))
+                       input-index (+ (* b height width 3) (* spatial 3) channel)]
+                   (- (* 2.0 (nth source input-index)) 1.0)))
+               (range total))
+         output-shape (array-dtype input))))))
+
+(defn nchw-to-rgb-image
+  "Convert contiguous `[batch,3,height,width]` model output to clamped
+  `[batch,height,width,3]` RGB `[0,1]`, device-native when available."
+  [input]
+  (let [[batch channels height width :as shape] (:shape input)
+        backend (:backend input) total (arr/nelems shape)
+        output-shape [batch height width channels]]
+    (when-not (and (= 4 (count shape)) (= 3 channels))
+      (throw (ex-info "nchw-to-rgb-image requires NCHW RGB" {:shape shape})))
+    (if (and (= :f32 (array-dtype input)) (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray backend
+                            (p/-nchw-to-rgb-image
+                             backend (:handle input)
+                             {:batch batch :height height :width width :total total})
+                            output-shape) :dtype :f32)
+      (let [source (vec (arr/->vec input))]
+        (arr/from-vec
+         backend
+         (mapv (fn [index]
+                 (let [channel (mod index 3)
+                       spatial (mod (quot index 3) (* height width))
+                       b (quot index (* height width 3))
+                       input-index (+ (* b 3 height width)
+                                      (* channel height width) spatial)]
+                   (max 0.0 (min 1.0 (* 0.5 (+ 1.0 (nth source input-index)))))))
+               (range total))
+         output-shape (array-dtype input))))))
+
 (defn cat
   "Concatenate equal-rank tensors along `axis` (PyTorch `torch.cat` shape
   semantics). All non-concatenated dimensions must match. ITensorBackend
@@ -706,6 +863,115 @@
             (arr/from-vec backend (vec out) out-shape
                           (array-dtype (first tensors)))))))))
 
+(defn slice-axis
+  "Select the half-open contiguous range `[start,end)` along `axis`, matching
+  the basic (step=1) PyTorch slice. Device tensor backends copy device-to-device."
+  [input axis start end]
+  (let [shape (:shape input)
+        rank (count shape)
+        axis (long (if (neg? axis) (+ rank axis) axis))]
+    (when-not (< -1 axis rank)
+      (throw (ex-info "num.tensor/slice-axis axis out of range"
+                      {:axis axis :rank rank})))
+    (let [axis-size (long (nth shape axis))
+          start (long start)
+          end (long end)]
+      (when-not (<= 0 start end axis-size)
+        (throw (ex-info "num.tensor/slice-axis range out of bounds"
+                        {:shape shape :axis axis :start start :end end})))
+      (let [inner (long (arr/nelems (subvec shape (inc axis))))
+            input-block (* axis-size inner)
+            output-block (* (- end start) inner)
+            out-shape (assoc shape axis (- end start))
+            total (arr/nelems out-shape)
+            backend (:backend input)
+            dtype (array-dtype input)]
+        (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+          (assoc (arr/->NDArray
+                  backend
+                  (p/-slice-axis backend (:handle input)
+                                 {:total total :input-block input-block
+                                  :output-block output-block
+                                  :input-offset (* start inner)})
+                  out-shape)
+                 :dtype :f32)
+          (let [source (arr/->vec input)
+                outer (arr/nelems (subvec shape 0 axis))
+                output (vec
+                        (mapcat (fn [outer-index]
+                                  (let [base (+ (* outer-index input-block)
+                                                (* start inner))]
+                                    (subvec source base (+ base output-block))))
+                                (range outer)))]
+            (arr/from-vec backend output out-shape dtype)))))))
+
+(defn pad-right-bottom-nchw
+  "Append one zero column and one zero row to an NCHW tensor. This is the
+  asymmetric padding used by Diffusers AutoencoderKL downsampling."
+  [input]
+  (let [[n c h width :as shape] (:shape input)]
+    (when-not (= 4 (count shape))
+      (throw (ex-info "num.tensor/pad-right-bottom-nchw requires rank-4 NCHW"
+                      {:shape shape})))
+    (let [out-shape [n c (inc h) (inc width)]
+          total (arr/nelems out-shape)
+          backend (:backend input)
+          dtype (array-dtype input)]
+      (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+        (assoc (arr/->NDArray
+                backend
+                (p/-pad-right-bottom-nchw
+                 backend (:handle input)
+                 {:total total :h h :width width :output-width (inc width)})
+                out-shape)
+               :dtype :f32)
+        (let [source (arr/->vec input)
+              output (vec
+                      (for [plane (range (* n c))
+                            y (range (inc h))
+                            x (range (inc width))]
+                        (if (or (= y h) (= x width))
+                          0.0
+                          (nth source (+ (* plane h width) (* y width) x)))))]
+          (arr/from-vec backend output out-shape dtype))))))
+
+(defn scale
+  "Return `input * factor` without mutating `input`. f32 tensor backends first
+  copy device-to-device and then dispatch their in-place BLAS scale kernel."
+  [input factor]
+  (let [shape (:shape input)
+        dtype (array-dtype input)]
+    (when (empty? shape)
+      (throw (ex-info "num.tensor/scale requires a non-scalar tensor"
+                      {:shape shape})))
+    (let [copy (slice-axis input 0 0 (first shape))]
+      (if (= :f32 dtype)
+        (nm/scal! (double factor) copy)
+        (arr/from-vec (:backend input)
+                      (mapv #(* (double factor) %) (arr/->vec copy))
+                      shape dtype)))))
+
+(defn copy-into!
+  "Copy all contiguous elements of `source` into preallocated `destination`
+  at a linear element offset. Mutates and returns destination."
+  [destination source destination-offset]
+  (require-same-dtype! "num.tensor/copy-into!" [destination source])
+  (let [backend (:backend destination)
+        offset (long destination-offset)
+        n (arr/nelems (:shape source))
+        capacity (arr/nelems (:shape destination))
+        dtype (array-dtype destination)]
+    (when-not (= backend (:backend source))
+      (throw (ex-info "copy-into arrays must share a backend" {})))
+    (when-not (and (<= 0 offset) (<= (+ offset n) capacity))
+      (throw (ex-info "copy-into destination range is out of bounds"
+                      {:offset offset :count n :capacity capacity})))
+    (when-not (satisfies? p/IMutableBufferOps backend)
+      (throw (ex-info "backend does not support device buffer writes"
+                      {:backend (p/-backend-name backend)})))
+    (p/-copy-into! backend (:handle destination) (:handle source) offset n dtype)
+    destination))
+
 (defn group-norm-nchw
   "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
   (`unbiased=false`), as in `torch.nn.GroupNorm`. Optional affine `weight` and
@@ -713,6 +979,8 @@
   the portable fallback is the CPU oracle below."
   ([input num-groups] (group-norm-nchw input num-groups nil nil 1.0e-5))
   ([input num-groups weight bias eps]
+   (group-norm-nchw input num-groups weight bias eps false))
+  ([input num-groups weight bias eps silu?]
    (require-same-dtype! "num.tensor/group-norm-nchw" [input weight bias])
    (let [[N C H W :as shape] (:shape input)
          groups (long num-groups)]
@@ -730,7 +998,7 @@
            backend (:backend input)
            params {:n N :c C :h H :width W :groups groups
                    :channels-group channels-per-group :group-size group-size
-                   :eps eps}]
+                   :eps eps :silu? silu?}]
        (cond
          (and (not= :f32 (array-dtype input))
               (satisfies? p/IDTypeTensorOps backend))
@@ -774,10 +1042,196 @@
                                     (quot i (* H W)))
                          normalized (* (- (aget xs (+ base i)) mean) inv-std)
                          value (+ (* normalized (if ws (aget ws channel) 1.0))
-                                  (if bs (aget bs channel) 0.0))]
+                                  (if bs (aget bs channel) 0.0))
+                         value (if silu?
+                                 (/ value (+ 1.0 (Math/exp (- value)))) value)]
                      (aset out (+ base i) value))))))
            (arr/from-vec backend (vec out) [N C H W]
                          (array-dtype input))))))))
+
+(defn group-norm-silu-nchw
+  "Fused PyTorch GroupNorm followed by SiLU. f32 ITensorBackend execution uses
+  one kernel and one output buffer; other dtypes preserve semantics by composition."
+  ([input num-groups]
+   (group-norm-silu-nchw input num-groups nil nil 1.0e-5))
+  ([input num-groups weight bias eps]
+   (if (= :f32 (array-dtype input))
+     (group-norm-nchw input num-groups weight bias eps true)
+     (silu (group-norm-nchw input num-groups weight bias eps)))))
+
+(defn layer-norm-last
+  "PyTorch-compatible LayerNorm over the final tensor dimension. `weight` and
+  `bias` are optional `[features]` affine parameters. The implementation
+  reshapes contiguous rows to `[rows features 1 1]` and dispatches the
+  mathematically equivalent one-group GroupNorm path, including its native
+  f32/f16 GPU kernels."
+  ([input] (layer-norm-last input nil nil 1.0e-5))
+  ([input weight bias eps]
+   (let [shape (vec (:shape input))]
+     (when (empty? shape)
+       (throw (ex-info "num.tensor/layer-norm-last requires rank >= 1"
+                       {:shape shape})))
+     (let [features (long (peek shape))
+           rows (quot (arr/nelems shape) features)]
+       (when-not (pos? features)
+         (throw (ex-info "layer norm final dimension must be positive"
+                         {:shape shape})))
+       (-> (reshape input [rows features 1 1])
+           (group-norm-nchw 1 weight bias eps)
+           (reshape shape))))))
+
+(defn embedding
+  "Gather rows from `[num-embeddings embedding-dim]` `weight` using a tensor
+  of integer-valued token IDs. The output shape is `indices-shape + [dim]`.
+  Device backends execute a gather kernel; the portable oracle validates every
+  token and throws for fractional or out-of-range IDs."
+  [indices weight]
+  (let [[rows dim :as weight-shape] (:shape weight)
+        index-shape (vec (:shape indices))
+        backend (:backend weight)
+        tokens (arr/nelems index-shape)
+        dtype (array-dtype weight)
+        params {:tokens tokens :rows rows :dim dim}]
+    (when-not (and (= 2 (count weight-shape)) (pos? rows) (pos? dim))
+      (throw (ex-info "embedding weight must have shape [rows dim]"
+                      {:shape weight-shape})))
+    (when-not (and (= :f32 (array-dtype indices))
+                   (= backend (:backend indices)))
+      (throw (ex-info "embedding indices must be f32 on the weight backend"
+                      {:indices-dtype (array-dtype indices)})))
+    (cond
+      (and (= dtype :f32) (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray backend
+                            (p/-embedding backend (:handle indices)
+                                          (:handle weight) params)
+                            (conj index-shape dim)) :dtype :f32)
+
+      (and (not= dtype :f32) (satisfies? p/IDTypeTensorOps backend))
+      (assoc (arr/->NDArray backend
+                            (p/-embedding-dtype backend (:handle indices)
+                                                (:handle weight) params dtype)
+                            (conj index-shape dim)) :dtype dtype)
+
+      :else
+      (let [ids (arr/->vec indices)
+            weights (vec (arr/->vec weight))]
+        (doseq [id ids]
+          (when-not (and (== (double id) (Math/floor (double id)))
+                         (<= 0 id) (< id rows))
+            (throw (ex-info "embedding token ID is out of range or fractional"
+                            {:token id :rows rows}))))
+        (arr/from-vec backend
+                      (mapcat (fn [id]
+                                (subvec weights (* (long id) dim)
+                                        (* (inc (long id)) dim)))
+                              ids)
+                      (conj index-shape dim) dtype)))))
+
+(defn rms-norm-last
+  "Llama/Ollama-style RMSNorm over the final dimension: `x / rms(x) * weight`.
+  Unlike LayerNorm it does not subtract the mean and has no bias. GPU kernels
+  use one 64-lane workgroup per row with f32 accumulation."
+  ([input weight] (rms-norm-last input weight 1.0e-5))
+  ([input weight eps]
+   (require-same-dtype! "num.tensor/rms-norm-last" [input weight])
+   (let [shape (vec (:shape input))]
+     (when (empty? shape)
+       (throw (ex-info "rms norm requires rank >= 1" {:shape shape})))
+     (let [dim (long (peek shape))
+           rows (quot (arr/nelems shape) dim)
+           backend (:backend input)
+           dtype (array-dtype input)
+           params {:rows rows :dim dim :eps eps}]
+       (when-not (= [dim] (:shape weight))
+         (throw (ex-info "rms norm weight must match the final dimension"
+                         {:input shape :weight (:shape weight)})))
+       (cond
+         (and (= dtype :f32) (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray backend
+                               (p/-rms-norm backend (:handle input)
+                                            (:handle weight) params)
+                               shape) :dtype :f32)
+
+         (and (not= dtype :f32) (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray backend
+                               (p/-rms-norm-dtype backend (:handle input)
+                                                  (:handle weight) params dtype)
+                               shape) :dtype dtype)
+
+         :else
+         (let [xs (vec (arr/->vec input)) ws (vec (arr/->vec weight))]
+           (arr/from-vec
+            backend
+            (mapcat (fn [row]
+                      (let [start (* row dim)
+                            values (subvec xs start (+ start dim))
+                            inv-rms (/ 1.0 (Math/sqrt
+                                            (+ eps (/ (reduce + (map #(* % %) values))
+                                                      dim))))]
+                        (mapv #(* %1 inv-rms %2) values ws)))
+                    (range rows))
+            shape dtype)))))))
+
+(defn rotary-embedding
+  "Apply Llama-style rotary position embedding independently inside each
+  attention head. Accepts `[sequence embed]` or `[batch sequence embed]`.
+  Options: `:theta` (default 10000), `:position-offset`, and internal
+  `:inverse?` for the exact transpose/VJP rotation."
+  ([input num-heads] (rotary-embedding input num-heads {}))
+  ([input num-heads {:keys [theta position-offset inverse?]
+                     :or {theta 10000.0 position-offset 0 inverse? false}}]
+   (let [shape (vec (:shape input)) rank (count shape)
+         [batch sequence embed] (case rank
+                                  2 [1 (first shape) (second shape)]
+                                  3 shape
+                                  nil)
+         heads (long num-heads)]
+     (when-not (and batch (pos? batch) (pos? sequence) (pos? embed)
+                    (pos? heads) (zero? (mod embed heads))
+                    (even? (quot embed heads))
+                    (pos? theta) (not (neg? position-offset)))
+       (throw (ex-info "rotary embedding requires rank 2/3, divisible heads, and even head dim"
+                       {:shape shape :heads heads :theta theta
+                        :position-offset position-offset})))
+     (let [head-dim (quot embed heads)
+           backend (:backend input) dtype (array-dtype input)
+           params {:batch batch :sequence sequence :embed embed :heads heads
+                   :head-dim head-dim :position-offset (long position-offset)
+                   :theta (double theta) :direction (if inverse? -1.0 1.0)}]
+       (cond
+         (and (= dtype :f32) (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray backend
+                               (p/-rotary-embedding backend (:handle input) params)
+                               shape) :dtype :f32)
+
+         (and (not= dtype :f32) (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray backend
+                               (p/-rotary-embedding-dtype backend (:handle input)
+                                                          params dtype)
+                               shape) :dtype dtype)
+
+         :else
+         (let [xs (vec (arr/->vec input)) half (quot head-dim 2)
+               direction (:direction params)]
+           (arr/from-vec
+            backend
+            (mapv (fn [i]
+                    (let [feature (mod i embed)
+                          local (mod feature head-dim)
+                          second-half? (>= local half)
+                          frequency-index (if second-half? (- local half) local)
+                          pair-local (if second-half? (- local half) (+ local half))
+                          pair (+ (- i local) pair-local)
+                          position (+ (mod (quot i embed) sequence) position-offset)
+                          angle (* direction position
+                                   (Math/pow theta (/ (* -2.0 frequency-index)
+                                                      head-dim)))
+                          c (Math/cos angle) s (Math/sin angle)]
+                      (if second-half?
+                        (+ (* (nth xs i) c) (* (nth xs pair) s))
+                        (- (* (nth xs i) c) (* (nth xs pair) s)))))
+                  (range (arr/nelems shape)))
+            shape dtype)))))))
 
 (defn upsample-nearest2d
   "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.
@@ -844,23 +1298,31 @@
 (defn multi-head-attention
   "Multi-head scaled dot-product attention for `[seq,d]` or `[batch,seq,d]`.
 
-  Q is `[B,seqQ,d_model]`; K/V are `[B,seqK,d_model]` with rank-2 forms
+  Q is `[B,seqQ,d_model]`; K/V are `[B,seqK,kv_model]` with rank-2 forms
   treated as B=1 and returned rank-2 for compatibility. Options:
+  `:kv-heads` enables grouped-query attention (defaults to `num-heads`), where
+  `kv_model = kv_heads * (d_model / num_heads)` and each KV head is shared by
+  `num_heads / kv_heads` adjacent query heads.
   `:causal?` prevents query row q from attending to keys k>q, and
   `:key-padding-mask` is `[B,seqK]` (or `[seqK]` for rank-2 input), where a
   non-zero value marks a key to ignore, matching PyTorch boolean-mask meaning."
   ([Q K V num-heads] (multi-head-attention Q K V num-heads {}))
-  ([Q K V num-heads {:keys [causal? key-padding-mask]
+  ([Q K V num-heads {:keys [causal? key-padding-mask kv-heads]
                       :or {causal? false}}]
    (let [q-shape (:shape Q) k-shape (:shape K) v-shape (:shape V)
          rank (count q-shape) h (long num-heads)
          [batch seq-q d-model] (if (= rank 2) (into [1] q-shape) q-shape)
          [k-batch seq-k k-model] (if (= rank 2) (into [1] k-shape) k-shape)
+         kv-heads (long (or kv-heads h))
+         d-head (when (and (pos? h) (zero? (mod (long d-model) h)))
+                  (quot (long d-model) h))
+         expected-k-model (when d-head (* kv-heads d-head))
          expected-mask-shape (if (= rank 2) [seq-k] [batch seq-k])
          mask-shape (:shape key-padding-mask)]
      (when-not (and (#{2 3} rank) (= rank (count k-shape) (count v-shape))
                     (= k-shape v-shape) (= batch k-batch)
-                    (= d-model k-model) (pos? h)
+                    (= k-model expected-k-model) (pos? h) (pos? kv-heads)
+                    (zero? (mod h kv-heads))
                     (zero? (mod (long d-model) h))
                     (or (nil? key-padding-mask)
                         (= mask-shape expected-mask-shape)
@@ -868,12 +1330,13 @@
        (throw (ex-info "num.tensor/multi-head-attention: incompatible batch, model, heads, or mask"
                        {:query q-shape :key k-shape :value v-shape
                         :key-padding-mask mask-shape :expected-mask expected-mask-shape
-                        :num-heads h})))
-     (let [backend (:backend Q) d-head (quot (long d-model) h)
+                        :num-heads h :kv-heads kv-heads})))
+     (let [backend (:backend Q)
            mask-backend (when key-padding-mask (:backend key-padding-mask))
            output-shape (if (= rank 2) [seq-q d-model] [batch seq-q d-model])
            params {:batch batch :seq-q seq-q :seq-k seq-k :d-model d-model
-                   :heads h :head-dim d-head :causal? causal?
+                   :kv-d-model k-model :heads h :kv-heads kv-heads
+                   :head-dim d-head :causal? causal?
                    :has-key-padding-mask? (boolean key-padding-mask)
                    :total (* batch seq-q d-model)}]
        (if (and (= backend (:backend K) (:backend V))
@@ -887,7 +1350,8 @@
                   backend (:handle Q) (:handle K) (:handle V)
                   (when key-padding-mask (:handle key-padding-mask)) params)
                  output-shape) :dtype :f32)
-         (let [q3 (if (= rank 2) (reshape Q [1 seq-q d-model]) Q)
+         (if (= h kv-heads)
+           (let [q3 (if (= rank 2) (reshape Q [1 seq-q d-model]) Q)
                k3 (if (= rank 2) (reshape K [1 seq-k d-model]) K)
                v3 (if (= rank 2) (reshape V [1 seq-k d-model]) V)
                split-heads (fn [x seq-len]
@@ -904,4 +1368,55 @@
                heads-out (matmul weights vh)
                merged (reshape (transpose heads-out [0 2 1 3])
                                [batch seq-q d-model])]
-           (if (= rank 2) (reshape merged output-shape) merged)))))))
+             (if (= rank 2) (reshape merged output-shape) merged))
+           ;; The generic tensor composition has no strided head-repeat view.
+           ;; Materialize only this non-ITensorBackend fallback; Metal uses the
+           ;; fused device kernel above.
+           (let [qs (vec (arr/->vec Q)) ks (vec (arr/->vec K))
+                 vs (vec (arr/->vec V))
+                 padding (when key-padding-mask
+                           (vec (arr/->vec key-padding-mask)))
+                 group-size (quot h kv-heads)
+                 scale (/ 1.0 (Math/sqrt d-head))
+                 out (double-array (* batch seq-q d-model))]
+             (dotimes [b batch]
+               (dotimes [q seq-q]
+                 (dotimes [head h]
+                   (let [kv-head (quot head group-size)
+                         qb (+ (* (+ (* b seq-q) q) d-model) (* head d-head))
+                         scores (double-array seq-k)]
+                     (dotimes [k seq-k]
+                       (let [masked? (or (and causal? (> k q))
+                                         (and padding
+                                              (not (zero? (nth padding (+ (* b seq-k) k))))))
+                             kb (+ (* (+ (* b seq-k) k) k-model)
+                                   (* kv-head d-head))]
+                         (aset scores k
+                               (if masked? ##-Inf
+                                   (* scale
+                                      (loop [d 0 sum 0.0]
+                                        (if (< d d-head)
+                                          (recur (inc d)
+                                                 (+ sum (* (nth qs (+ qb d))
+                                                           (nth ks (+ kb d)))))
+                                          sum)))))))
+                     (let [maximum (reduce max ##-Inf (vec scores))
+                           denominator (reduce + 0.0
+                                               (map #(if (= ##-Inf %) 0.0
+                                                       (Math/exp (- % maximum)))
+                                                    (vec scores)))]
+                       (dotimes [d d-head]
+                         (aset out (+ qb d)
+                               (if (zero? denominator) 0.0
+                                   (loop [k 0 sum 0.0]
+                                     (if (< k seq-k)
+                                       (let [score (aget scores k)
+                                             weight (if (= ##-Inf score) 0.0
+                                                        (/ (Math/exp (- score maximum))
+                                                           denominator))
+                                             vb (+ (* (+ (* b seq-k) k) k-model)
+                                                   (* kv-head d-head))]
+                                         (recur (inc k)
+                                                (+ sum (* weight (nth vs (+ vb d))))))
+                                       sum))))))))))
+             (arr/from-vec backend (vec out) output-shape (array-dtype Q)))))))))

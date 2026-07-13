@@ -17,10 +17,9 @@
   gradient and replays the tape in REVERSE (creation) order, each node's
   backward-fn reading its own accumulated upstream gradient and pushing
   gradient contributions into its parents' `:grad` atoms. This is correct
-  for the acyclic, single-path sequential graphs a `torch.model/sequential`
-  produces — it does NOT handle branching/shared-subgraph reuse (a value
-  used by two different downstream ops) or control flow, which a general
-  autograd needs and this one deliberately does not attempt."
+  for acyclic tensor graphs, including residual/shared-subgraph branches whose
+  contributions are summed by `accumulate!`. Dynamic control flow and higher-
+  order differentiation remain outside this minimal engine."
   (:require [num.array :as arr]
             [num.core :as nm]
             [num.protocol :as p]
@@ -93,6 +92,24 @@
             (accumulate! x g)
             (accumulate! b (t/sum g 0))))))
 
+(defn add*
+  "Elementwise addition of equal-shaped Values, including residual branches."
+  [x y]
+  (node (nm/add (:data x) (:data y)) [x y]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x g)
+            (accumulate! y g)))))
+
+(defn mul*
+  "Elementwise multiplication of equal-shaped Values."
+  [x y]
+  (node (nm/mul (:data x) (:data y)) [x y]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x (nm/mul g (:data y)))
+            (accumulate! y (nm/mul g (:data x)))))))
+
 (defn- relu-grad
   "Elementwise derivative of relu at `x-data`: 1.0 where x>0, else 0.0 (the
   standard, if technically-debatable-at-exactly-0, convention). A small host
@@ -110,6 +127,36 @@
         (fn [self]
           (when-let [g @(:grad self)]
             (accumulate! x (nm/mul g (relu-grad (:data x))))))))
+
+(defn sigmoid*
+  "Differentiable sigmoid. Its derivative is evaluated from the saved output,
+  so both the forward and backward remain backend-native."
+  [x]
+  (let [y (nm/sigmoid (:data x))]
+    (node y [x]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (accumulate! x (nm/mul g (nm/sigmoid-gradient y))))))))
+
+(defn tanh*
+  "Differentiable hyperbolic tangent with a backend-native `1 - y^2`
+  derivative evaluated from the saved output."
+  [x]
+  (let [y (nm/tanh (:data x))]
+    (node y [x]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (accumulate! x (nm/mul g (nm/tanh-gradient y))))))))
+
+(defn gelu*
+  "Differentiable PyTorch-default GELU. The derivative uses the saved input
+  and remains backend-native on GPU backends."
+  [x]
+  (node (nm/gelu (:data x)) [x]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x
+                         (nm/mul g (nm/gelu-gradient (:data x))))))))
 
 (defn softmax*
   "y = softmax(x) along the last axis. Standard softmax-Jacobian-vector
@@ -322,11 +369,13 @@
              (range (* batch seq-q seq-k)))
        [batch 1 seq-q seq-k]))))
 
+(declare cat* slice-axis*)
+
 (defn multi-head-attention*
   "Differentiable rank-2/rank-3 multi-head attention, including causal and
   key-padding masks. Options match `num.tensor/multi-head-attention`."
   ([Q K V num-heads] (multi-head-attention* Q K V num-heads {}))
-  ([Q K V num-heads {:keys [causal? key-padding-mask] :as opts
+  ([Q K V num-heads {:keys [causal? key-padding-mask kv-heads] :as opts
                       :or {causal? false}}]
    (let [q-data (:data Q) k-data (:data K) v-data (:data V)
          q-shape (:shape q-data) k-shape (:shape k-data)
@@ -334,10 +383,15 @@
          [batch seq-q d-model] (if (= rank 2) (into [1] q-shape) q-shape)
          [k-batch seq-k k-d-model] (if (= rank 2) (into [1] k-shape) k-shape)
          expected-mask (if (= rank 2) [seq-k] [batch seq-k])
-         heads (long num-heads)]
+         heads (long num-heads)
+         kv-heads (long (or kv-heads heads))
+         d-head (when (and (pos? heads) (zero? (mod (long d-model) heads)))
+                  (quot (long d-model) heads))
+         expected-k-model (when d-head (* kv-heads d-head))]
      (when-not (and (#{2 3} rank) (= rank (count k-shape) (count v-shape))
                     (= k-shape v-shape) (= batch k-batch)
-                    (= d-model k-d-model) (pos? heads)
+                    (= k-d-model expected-k-model) (pos? heads) (pos? kv-heads)
+                    (zero? (mod heads kv-heads))
                     (zero? (mod (long d-model) heads))
                     (or (nil? key-padding-mask)
                         (= (:shape key-padding-mask) expected-mask)
@@ -346,9 +400,8 @@
        (throw (ex-info "num.autograd/multi-head-attention*: incompatible dimensions or mask"
                        {:query q-shape :key k-shape :value v-shape
                         :key-padding-mask (:shape key-padding-mask)
-                        :num-heads heads})))
-     (let [d-head (quot (long d-model) heads)
-           backend (:backend q-data)
+                        :num-heads heads :kv-heads kv-heads})))
+     (let [backend (:backend q-data)
            output-shape (if (= rank 2) [seq-q d-model] [batch seq-q d-model])
            fused? (and (= backend (:backend k-data) (:backend v-data))
                        (or (nil? key-padding-mask)
@@ -363,7 +416,8 @@
           (fn [self]
             (when-let [g @(:grad self)]
               (let [params {:batch batch :seq-q seq-q :seq-k seq-k
-                            :d-model d-model :heads heads :head-dim d-head
+                            :d-model d-model :kv-d-model k-d-model
+                            :heads heads :kv-heads kv-heads :head-dim d-head
                             :causal? causal?
                             :has-key-padding-mask? (boolean key-padding-mask)}
                     gradients (p/-multi-head-attention-backward
@@ -378,14 +432,22 @@
                 (accumulate! K (ndarray (:key gradients) k-shape))
                 (accumulate! V (ndarray (:value gradients) (:shape v-data)))))))
          (let [q3 (if (= rank 2) (reshape* Q [1 seq-q d-model]) Q)
-               k3 (if (= rank 2) (reshape* K [1 seq-k d-model]) K)
-               v3 (if (= rank 2) (reshape* V [1 seq-k d-model]) V)
-               split-heads (fn [x seq-len]
-                             (transpose* (reshape* x [batch seq-len heads d-head])
+               k3 (if (= rank 2) (reshape* K [1 seq-k k-d-model]) K)
+               v3 (if (= rank 2) (reshape* V [1 seq-k k-d-model]) V)
+               split-query (fn [x]
+                             (transpose* (reshape* x [batch seq-q heads d-head])
                                          [0 2 1 3]))
-               qh (split-heads q3 seq-q)
-               kh (split-heads k3 seq-k)
-               vh (split-heads v3 seq-k)
+               repeat-kv (fn [x]
+                           (let [split (reshape* x [batch seq-k kv-heads d-head])
+                                 group-size (quot heads kv-heads)
+                                 pieces (mapcat (fn [head]
+                                                  (repeat group-size
+                                                          (slice-axis* split 2 head (inc head))))
+                                                (range kv-heads))]
+                             (transpose* (cat* pieces 2) [0 2 1 3])))
+               qh (split-query q3)
+               kh (repeat-kv k3)
+               vh (repeat-kv v3)
                scores (scale* (/ 1.0 (Math/sqrt d-head))
                               (matmul* qh (transpose* kh [0 1 3 2])))
                mask (attention-mask-nd backend batch seq-q seq-k
@@ -570,6 +632,96 @@
                    (accumulate! bias (arr/from-vec (:backend bias-data) (vec dbias)
                                                    (:shape bias-data)))))))))))
 
+(defn layer-norm-last*
+  "Differentiable LayerNorm over the final dimension, composed from metadata
+  reshapes and the verified one-group GroupNorm VJP."
+  ([x] (layer-norm-last* x nil nil 1.0e-5))
+  ([x weight bias eps]
+   (let [shape (:shape (:data x))]
+     (when (empty? shape)
+       (throw (ex-info "num.autograd/layer-norm-last* requires rank >= 1"
+                       {:shape shape})))
+     (let [features (long (peek shape))
+           rows (quot (arr/nelems shape) features)]
+       (reshape*
+        (group-norm-nchw* (reshape* x [rows features 1 1])
+                          1 weight bias eps)
+        shape)))))
+
+(defn embedding*
+  "Differentiable embedding lookup. Token IDs are constants; gradients are
+  accumulated into weight rows, including repeated-token scatter-adds."
+  [indices weight]
+  (let [weight-data (:data weight)
+        output (t/embedding indices weight-data)
+        ids (delay (mapv long (arr/->vec indices)))
+        [rows dim] (:shape weight-data)]
+    (node output [weight]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [gs (vec (arr/->vec g))
+                    dw (double-array (* rows dim))]
+                (doseq [[token-pos row] (map-indexed vector @ids)
+                        feature (range dim)]
+                  (let [weight-index (+ (* row dim) feature)
+                        gradient-index (+ (* token-pos dim) feature)]
+                    (aset dw weight-index
+                          (+ (aget dw weight-index) (nth gs gradient-index)))))
+                (accumulate! weight
+                             (arr/from-vec (:backend weight-data) (vec dw)
+                                           (:shape weight-data)
+                                           (or (:dtype weight-data) :f32)))))))))
+
+(defn rms-norm-last*
+  "Differentiable RMSNorm over the final dimension."
+  ([x weight] (rms-norm-last* x weight 1.0e-5))
+  ([x weight eps]
+   (let [input-data (:data x) weight-data (:data weight)
+         shape (:shape input-data) dim (long (peek shape))
+         rows (quot (arr/nelems shape) dim)
+         output (t/rms-norm-last input-data weight-data eps)]
+     (node output [x weight]
+           (fn [self]
+             (when-let [g @(:grad self)]
+               (let [xs (vec (arr/->vec input-data))
+                     ws (vec (arr/->vec weight-data))
+                     gs (vec (arr/->vec g))
+                     dx (double-array (* rows dim))
+                     dw (double-array dim)]
+                 (dotimes [row rows]
+                   (let [base (* row dim)
+                         square-sum (reduce + (map (fn [f]
+                                                    (let [v (nth xs (+ base f))]
+                                                      (* v v)))
+                                                  (range dim)))
+                         inv-rms (/ 1.0 (Math/sqrt (+ (/ square-sum dim) eps)))
+                         dot-zx (reduce + (map (fn [f]
+                                                (* (nth gs (+ base f)) (nth ws f)
+                                                   (nth xs (+ base f))))
+                                              (range dim)))
+                         correction (/ (* dot-zx inv-rms inv-rms inv-rms) dim)]
+                     (dotimes [f dim]
+                       (let [i (+ base f) upstream (nth gs i) value (nth xs i)]
+                         (aset dx i (- (* upstream (nth ws f) inv-rms)
+                                      (* value correction)))
+                         (aset dw f (+ (aget dw f) (* upstream value inv-rms)))))))
+                 (accumulate! x (arr/from-vec (:backend input-data) (vec dx) shape))
+                 (accumulate! weight
+                              (arr/from-vec (:backend weight-data) (vec dw)
+                                            (:shape weight-data))))))))))
+
+(defn rotary-embedding*
+  "Differentiable RoPE. Since each pair is an orthogonal rotation, its VJP is
+  the same kernel with the angle sign reversed."
+  ([x num-heads] (rotary-embedding* x num-heads {}))
+  ([x num-heads opts]
+   (node (t/rotary-embedding (:data x) num-heads opts) [x]
+         (fn [self]
+           (when-let [g @(:grad self)]
+             (accumulate! x
+                          (t/rotary-embedding g num-heads
+                                              (assoc opts :inverse? true))))))))
+
 (defn cat*
   "Differentiable `num.tensor/cat`. Backward slices the upstream gradient
   along the concatenation axis and accumulates one contiguous gradient per
@@ -607,6 +759,33 @@
                                    (arr/from-vec (:backend (:data value))
                                                  (vec sliced) shape))
                       (recur (inc value-index) (+ axis-offset axis-size)))))))))))
+
+(defn slice-axis*
+  "Differentiable contiguous slice along one axis. Backward scatters the
+  upstream slice into a zero gradient with the input shape."
+  [value axis start end]
+  (let [input (:data value) shape (:shape input) rank (count shape)
+        axis (long (if (neg? axis) (+ rank axis) axis))
+        start (long start) end (long end)
+        inner (long (arr/nelems (subvec shape (inc axis))))
+        input-axis (long (nth shape axis))
+        output-axis (- end start)
+        outer (long (arr/nelems (subvec shape 0 axis)))]
+    (node (t/slice-axis input axis start end) [value]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [source (vec (arr/->vec g))
+                    scattered (double-array (arr/nelems shape))]
+                (dotimes [outer-index outer]
+                  (let [source-base (* outer-index output-axis inner)
+                        destination-base (+ (* outer-index input-axis inner)
+                                            (* start inner))]
+                    (dotimes [i (* output-axis inner)]
+                      (aset scattered (+ destination-base i)
+                            (nth source (+ source-base i))))))
+                (accumulate! value
+                             (arr/from-vec (:backend input) (vec scattered)
+                                           shape (:dtype input :f32)))))))))
 
 (defn upsample-nearest2d*
   "Differentiable nearest-neighbor NCHW upsampling. Backward sums every

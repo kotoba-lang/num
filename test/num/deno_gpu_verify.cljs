@@ -32,6 +32,17 @@
   (println (str (if ok? "✓" "✗") " " label))
   (if ok? (swap! pass inc) (swap! fail inc)))
 
+(defn- verify-temporary-buffer-lifetime! [backend]
+  (let [before (dg/backend-stats backend)
+        input (arr/from-vec backend [1.0 -2.0 3.0 -4.0] [4])]
+    (dotimes [_ 100]
+      (arr/release! (nm/relu input)))
+    (arr/release! input)
+    (let [after (dg/backend-stats backend)]
+      (and (= (:live-buffers before) (:live-buffers after))
+           (= (:live-bytes before) (:live-bytes after))
+           (>= (- (:destroyed-buffers after) (:destroyed-buffers before)) 201)))))
+
 (defn -main [& _]
   (let [cpu-b (cpu/cpu-backend)
         ;; --- CPU ORACLE: computed eagerly, same literals + same order as
@@ -52,6 +63,35 @@
         exp-relu (arr/->vec (nm/relu c))
         exp-neg (arr/->vec (nm/neg c))
         exp-silu (arr/->vec (nm/silu c))
+        exp-sigmoid (arr/->vec (nm/sigmoid c))
+        exp-tanh (arr/->vec (nm/tanh c))
+        exp-sigmoid-gradient (arr/->vec (nm/sigmoid-gradient (nm/sigmoid c)))
+        exp-tanh-gradient (arr/->vec (nm/tanh-gradient (nm/tanh c)))
+        exp-gelu (arr/->vec (nm/gelu c))
+        exp-gelu-gradient (arr/->vec (nm/gelu-gradient c))
+        exp-layernorm (arr/->vec
+                       (t/layer-norm-last c
+                                          (arr/from-vec cpu-b [0.8 1.1 -0.7 1.3] [4])
+                                          (arr/from-vec cpu-b [0.1 -0.2 0.05 0.3] [4])
+                                          1.0e-5))
+        embedding-indices [2 0 2 1]
+        embedding-weights [0.1 0.2 0.3, -0.2 0.4 0.5,
+                           0.7 -0.1 0.6, 0.0 0.2 -0.3]
+        exp-embedding (arr/->vec
+                       (t/embedding
+                        (arr/from-vec cpu-b embedding-indices [4])
+                        (arr/from-vec cpu-b embedding-weights [4 3])))
+        rms-weight-values [0.8 1.1 -0.7 1.3]
+        exp-rmsnorm (arr/->vec
+                     (t/rms-norm-last c
+                                      (arr/from-vec cpu-b rms-weight-values [4])
+                                      1.0e-5))
+        rope-values [0.2 -0.4 0.7 1.1, -0.3 0.8 1.4 -0.9,
+                     0.1 0.5 -0.2 0.6, 0.9 -0.7 0.3 -0.1]
+        rope-opts {:theta 10000.0 :position-offset 3}
+        exp-rope (arr/->vec
+                  (t/rotary-embedding
+                   (arr/from-vec cpu-b rope-values [2 2 4]) 2 rope-opts))
         A (arr/from-vec cpu-b [1 2 3 4] [2 2])
         xv (arr/from-vec cpu-b [1 1] [2])
         B (arr/from-vec cpu-b [5 6 7 8] [2 2])
@@ -90,6 +130,15 @@
                         (arr/from-vec cpu-b depth-input-values [1 2 4 4])
                         (arr/from-vec cpu-b depth-weight-values [2 1 2 2]) nil
                         {:dilation 2 :groups 2}))
+        oc4-input-values (mapv #(- (* 0.03 %) 0.2) (range 75))
+        oc4-weight-values (mapv #(- (* 0.01 (mod % 11)) 0.05)
+                                 (range (* 8 3 3 3)))
+        oc4-bias-values (mapv #(* 0.02 %) (range 8))
+        exp-oc4 (arr/->vec
+                 (t/conv2d-nchw
+                  (arr/from-vec cpu-b oc4-input-values [1 3 5 5])
+                  (arr/from-vec cpu-b oc4-weight-values [8 3 3 3])
+                  (arr/from-vec cpu-b oc4-bias-values [8]) {:padding 1}))
         norm-input-values (mapv #(- (* 0.011 (mod % 97)) 0.5)
                                 (range (* 2 32 16 16)))
         norm-weight-values (mapv #(+ 0.7 (* 0.01 %)) (range 32))
@@ -103,6 +152,11 @@
                                  (t/group-norm-nchw
                                   (arr/from-vec cpu-b (take 32 norm-input-values)
                                                 [1 4 4 2]) 2))
+        exp-groupnorm-silu (arr/->vec
+                            (t/group-norm-silu-nchw
+                             (arr/from-vec cpu-b norm-input-values [2 32 16 16]) 4
+                             (arr/from-vec cpu-b norm-weight-values [32])
+                             (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5))
         exp-unet-chain
         (arr/->vec
          (t/upsample-nearest2d
@@ -118,7 +172,31 @@
                        (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5)
         exp-cat (arr/->vec
                  (t/cat [(t/upsample-nearest2d (nm/silu cpu-groupnorm) 2)
-                         (t/upsample-nearest2d cpu-groupnorm 2)] 1))]
+                         (t/upsample-nearest2d cpu-groupnorm 2)] 1))
+        slice-values (mapv double (range 1 17))
+        exp-slice (arr/->vec
+                   (t/slice-axis (arr/from-vec cpu-b slice-values [2 4 1 2])
+                                 1 1 3))
+        exp-scale (arr/->vec
+                   (t/scale (t/slice-axis
+                             (arr/from-vec cpu-b slice-values [2 4 1 2]) 1 1 3)
+                            0.5))
+        pad-values (mapv double (range 1 9))
+        exp-pad (arr/->vec
+                 (t/pad-right-bottom-nchw
+                  (arr/from-vec cpu-b pad-values [1 2 2 2])))
+        adam-options {:learning-rate 0.003 :beta1 0.9 :beta2 0.999
+                      :eps 1.0e-8 :weight-decay 0.02}
+        adam-gradient-values [0.2 -0.1 0.05 -0.4]
+        cpu-adam-1 (t/adamw-step
+                    (arr/from-vec cpu-b [1.0 -2.0 0.5 3.0] [4])
+                    (arr/from-vec cpu-b adam-gradient-values [4])
+                    nil nil 1 adam-options)
+        cpu-adam-2 (t/adamw-step
+                    (:parameter cpu-adam-1)
+                    (arr/from-vec cpu-b adam-gradient-values [4])
+                    (:moment cpu-adam-1) (:variance cpu-adam-1)
+                    2 adam-options)]
     (-> (dg/request-device)
         (.then
          (fn [r]
@@ -144,6 +222,10 @@
                                 (arr/from-vec gpu depth-input-values [1 2 4 4])
                                 (arr/from-vec gpu depth-weight-values [2 1 2 2]) nil
                                 {:dilation 2 :groups 2})
+                 oc4-out (t/conv2d-nchw
+                          (arr/from-vec gpu oc4-input-values [1 3 5 5])
+                          (arr/from-vec gpu oc4-weight-values [8 3 3 3])
+                          (arr/from-vec gpu oc4-bias-values [8]) {:padding 1})
                  groupnorm-out (t/group-norm-nchw
                                 (arr/from-vec gpu norm-input-values [2 32 16 16]) 4
                                 (arr/from-vec gpu norm-weight-values [32])
@@ -151,15 +233,52 @@
                  groupnorm-no-affine-out
                  (t/group-norm-nchw
                   (arr/from-vec gpu (take 32 norm-input-values) [1 4 4 2]) 2)
+                 groupnorm-silu-out
+                 (t/group-norm-silu-nchw
+                  (arr/from-vec gpu norm-input-values [2 32 16 16]) 4
+                  (arr/from-vec gpu norm-weight-values [32])
+                  (arr/from-vec gpu norm-bias-values [32]) 1.0e-5)
                  unet-chain-out (t/upsample-nearest2d (nm/silu groupnorm-out) [2 2])
                  cat-out (t/cat [unet-chain-out
                                  (t/upsample-nearest2d groupnorm-out 2)] 1)
+                 slice-out (t/slice-axis
+                            (arr/from-vec gpu slice-values [2 4 1 2]) 1 1 3)
+                 scale-out (t/scale slice-out 0.5)
+                 pad-out (t/pad-right-bottom-nchw
+                          (arr/from-vec gpu pad-values [1 2 2 2]))
+                 layernorm-out
+                 (t/layer-norm-last cg
+                                    (arr/from-vec gpu [0.8 1.1 -0.7 1.3] [4])
+                                    (arr/from-vec gpu [0.1 -0.2 0.05 0.3] [4])
+                                    1.0e-5)
+                 embedding-out
+                 (t/embedding (arr/from-vec gpu embedding-indices [4])
+                              (arr/from-vec gpu embedding-weights [4 3]))
+                 rmsnorm-out
+                 (t/rms-norm-last cg
+                                  (arr/from-vec gpu rms-weight-values [4]) 1.0e-5)
+                 rope-out
+                 (t/rotary-embedding
+                  (arr/from-vec gpu rope-values [2 2 4]) 2 rope-opts)
                  bias-add-out (t/add (arr/from-vec gpu bias-input-values [2 3])
                                      (arr/from-vec gpu bias-values [3]))
                  mha-out (t/multi-head-attention
                           (arr/from-vec gpu query-values [2 4])
                           (arr/from-vec gpu key-values [3 4])
                           (arr/from-vec gpu value-values [3 4]) 2)
+                 gpu-adam-1 (t/adamw-step
+                             (arr/from-vec gpu [1.0 -2.0 0.5 3.0] [4])
+                             (arr/from-vec gpu adam-gradient-values [4])
+                             nil nil 1 adam-options)
+                 gpu-adam-2 (t/adamw-step
+                             (:parameter gpu-adam-1)
+                             (arr/from-vec gpu adam-gradient-values [4])
+                             (:moment gpu-adam-1) (:variance gpu-adam-1)
+                             2 adam-options)
+                 gpu-unscale (t/unscale-gradient
+                              (arr/from-vec gpu [16.0 -8.0 4.0] [3]) 8.0)
+                 gpu-overflow (t/unscale-gradient
+                               (arr/from-vec gpu [1.0 js/Infinity] [2]) 4.0)
                  checks
                  [["dot"    (->p (nm/dot xg yg))                              (fn [g] (contract/approx? g exp-dot))]
                   ["nrm2"   (->p (nm/nrm2 (arr/from-vec gpu [3 4] [2])))      (fn [g] (contract/approx? g exp-nrm2))]
@@ -177,25 +296,68 @@
                   ["matmul" (->p (arr/->vec (nm/matmul Ag Bg)))               (fn [g] (contract/approx-vec? g exp-matmul))]
                   ["bias-add" (->p (arr/->vec bias-add-out))                  (fn [g] (contract/approx-vec? g exp-bias-add))]
                   ["multi-head-attention" (->p (arr/->vec mha-out))           (fn [g] (contract/approx-vec? g exp-mha))]
+                  ["adamw-parameter-step2" (->p (arr/->vec (:parameter gpu-adam-2)))
+                   (fn [g] (contract/approx-vec? g (arr/->vec (:parameter cpu-adam-2))))]
+                  ["adamw-moment-step2" (->p (arr/->vec (:moment gpu-adam-2)))
+                   (fn [g] (contract/approx-vec? g (arr/->vec (:moment cpu-adam-2))))]
+                  ["adamw-variance-step2" (->p (arr/->vec (:variance gpu-adam-2)))
+                   (fn [g] (contract/approx-vec? g (arr/->vec (:variance cpu-adam-2))))]
+                  ["unscale-gradient" (->p (arr/->vec (:gradient gpu-unscale)))
+                   (fn [g] (contract/approx-vec? g [2.0 -1.0 0.5]))]
+                  ["unscale-finite-flag" (->p (arr/->vec (:found-inf gpu-unscale)))
+                   (fn [g] (zero? (first g)))]
+                  ["unscale-overflow-flag" (->p (arr/->vec (:found-inf gpu-overflow)))
+                   (fn [g] (pos? (first g)))]
                   ["spmv"   (->p (arr/->vec (nm/spmv gpu csr xsg)))           (fn [g] (contract/approx-vec? g exp-spmv))]
                   ["exp"    (->p (arr/->vec (nm/exp cg)))                     (fn [g] (contract/approx-vec? g exp-exp))]
                   ["relu"   (->p (arr/->vec (nm/relu cg)))                    (fn [g] (contract/approx-vec? g exp-relu))]
                   ["neg"    (->p (arr/->vec (nm/neg cg)))                     (fn [g] (contract/approx-vec? g exp-neg))]
                   ["silu"   (->p (arr/->vec (nm/silu cg)))                    (fn [g] (contract/approx-vec? g exp-silu))]
+                  ["sigmoid" (->p (arr/->vec (nm/sigmoid cg)))                (fn [g] (contract/approx-vec? g exp-sigmoid))]
+                  ["tanh" (->p (arr/->vec (nm/tanh cg)))                      (fn [g] (contract/approx-vec? g exp-tanh))]
+                  ["sigmoid-gradient" (->p (arr/->vec (nm/sigmoid-gradient (nm/sigmoid cg))))
+                   (fn [g] (contract/approx-vec? g exp-sigmoid-gradient))]
+                  ["tanh-gradient" (->p (arr/->vec (nm/tanh-gradient (nm/tanh cg))))
+                   (fn [g] (contract/approx-vec? g exp-tanh-gradient))]
+                  ["gelu" (->p (arr/->vec (nm/gelu cg)))
+                   (fn [g] (contract/approx-vec? g exp-gelu))]
+                  ["gelu-gradient" (->p (arr/->vec (nm/gelu-gradient cg)))
+                   (fn [g] (contract/approx-vec? g exp-gelu-gradient))]
+                  ["layernorm-last" (->p (arr/->vec layernorm-out))
+                   (fn [g] (contract/approx-vec? g exp-layernorm))]
+                  ["embedding" (->p (arr/->vec embedding-out))
+                   (fn [g] (contract/approx-vec? g exp-embedding))]
+                  ["rmsnorm-last" (->p (arr/->vec rmsnorm-out))
+                   (fn [g] (contract/approx-vec? g exp-rmsnorm))]
+                  ["rotary-embedding" (->p (arr/->vec rope-out))
+                   (fn [g] (contract/approx-vec? g exp-rope))]
                   ["conv2d-nchw" (->p (arr/->vec conv-out))                    (fn [g] (contract/approx-vec? g exp-conv))]
                   ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]
+                  ["conv2d-output-channel-4" (->p (arr/->vec oc4-out))
+                   (fn [g] (contract/approx-vec? g exp-oc4))]
                   ["groupnorm-nchw" (->p (arr/->vec groupnorm-out))            (fn [g] (contract/approx-vec? g exp-groupnorm))]
                   ["groupnorm-no-affine" (->p (arr/->vec groupnorm-no-affine-out))
                                             (fn [g] (contract/approx-vec? g exp-groupnorm-no-affine))]
+                  ["groupnorm-silu-fused" (->p (arr/->vec groupnorm-silu-out))
+                   (fn [g] (contract/approx-vec? g exp-groupnorm-silu))]
                   ["groupnorm-silu-upsample-chain" (->p (arr/->vec unet-chain-out))
                                                     (fn [g] (contract/approx-vec? g exp-unet-chain))]
-                  ["unet-skip-cat" (->p (arr/->vec cat-out))                  (fn [g] (contract/approx-vec? g exp-cat))]]]
+                  ["unet-skip-cat" (->p (arr/->vec cat-out))
+                   (fn [g] (contract/approx-vec? g exp-cat))]
+                  ["slice-axis" (->p (arr/->vec slice-out))
+                   (fn [g] (contract/approx-vec? g exp-slice))]
+                  ["immutable-tensor-scale" (->p (arr/->vec scale-out))
+                   (fn [g] (contract/approx-vec? g exp-scale))]
+                  ["pad-right-bottom-nchw" (->p (arr/->vec pad-out))
+                   (fn [g] (contract/approx-vec? g exp-pad))]]]
              (-> (js/Promise.all
                   (into-array
                    (map (fn [[label prom okfn]]
                           (.then prom (fn [g] (record! pass fail label (okfn g)))))
                         checks)))
                  (.then (fn [_]
+                          (record! pass fail "temporary GPUBuffer lifetime"
+                                   (verify-temporary-buffer-lifetime! gpu))
                           (println (str "\nDeno WgslBackendAsync ≡ CPU oracle: " @pass " passed, " @fail " failed"))
                           (js/Deno.exit (if (pos? @fail) 1 0))))))))
         (.catch (fn [e]

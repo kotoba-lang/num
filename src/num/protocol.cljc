@@ -32,7 +32,7 @@
 
   ;; elementwise + reduction -------------------------------------------------
   (-ewise [b op xh yh n] "op ∈ #{:add :sub :mul :div}; returns a NEW handle z=op(x,y).")
-  (-ewise1 [b op xh n] "UNARY elementwise; op ∈ #{:exp :relu :neg :silu}; returns a NEW handle z=op(x).")
+  (-ewise1 [b op xh n] "UNARY elementwise activation/derivative; returns a NEW handle z=op(x).")
   (-reduce [b op xh n] "op ∈ #{:sum :max :min}; → host scalar.")
 
   ;; level-2 / level-3 BLAS (dense, row-major) -------------------------------
@@ -61,10 +61,28 @@
   (-ewise1-dtype [b op xh n dtype])
   (-gemm-dtype [b Ah m k Bh n dtype]))
 
+(defprotocol IMutableBufferOps
+  "Optional bounded device-to-device writes used by preallocated caches."
+  (-copy-into! [b destination-h source-h destination-offset n dtype]
+    "Copy `n` contiguous elements into destination at an element offset."))
+
+(defprotocol IQuantizedOps
+  "Packed inference-weight storage and compute. Handles preserve the original
+  GGML bytes; outputs accumulate in f32 without materializing a dense weight."
+  (-quantized-from-host [b bytes params]
+    "Upload unsigned packed bytes and return an opaque quantized handle.")
+  (-quantized-matmul [b input-h weight-h params]
+    "Multiply f32 `[m,k]` input by a packed logical `[k,n]` weight.")
+  (-quantized-embedding [b indices-h table-h params]
+    "Gather packed quantized table rows into a dense f32 output."))
+
 (defprotocol IDTypeTensorOps
   "Optional N-D compute operations over physical typed storage."
   (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])
-  (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype]))
+  (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype])
+  (-embedding-dtype [b indices-h weight-h params dtype])
+  (-rms-norm-dtype [b input-h weight-h params dtype])
+  (-rotary-embedding-dtype [b input-h params dtype]))
 
 (defprotocol ITensorBackend
   "Optional device-native N-D operations. Backends that do not implement this
@@ -74,14 +92,32 @@
     returns a newly allocated output handle.")
   (-group-norm-nchw [b input-h weight-h bias-h params]
     "NCHW GroupNorm with optional affine parameters; returns a new handle.")
+  (-embedding [b indices-h weight-h params]
+    "Gather embedding rows for contiguous f32 token indices.")
+  (-rms-norm [b input-h weight-h params]
+    "RMS-normalize contiguous rows over their final dimension.")
+  (-rotary-embedding [b input-h params]
+    "Apply head-wise Llama rotary position embedding.")
+  (-rgb-image-to-nchw [b input-h params]
+    "Convert NHWC RGB [0,1] into NCHW model input [-1,1].")
+  (-nchw-to-rgb-image [b input-h params]
+    "Convert NCHW RGB model output [-1,1] into clamped NHWC [0,1].")
   (-upsample-nearest2d [b input-h params]
     "Integer nearest-neighbor NCHW upsampling; returns a new handle.")
   (-cat [b input-handles params]
     "Concatenate contiguous tensors along an arbitrary axis; returns a new handle.")
+  (-slice-axis [b input-h params]
+    "Copy a contiguous range along one tensor axis into a new handle.")
+  (-pad-right-bottom-nchw [b input-h params]
+    "Append one zero column and row to a contiguous NCHW tensor.")
   (-add-last-axis-bias [b input-h bias-h params]
     "Broadcast-add a rank-1 bias over every contiguous last-axis row.")
   (-transpose-2d [b input-h params]
     "Out-of-place transpose of a contiguous f32 matrix.")
+  (-transpose-nd [b input-h params]
+    "Out-of-place axis permutation for a contiguous rank-1 through rank-4 tensor.")
+  (-batched-matmul [b a-h b-h params]
+    "Batched f32 matrix multiplication with broadcast leading dimensions.")
   (-sum-rows [b input-h params]
     "Reduce a contiguous f32 matrix over its row axis.")
   (-mse-loss [b prediction-h target-h params]
@@ -90,6 +126,10 @@
     "MSE vector-Jacobian product as a device-resident tensor handle.")
   (-sgd-step [b parameter-h gradient-h params]
     "Out-of-place immutable SGD update as a new device tensor handle.")
+  (-adamw-step [b parameter-h gradient-h moment-h variance-h params]
+    "Fused immutable AdamW update; returns {:parameter :moment :variance} handles.")
+  (-unscale-gradient [b gradient-h params]
+    "Unscale gradient and detect non-finite values; returns gradient/flag handles.")
   (-multi-head-attention [b query-h key-h value-h key-padding-mask-h params]
     "Fused batched scaled dot-product attention with causal/padding masks.")
   (-multi-head-attention-backward [b query-h key-h value-h key-padding-mask-h

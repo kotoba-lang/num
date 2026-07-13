@@ -24,7 +24,27 @@
     (is (= [3 4] (t/broadcast-shapes [3 1] [1 4])))
     (is (= [2 3 4] (t/broadcast-shapes [3 4] [2 1 4]))))
   (testing "incompatible non-1 sizes error"
-    (is (thrown? #?(:clj Exception :cljs js/Error) (t/broadcast-shapes [2 3] [2 4])))))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/broadcast-shapes [2 3] [2 4])))))
+
+(deftest rgb-image-layout-and-range-conversions
+  (let [nhwc (arr/from-vec backend
+                           [0.0 0.25 0.5, 0.75 1.0 0.1,
+                            0.2 0.4 0.6, 0.8 0.9 1.0]
+                           [2 1 2 3])
+        nchw (t/rgb-image-to-nchw nhwc)
+        restored (t/nchw-to-rgb-image nchw)]
+    (is (= [2 3 1 2] (:shape nchw)))
+    (is (contract/approx-vec?
+         [-1.0 0.5, -0.5 1.0, 0.0 -0.8,
+          -0.6 0.6, -0.2 0.8, 0.2 1.0]
+         (arr/->vec nchw)))
+    (is (= [2 1 2 3] (:shape restored)))
+    (is (contract/approx-vec? (arr/->vec nhwc) (arr/->vec restored)))
+    (is (= [0.0 1.0 0.5]
+           (arr/->vec
+            (t/nchw-to-rgb-image
+             (arr/from-vec backend [-2.0 2.0 0.0] [1 3 1 1])))))))
 
 (deftest broadcast-to-scalar-plus-vector
   (testing "a 0-D scalar broadcasts to every element of a vector"
@@ -412,9 +432,11 @@
     (let [input (arr/from-vec backend [1 3 2 6] [1 4 1 1])
           weight (arr/from-vec backend [1 2 3 4] [4])
           bias (arr/from-vec backend [0.5 0.5 0 0] [4])
-          out (t/group-norm-nchw input 2 weight bias 0.0)]
+          out (t/group-norm-nchw input 2 weight bias 0.0)
+          fused (t/group-norm-silu-nchw input 2 weight bias 0.0)]
       (is (= [1 4 1 1] (:shape out)))
-      (is (= [-0.5 2.5 -3.0 4.0] (arr/->vec out)))))
+      (is (= [-0.5 2.5 -3.0 4.0] (arr/->vec out)))
+      (is (contract/approx-vec? (arr/->vec (t/silu out)) (arr/->vec fused)))))
   (testing "channel concat preserves NCHW block order"
     (let [a (arr/from-vec backend [1 2 3 4] [1 1 2 2])
           b (arr/from-vec backend [10 20 30 40 50 60 70 80] [1 2 2 2])
@@ -502,6 +524,50 @@
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (t/sgd-step parameter (arr/from-vec backend [1.0] [1]) 0.1)))))
 
+(deftest immutable-adamw-step-preserves-inputs-and-slots
+  (let [parameter (arr/from-vec backend [1.0 -2.0] [2])
+        gradient (arr/from-vec backend [0.5 -0.25] [2])
+        options {:learning-rate 0.01 :beta1 0.9 :beta2 0.999
+                 :eps 1.0e-8 :weight-decay 0.1}
+        first (t/adamw-step parameter gradient nil nil 1 options)
+        second (t/adamw-step (:parameter first) gradient
+                             (:moment first) (:variance first) 2 options)]
+    (is (= [1.0 -2.0] (arr/->vec parameter)))
+    (is (every? #(< (Math/abs %) 1.0e-12)
+                (map - [0.05 -0.025] (arr/->vec (:moment first)))))
+    (is (every? #(< (Math/abs %) 1.0e-12)
+                (map - [0.00025 0.0000625]
+                     (arr/->vec (:variance first)))))
+    (is (every? #(< (Math/abs %) 1.0e-7)
+                (map - [0.989 -1.988]
+                     (arr/->vec (:parameter first)))))
+    (is (not= (arr/->vec (:parameter first))
+              (arr/->vec (:parameter second))))))
+
+(deftest fused-gradient-unscale-detects-overflow
+  (let [finite (t/unscale-gradient
+                (arr/from-vec backend [16.0 -8.0] [2]) 8.0)
+        overflow (t/unscale-gradient
+                  (arr/from-vec backend [1.0 ##Inf] [2]) 4.0)]
+    (is (= [2.0 -1.0] (arr/->vec (:gradient finite))))
+    (is (= [0.0] (arr/->vec (:found-inf finite))))
+    (is (pos? (first (arr/->vec (:found-inf overflow)))))
+    (is (#?(:clj Double/isInfinite :cljs (complement js/isFinite))
+         (double (second (arr/->vec (:gradient overflow))))))))
+
+(deftest grouped-query-attention-matches-explicit-kv-head-repeat
+  (let [q (arr/from-vec backend [0.2 -0.1 0.4 0.3
+                                 -0.3 0.5 0.1 -0.2] [2 4])
+        k (arr/from-vec backend [0.6 -0.4, 0.2 0.7] [2 2])
+        v (arr/from-vec backend [1.0 2.0, 3.0 -1.0] [2 2])
+        repeated-k (arr/from-vec backend [0.6 -0.4 0.6 -0.4
+                                          0.2 0.7 0.2 0.7] [2 4])
+        repeated-v (arr/from-vec backend [1.0 2.0 1.0 2.0
+                                          3.0 -1.0 3.0 -1.0] [2 4])]
+    (is (contract/approx-vec?
+         (arr/->vec (t/multi-head-attention q k v 2 {:kv-heads 1}))
+         (arr/->vec (t/multi-head-attention q repeated-k repeated-v 2))))))
+
 (deftest batched-causal-padding-multi-head-attention
   (let [query (arr/from-vec backend (repeat 12 0.0) [2 3 2])
         key (arr/from-vec backend (repeat 12 0.0) [2 3 2])
@@ -521,3 +587,34 @@
                  (t/multi-head-attention
                   query key value 1
                   {:key-padding-mask (arr/from-vec backend [0 1 0] [3])})))))
+
+(deftest contiguous-axis-slice-and-asymmetric-nchw-padding
+  (let [input (arr/from-vec backend (range 1 17) [2 4 1 2])
+        sliced (t/slice-axis input 1 1 3)
+        scaled (t/scale sliced 0.5)
+        image (arr/from-vec backend [1 2, 3 4, 5 6, 7 8] [1 2 2 2])
+        padded (t/pad-right-bottom-nchw image)]
+    (is (= [2 2 1 2] (:shape sliced)))
+    (is (= [3.0 4.0 5.0 6.0, 11.0 12.0 13.0 14.0]
+           (arr/->vec sliced)))
+    (is (= [1.5 2.0 2.5 3.0, 5.5 6.0 6.5 7.0]
+           (arr/->vec scaled)))
+    (is (= [3.0 4.0 5.0 6.0, 11.0 12.0 13.0 14.0]
+           (arr/->vec sliced)) "scale must not mutate its input")
+    (is (= [1 2 3 3] (:shape padded)))
+    (is (= [1.0 2.0 0.0, 3.0 4.0 0.0, 0.0 0.0 0.0,
+            5.0 6.0 0.0, 7.0 8.0 0.0, 0.0 0.0 0.0]
+           (arr/->vec padded)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/slice-axis input 1 3 5)))))
+
+(deftest explicit-release-deduplicates-aliased-handles
+  (let [array (arr/from-vec backend [1 2 3 4] [2 2])
+        alias (t/reshape array [4])
+        released (atom [])]
+    (with-redefs [arr/release! (fn [value]
+                                (swap! released conj value)
+                                nil)]
+      (is (nil? (arr/release-all! [array alias nil])))
+      (is (= 1 (count @released)))
+      (is (identical? (:handle array) (:handle (first @released)))))))

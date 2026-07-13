@@ -90,6 +90,23 @@
      :batched-masked-key @(:grad (:k graph))
      :batched-masked-value @(:grad (:v graph))}))
 
+(defn- run-gqa-graph [backend]
+  (let [gqa-key [0.1 0.3, -0.2 0.4, 0.5 -0.1]
+        gqa-value [0.4 -0.2, 0.1 0.3, -0.1 0.5]
+        [graph tape]
+        (ag/with-tape
+          (let [q (ag/value (arr/from-vec backend query-values [2 4]))
+                k (ag/value (arr/from-vec backend gqa-key [3 2]))
+                v (ag/value (arr/from-vec backend gqa-value [3 2]))]
+            {:q q :k k :v v
+             :out (ag/multi-head-attention* q k v 2 {:kv-heads 1})}))]
+    (ag/backward! (:out graph)
+                  (arr/from-vec backend grad-output-values [2 4]) tape)
+    {:gqa-out (:data (:out graph))
+     :gqa-query @(:grad (:q graph))
+     :gqa-key @(:grad (:k graph))
+     :gqa-value @(:grad (:v graph))}))
+
 (defn- run-projected-graph [backend]
   (let [[graph tape]
         (ag/with-tape
@@ -144,6 +161,7 @@
   (let [cpu-backend (cpu/cpu-backend)
         cpu-result (merge (run-graph cpu-backend)
                           (run-batched-masked-graph cpu-backend)
+                          (run-gqa-graph cpu-backend)
                           (run-projected-graph cpu-backend))
         expected (into {} (map (fn [[k a]] [k (arr/->vec a)]) cpu-result))]
     (-> (dg/request-device)
@@ -153,6 +171,7 @@
            (let [gpu (dg/backend request)
                  result (merge (run-graph gpu)
                                (run-batched-masked-graph gpu)
+                               (run-gqa-graph gpu)
                                (run-projected-graph gpu))
                  pass (atom 0)
                  fail (atom 0)]

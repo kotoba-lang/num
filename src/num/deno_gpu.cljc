@@ -65,12 +65,37 @@
          :uniform uniform-usage
          (:storage :read) storage-usage))
 
-     (deftype DenoGpuDevice [dev]
+     (defn- record-allocation! [stats buffer]
+       (let [bytes (.-size buffer)]
+         (swap! stats
+                (fn [state]
+                  (let [live-buffers (inc (:live-buffers state))
+                        live-bytes (+ (:live-bytes state) bytes)]
+                    (-> state
+                        (assoc :live-buffers live-buffers :live-bytes live-bytes)
+                        (update :created-buffers inc)
+                        (update :created-bytes + bytes)
+                        (update :peak-live-buffers max live-buffers)
+                        (update :peak-live-bytes max live-bytes))))))
+       buffer)
+
+     (defn- record-destroy! [stats buffer]
+       (let [bytes (.-size buffer)]
+         (swap! stats #(-> %
+                           (update :live-buffers dec)
+                           (update :live-bytes - bytes)
+                           (update :destroyed-buffers inc)
+                           (update :destroyed-bytes + bytes))))
+       (.destroy buffer))
+
+     (deftype DenoGpuDevice [dev stats]
        w/IGpuDevice
        (-create-buffer [_ n usage]
          (let [nbytes (* 4 (long n))
                floor (if (= usage :uniform) 16 4)]
-           (.createBuffer dev #js {:size (max nbytes floor) :usage (usage->flags usage)})))
+           (record-allocation!
+            stats (.createBuffer dev #js {:size (max nbytes floor)
+                                          :usage (usage->flags usage)}))))
 
        (-write-buffer [_ buf xs]
          ;; Dtype comes from `num.wgsl-backend/u32-tag` metadata, NOT from
@@ -101,6 +126,7 @@
                (.then (fn [_]
                         (let [out (vec (js/Array.from (js/Float32Array. (.slice (.getMappedRange staging) 0))))]
                           (.unmap staging)
+                          (.destroy staging)
                           out))))))
 
        (-compile [_ wgsl-src entry]
@@ -122,15 +148,27 @@
            (.setBindGroup pass 0 bind-group)
            (.dispatchWorkgroups pass wx wy wz)
            (.end pass)
-           (.submit (.-queue dev) #js [(.finish encoder)])))
+           (.submit (.-queue dev) #js [(.finish encoder)])
+           ;; Every uniform in this backend is a one-dispatch parameter buffer
+           ;; created by `wb/uni`. WebGPU guarantees already-submitted work may
+           ;; finish after destroy, so retire it immediately instead of leaking
+           ;; thousands of tiny GPUBuffer objects across diffusion steps.
+           (doseq [buffer buffers]
+             (when (not (zero? (bit-and (.-usage buffer) js/GPUBufferUsage.UNIFORM)))
+               (record-destroy! stats buffer)))))
+
+       w/IGpuDeviceLifecycle
+       (-destroy-buffer [_ buffer]
+         (record-destroy! stats buffer))
 
        w/IGpuDeviceDType
        (-create-buffer-dtype [_ n usage dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "WebGPU typed storage currently supports f16 only"
                            {:dtype dtype*})))
-         (.createBuffer dev #js {:size (max (* 4 (quot (+ (long n) 1) 2)) 4)
-                                 :usage (usage->flags usage)}))
+         (record-allocation!
+          stats (.createBuffer dev #js {:size (max (* 4 (quot (+ (long n) 1) 2)) 4)
+                                        :usage (usage->flags usage)})))
        (-write-buffer-dtype [_ buf xs dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
@@ -151,6 +189,7 @@
                               out (mapv dtype/f16-bits->f32
                                         (take n (js/Array.from raw)))]
                           (.unmap staging)
+                          (.destroy staging)
                           out)))))))
 
      ;; --- device negotiation (the ONLY inherently-async step) ------------------
@@ -181,7 +220,9 @@
        p/IBackend
        (-backend-name [_] :wgsl-deno)
        (-alloc [_ n] (w/-create-buffer dev n :storage))
-       (-free [_ _] nil)
+       (-free [_ h]
+         (w/-destroy-buffer dev h)
+         nil)
        (-copy-from-host [_ xs]
          (let [b (w/-create-buffer dev (count xs) :storage)] (w/-write-buffer dev b (map double xs)) b))
        (-copy-to-host [_ h n] (w/-read-buffer dev h n))          ; => Promise<vector> — see ns docstring
@@ -206,7 +247,12 @@
        (-ewise1 [_ op xh n]
          (let [z (w/-create-buffer dev n :storage)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1)
-                        [xh z (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)]))]
+                        [xh z (wb/uni
+                               dev (wb/u32-tag
+                                    [({:exp 0 :relu 1 :neg 2 :silu 3
+                                       :sigmoid 4 :tanh 5
+                                       :sigmoid-gradient 6 :tanh-gradient 7
+                                       :gelu 8 :gelu-gradient 9} op)]))]
                         [(wb/ceil-div n 64) 1 1])
            z))
 
@@ -216,9 +262,15 @@
            (w/-dispatch dev (wb/get-pipeline dev pipes :reduce)
                         [xh parts (wb/uni dev (wb/u32-tag [({:sum 0 :max 1 :min 2} op)]))] [nwg 1 1])
            (.then (w/-read-buffer dev parts nwg)                 ; => Promise<number>
-                  (fn [xs] (reduce (case op :sum + :max max :min min) xs)))))
+                  (fn [xs]
+                    (w/-destroy-buffer dev parts)
+                    (reduce (case op :sum + :max max :min min) xs)))))
 
-       (-dot [this xh yh n] (p/-reduce this :sum (p/-ewise this :mul xh yh n) n)) ; => Promise<number>, automatically
+       (-dot [this xh yh n]
+         (let [product (p/-ewise this :mul xh yh n)
+               result (p/-reduce this :sum product n)]
+           (w/-destroy-buffer dev product)
+           result))
        (-nrm2 [this xh n] (.then (p/-dot this xh xh n) (fn [d] (Math/sqrt d))))   ; => Promise<number>
 
        (-gemv [this alpha Ah m n xh beta yh]
@@ -243,7 +295,64 @@
            (w/-write-buffer dev ci (wb/u32-tag (seq (:col-idx csr))))
            (w/-write-buffer dev v (seq (:vals csr)))
            (w/-dispatch dev (wb/get-pipeline dev pipes :spmv) [rp ci v xh y] [(wb/ceil-div m 64) 1 1])
+           (doseq [temporary [rp ci v]] (w/-destroy-buffer dev temporary))
            y))
+
+       p/IQuantizedOps
+       (-quantized-from-host [_ bytes _params]
+         (let [words (wb/pack-bytes-u32 bytes)
+               buffer (w/-create-buffer dev (count words) :storage)]
+           (w/-write-buffer dev buffer words)
+           buffer))
+       (-quantized-matmul [_ input-h weight-h
+                           {:keys [quant-type m k n blocks-per-row]}]
+         (when-not (#{:q4-k :q6-k :q8-0} quant-type)
+           (throw (ex-info "unsupported WebGPU quantized matmul"
+                           {:quant-type quant-type})))
+         (let [output (w/-create-buffer dev (* m n) :storage)]
+           (w/-dispatch dev (wb/get-pipeline
+                             dev pipes ({:q4-k :q4-k-matmul
+                                        :q6-k :q6-k-matmul
+                                        :q8-0 :q8-0-matmul} quant-type))
+                        [input-h weight-h output
+                         (wb/uni dev (wb/u32-tag [m k n blocks-per-row]))]
+                        [(* (wb/ceil-div m 4) n) 1 1])
+           output))
+       (-quantized-embedding [_ indices-h table-h
+                              {:keys [quant-type rows dim count blocks-per-row total]}]
+         (let [pipeline ({:q4-k :q4-k-embedding :q6-k :q6-k-embedding
+                          :q8-0 :q8-0-embedding} quant-type)]
+           (when-not pipeline
+             (throw (ex-info "unsupported WebGPU quantized embedding"
+                             {:quant-type quant-type})))
+           (let [output (w/-create-buffer dev total :storage)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes pipeline)
+                          [indices-h table-h output
+                           (wb/uni dev (wb/u32-tag
+                                        [rows dim count blocks-per-row total 0 0 0]))]
+                          [(wb/ceil-div total 64) 1 1])
+             output)))
+
+       p/IMutableBufferOps
+       (-copy-into! [_ destination source offset n dtype*]
+         (case dtype*
+           :f32
+           (w/-dispatch dev (wb/get-pipeline dev pipes :copy-into)
+                        [destination source
+                         (wb/uni dev (wb/u32-tag [offset n 0 0]))]
+                        [(wb/ceil-div n 64) 1 1])
+           :f16
+           (do
+             (when-not (and (even? offset) (even? n))
+               (throw (ex-info "f16 copy-into requires even offset and count"
+                               {:offset offset :count n})))
+             (w/-dispatch dev (wb/get-pipeline dev pipes :copy-into-f16)
+                          [destination source
+                           (wb/uni dev (wb/u32-tag
+                                        [(quot offset 2) (quot n 2) 0 0]))]
+                          [(wb/ceil-div (quot n 2) 64) 1 1]))
+           (throw (ex-info "GPU copy-into supports f32/f16" {:dtype dtype*})))
+         destination)
 
        p/IDTypeStorage
        (-alloc-dtype [_ n dtype*]
@@ -272,7 +381,10 @@
          (let [output (w/-create-buffer-dtype dev n :storage :f16)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1-f16)
                         [xh output
-                         (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)
+                         (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3
+                                                   :sigmoid 4 :tanh 5
+                                                   :sigmoid-gradient 6 :tanh-gradient 7
+                                                   :gelu 8 :gelu-gradient 9} op)
                                                   n 0 0]))]
                         [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
            output))
@@ -293,13 +405,21 @@
          (let [total (* n cout oh ow)
                output (w/-create-buffer-dtype dev total :storage :f16)
                bias (or bias-h (w/-create-buffer-dtype dev cout :storage :f16))
+               spatial (* oh ow)
+               oc4? (and (= 1 (:groups params))
+                         (zero? (mod cout 4)) (zero? (mod spatial 2)))
+               invocations (if oc4? (* n (quot cout 4) (quot spatial 2))
+                               (wb/ceil-div total 2))
                values ((juxt :n :cin :h :width :cout :cin-group :kh :kw
                              :oh :ow :sh :sw :ph :pw :dh :dw :groups)
                        params)]
-           (w/-dispatch dev (wb/get-pipeline dev pipes :conv2d-nchw-f16)
+           (w/-dispatch dev (wb/get-pipeline dev pipes
+                                             (if oc4? :conv2d-nchw-f16-oc4
+                                                 :conv2d-nchw-f16))
                         [input-h weight-h bias output
                          (wb/uni dev (wb/u32-tag (into (vec values) [0 0 0])))]
-                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+                        [(wb/ceil-div invocations 64) 1 1])
+           (when-not bias-h (w/-destroy-buffer dev bias))
            output))
        (-group-norm-nchw-dtype [_ input-h weight-h bias-h
                                 {:keys [n c h width groups channels-group
@@ -320,6 +440,45 @@
                                        group-size (* h width)]))
                          (wb/uni dev [(double eps)])]
                         [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           (when-not weight-h (w/-destroy-buffer dev weight))
+           (when-not bias-h (w/-destroy-buffer dev bias))
+           output))
+       (-embedding-dtype [_ indices-h weight-h {:keys [tokens rows dim]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU embedding supports f16 only" {:dtype dtype*})))
+         (let [total (* tokens dim)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding-f16)
+                        [indices-h weight-h output
+                         (wb/uni dev (wb/u32-tag [tokens rows dim 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-rms-norm-dtype [_ input-h weight-h {:keys [rows dim eps]} dtype*]
+         (when-not (and (= dtype* :f16) (even? dim))
+           (throw (ex-info "typed GPU RMSNorm requires f16 and even features"
+                           {:dtype dtype* :dim dim})))
+         (let [output (w/-create-buffer-dtype dev (* rows dim) :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rms-norm-f16)
+                        [input-h weight-h output
+                         (wb/uni dev (wb/u32-tag [rows dim 0 0]))
+                         (wb/uni dev [(double eps)])]
+                        [rows 1 1])
+           output))
+       (-rotary-embedding-dtype
+         [_ input-h {:keys [batch sequence embed heads head-dim position-offset
+                            theta direction]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RoPE supports f16 only" {:dtype dtype*})))
+         (let [total (* batch sequence embed)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rotary-embedding-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch sequence embed heads head-dim
+                                       position-offset 0 0]))
+                         (wb/uni dev [(double theta)])
+                         (wb/uni dev [(double direction)])]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
            output))
 
        p/ITensorBackend
@@ -330,12 +489,18 @@
                bias (or bias-h (w/-create-buffer dev cout :storage))
                params [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw
                        groups 0 0 0]]
-           (w/-dispatch dev (wb/get-pipeline dev pipes :conv2d-nchw)
-                        [input-h weight-h bias output (wb/uni dev (wb/u32-tag params))]
-                        [(wb/ceil-div total 64) 1 1])
+           (let [oc4? (and (= groups 1) (zero? (mod cout 4)))
+                 invocations (if oc4? (quot total 4) total)]
+             (w/-dispatch
+              dev (wb/get-pipeline
+                   dev pipes (if oc4? :conv2d-nchw-oc4 :conv2d-nchw))
+              [input-h weight-h bias output (wb/uni dev (wb/u32-tag params))]
+              [(wb/ceil-div invocations 64) 1 1]))
+           (when-not bias-h (w/-destroy-buffer dev bias))
            output))
        (-group-norm-nchw [_ input-h weight-h bias-h
-                          {:keys [n c h width groups channels-group group-size eps]}]
+                          {:keys [n c h width groups channels-group group-size eps]
+                           :as params}]
          (let [total (* n c h width)
                output (w/-create-buffer dev total :storage)
                weight (or weight-h
@@ -343,10 +508,60 @@
                             (w/-write-buffer dev buffer (repeat c 1.0)) buffer))
                bias (or bias-h (w/-create-buffer dev c :storage))
                dims [n c h width groups channels-group group-size (* h width)]]
-           (w/-dispatch dev (wb/get-pipeline dev pipes :group-norm-nchw)
+           (w/-dispatch dev
+                        (wb/get-pipeline dev pipes
+                                         (if (:silu? params)
+                                           :group-norm-silu-nchw
+                                           :group-norm-nchw))
                         [input-h weight bias output (wb/uni dev (wb/u32-tag dims))
                          (wb/uni dev [(double eps)])]
                         [(* n groups) 1 1])
+           (when-not weight-h (w/-destroy-buffer dev weight))
+           (when-not bias-h (w/-destroy-buffer dev bias))
+           output))
+       (-embedding [_ indices-h weight-h {:keys [tokens rows dim]}]
+         (let [total (* tokens dim)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding)
+                        [indices-h weight-h output
+                         (wb/uni dev (wb/u32-tag [tokens rows dim 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-rms-norm [_ input-h weight-h {:keys [rows dim eps]}]
+         (let [output (w/-create-buffer dev (* rows dim) :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rms-norm)
+                        [input-h weight-h output
+                         (wb/uni dev (wb/u32-tag [rows dim 0 0]))
+                         (wb/uni dev [(double eps)])]
+                        [rows 1 1])
+           output))
+       (-rotary-embedding
+         [_ input-h {:keys [batch sequence embed heads head-dim position-offset
+                            theta direction]}]
+         (let [total (* batch sequence embed)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rotary-embedding)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch sequence embed heads head-dim
+                                       position-offset 0 0]))
+                         (wb/uni dev [(double theta)])
+                         (wb/uni dev [(double direction)])]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-rgb-image-to-nchw [_ input-h {:keys [height width total]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rgb-image-to-nchw)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-nchw-to-rgb-image [_ input-h {:keys [height width total]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :nchw-to-rgb-image)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        [(wb/ceil-div total 64) 1 1])
            output))
        (-upsample-nearest2d [_ input-h
                              {:keys [n c h width oh ow scale-h scale-w]}]
@@ -366,6 +581,21 @@
                            (wb/uni dev (wb/u32-tag [total block output-block axis-offset]))]
                           [(wb/ceil-div total 64) 1 1]))
            output))
+       (-slice-axis [_ input-h {:keys [total input-block output-block input-offset]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :slice-axis)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [total input-block output-block input-offset]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-pad-right-bottom-nchw [_ input-h {:keys [total h width output-width]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :pad-right-bottom-nchw)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [total h width output-width]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
        (-add-last-axis-bias [_ input-h bias-h {:keys [total width]}]
          (let [output (w/-create-buffer dev total :storage)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :add-last-axis-bias)
@@ -379,6 +609,29 @@
                         [input-h output
                          (wb/uni dev (wb/u32-tag [rows cols]))]
                         [(wb/ceil-div cols 16) (wb/ceil-div rows 16) 1])
+           output))
+       (-transpose-nd [_ input-h {:keys [rank total input-shape output-shape perm]}]
+         (let [pad4 #(vec (take 4 (concat % (repeat 0))))
+               params (concat [rank total 0 0] (pad4 input-shape)
+                              (pad4 output-shape) (pad4 perm))
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-nd)
+                        [input-h output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-batched-matmul [_ a-h b-h
+                         {:keys [batch-shape batch-a batch-b batch-rank
+                                 batches m k n total]}]
+         (let [align (fn [shape]
+                       (vec (concat (repeat (- batch-rank (count shape)) 1) shape
+                                    (repeat (- 4 batch-rank) 1))))
+               out-shape (vec (concat batch-shape (repeat (- 4 batch-rank) 1)))
+               params (concat [batch-rank batches m n] [k total 0 0]
+                              out-shape (align batch-a) (align batch-b))
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :batched-matmul)
+                        [a-h b-h output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div total 64) 1 1])
            output))
        (-sum-rows [_ input-h {:keys [rows cols]}]
          (let [output (w/-create-buffer dev cols :storage)]
@@ -409,8 +662,35 @@
                          (wb/uni dev (wb/u32-tag [count]))]
                         [(wb/ceil-div count 64) 1 1])
            output))
+       (-adamw-step [_ parameter-h gradient-h moment-h variance-h
+                     {:keys [count learning-rate beta1 beta2 eps weight-decay
+                             correction1 correction2]}]
+         (let [moment (or moment-h (w/-create-buffer dev count :storage))
+               variance (or variance-h (w/-create-buffer dev count :storage))
+               next-parameter (w/-create-buffer dev count :storage)
+               next-moment (w/-create-buffer dev count :storage)
+               next-variance (w/-create-buffer dev count :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :adamw-step)
+                        [parameter-h gradient-h moment variance
+                         next-parameter next-moment next-variance
+                         (wb/uni dev (mapv double
+                                           [learning-rate beta1 beta2 eps
+                                            weight-decay correction1 correction2 0.0]))
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [(wb/ceil-div count 64) 1 1])
+           {:parameter next-parameter :moment next-moment
+            :variance next-variance}))
+       (-unscale-gradient [_ gradient-h {:keys [count inverse-scale]}]
+         (let [output (w/-create-buffer dev count :storage)
+               found-inf (w/-create-buffer dev 1 :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :unscale-gradient)
+                        [gradient-h output found-inf
+                         (wb/uni dev [(double inverse-scale)])
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [(wb/ceil-div count 64) 1 1])
+           {:gradient output :found-inf found-inf}))
        (-multi-head-attention [_ query-h key-h value-h key-padding-mask-h
-                               {:keys [batch seq-q seq-k d-model heads head-dim total
+                               {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim total
                                        causal? has-key-padding-mask?]}]
          (let [output (w/-create-buffer dev total :storage)
                mask (or key-padding-mask-h
@@ -418,17 +698,19 @@
            (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention)
                         [query-h key-h value-h mask output
                          (wb/uni dev (wb/u32-tag
-                                      [batch seq-q seq-k d-model heads head-dim
-                                       total (if causal? 1 0)
-                                       (if has-key-padding-mask? 1 0) 0 0 0]))]
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total
+                                       (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0]))]
                         [(wb/ceil-div total 64) 1 1])
+           (when-not key-padding-mask-h (w/-destroy-buffer dev mask))
            output))
        (-multi-head-attention-backward [_ query-h key-h value-h key-padding-mask-h
                                         grad-output-h
-                                        {:keys [batch seq-q seq-k d-model heads head-dim
+                                        {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim
                                                 causal? has-key-padding-mask?]}]
          (let [total-q (* batch seq-q d-model)
-               total-k (* batch seq-k d-model)
+               total-k (* batch seq-k kv-d-model)
                total (max total-q total-k)
                mask (or key-padding-mask-h
                         (w/-create-buffer dev (* batch seq-k) :storage))
@@ -439,10 +721,12 @@
                         [query-h key-h value-h mask grad-output-h
                          grad-query grad-key grad-value
                          (wb/uni dev (wb/u32-tag
-                                      [batch seq-q seq-k d-model heads head-dim
-                                       total-q total-k total (if causal? 1 0)
-                                       (if has-key-padding-mask? 1 0) 0]))]
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total-q total-k total
+                                       (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0 0 0]))]
                         [(wb/ceil-div total 64) 1 1])
+           (when-not key-padding-mask-h (w/-destroy-buffer dev mask))
            {:query grad-query :key grad-key :value grad-value})))
 
      (defn backend
@@ -451,7 +735,21 @@
        Deno hosts. Pipelines compile lazily on first use, exactly like
        num.wgsl-backend/wgsl-backend."
        [r]
-       (->WgslBackendAsync (->DenoGpuDevice (.-device r)) (atom {})))
+       (->WgslBackendAsync
+        (->DenoGpuDevice
+         (.-device r)
+         (atom {:live-buffers 0 :live-bytes 0
+                :peak-live-buffers 0 :peak-live-bytes 0
+                :created-buffers 0 :created-bytes 0
+                :destroyed-buffers 0 :destroyed-bytes 0}))
+        (atom {})))
+
+     (defn backend-stats
+       "Snapshot tracked storage/uniform GPUBuffer lifetime counters. Readback
+       staging buffers are intentionally excluded because they are scoped to a
+       Promise and destroyed immediately after unmap."
+       [backend]
+       @(.-stats (.-dev backend)))
 
      (defn gpu-backend
        "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.
