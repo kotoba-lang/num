@@ -227,6 +227,30 @@ no `--unstable-webgpu` flag needed):
 clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
 ```
 
+### UNet Metal benchmark
+
+The benchmark forces final readback, so it measures completed GPU work rather
+than near-zero queue submission latency:
+
+```bash
+clojure -M:deno-benchmark
+deno run --allow-all target/deno-gpu-benchmark.cjs
+```
+
+Measured on Apple M4 with input `[1,32,64,64]`, weights `[64,32,3,3]`, and a
+full `NCHW conv(pad=1) → GroupNorm(8) → SiLU` chain:
+
+| path | elapsed |
+|---|---:|
+| ClojureScript CPU oracle | 934.46 ms |
+| Metal cold (pipeline compile included) | 41.14 ms |
+| Metal warm | 36.68 ms |
+
+Warm speedup is **25.48×**, with maximum absolute error `2.38e-6` against the
+CPU oracle. This is a concrete kernel-chain measurement, not a claim of
+PyTorch/MPS-wide parity: larger 320-channel blocks, memory pressure, mixed
+precision, fusion, and full-model throughput still require separate benchmarks.
+
 This cross-checks the live GPU backend against `num.cpu`'s reference oracle (dispatched
 through `num.core`/`num.array`, i.e. through `IBackend`, the same seam any real caller
 uses) — **verified passing on real Apple M4 Metal hardware while building this**:
