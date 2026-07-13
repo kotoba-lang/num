@@ -146,12 +146,14 @@
 (defn- create-kv! [device command]
   (let [id (aget command "id") layers (aget command "layers")
         context (aget command "context") kv-heads (aget command "kvHeads")
-        head-dim (aget command "headDim") bytes (* layers context kv-heads head-dim 4)
+        head-dim (aget command "headDim") page-tokens (min context 16)
+        bytes (* layers page-tokens kv-heads head-dim 4)
         storage (bit-or (.-STORAGE usage) (.-COPY_DST usage) (.-COPY_SRC usage))
         keys (.createBuffer device #js {:size bytes :usage storage})
         values (.createBuffer device #js {:size bytes :usage storage})]
     (swap! kv-registry assoc id #js {:keys keys :values values :bytes bytes :layers layers
-                                     :context context :kvHeads kv-heads :headDim head-dim})
+                                     :context context :capacity page-tokens
+                                     :kvHeads kv-heads :headDim head-dim})
     (reply {:ok true :id id :gpu-bytes (* bytes 2)})))
 
 (defn- clone-kv! [device command]
@@ -167,21 +169,50 @@
       (.submit (.-queue device) #js [(.finish encoder)])
       (swap! kv-registry assoc id #js {:keys keys :values values :bytes (.-bytes source)
                                        :layers (.-layers source) :context (.-context source)
+                                       :capacity (.-capacity source)
                                        :kvHeads (.-kvHeads source) :headDim (.-headDim source)})
       (reply {:ok true :id id :gpu-bytes (* 2 (.-bytes source))}))))
 
-(defn- attention! [device cache-pipeline attention-pipeline command]
-  (let [id (aget command "id") entry (get @kv-registry id)]
-    (when-not entry (throw (js/Error. (str "unknown KV handle: " id))))
-    (let [heads (aget command "heads") kv-heads (.-kvHeads entry)
-          head-dim (.-headDim entry) position (aget command "position")
-          layer (aget command "layer") context (.-context entry)
+(defn- grow-kv! [device id entry position]
+  (if (< position (.-capacity entry)) entry
+    (let [capacity (min (.-context entry)
+                        (max (inc position) (* 2 (.-capacity entry))))
+          bytes (* (.-layers entry) capacity (.-kvHeads entry) (.-headDim entry) 4)
+          storage (bit-or (.-STORAGE usage) (.-COPY_DST usage) (.-COPY_SRC usage))
+          keys (.createBuffer device #js {:size bytes :usage storage})
+          values (.createBuffer device #js {:size bytes :usage storage})
+          encoder (.createCommandEncoder device)]
+      ;; Layer strides change with capacity, so copy each layer independently.
+      (dotimes [layer (.-layers entry)]
+        (let [old-layer-bytes (* (.-capacity entry) (.-kvHeads entry)
+                                 (.-headDim entry) 4)
+              new-layer-bytes (* capacity (.-kvHeads entry) (.-headDim entry) 4)]
+          (.copyBufferToBuffer encoder (.-keys entry) (* layer old-layer-bytes)
+                               keys (* layer new-layer-bytes) old-layer-bytes)
+          (.copyBufferToBuffer encoder (.-values entry) (* layer old-layer-bytes)
+                               values (* layer new-layer-bytes) old-layer-bytes)))
+      (.submit (.-queue device) #js [(.finish encoder)])
+      (.destroy (.-keys entry)) (.destroy (.-values entry))
+      (let [grown #js {:keys keys :values values :bytes bytes :layers (.-layers entry)
+                       :context (.-context entry) :capacity capacity
+                       :kvHeads (.-kvHeads entry) :headDim (.-headDim entry)}]
+        (swap! kv-registry assoc id grown)
+        (swap! metrics update :kv-grows (fnil inc 0))
+        grown))))
+
+(defn- encode-attention! [device cache-pipeline attention-pipeline encoder command]
+  (let [id (aget command "id") original (get @kv-registry id)]
+    (when-not original (throw (js/Error. (str "unknown KV handle: " id))))
+    (let [position (aget command "position") entry (grow-kv! device id original position)
+          heads (aget command "heads") kv-heads (.-kvHeads entry)
+          head-dim (.-headDim entry)
+          layer (aget command "layer") capacity (.-capacity entry)
           q (js/Float32Array. (aget command "q"))
           k (js/Float32Array. (aget command "k")) v (js/Float32Array. (aget command "v"))
           _ (when-not (and (= (.-length q) (* heads head-dim))
                            (= (.-length k) (* kv-heads head-dim))
                            (= (.-length v) (* kv-heads head-dim))
-                           (< position context) (< layer (.-layers entry)))
+                           (< position (.-context entry)) (< layer (.-layers entry)))
               (throw (js/Error. "attention shape or cache position mismatch")))
           storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
           qbuf (gpu-buffer device q storage) kbuf (gpu-buffer device k storage)
@@ -192,7 +223,7 @@
                                            :usage (bit-or (.-COPY_DST usage) (.-MAP_READ usage))})
           params (gpu-buffer device
                              (js/Uint32Array. #js [heads kv-heads head-dim position
-                                                   context layer 0 0])
+                                                   capacity layer 0 0])
                              (bit-or (.-UNIFORM usage) (.-COPY_DST usage)))
           cache-bind (.createBindGroup device
                                        #js {:layout (.getBindGroupLayout cache-pipeline 0)
@@ -208,7 +239,7 @@
                                                               #js {:binding 2 :resource #js {:buffer (.-values entry)}}
                                                               #js {:binding 3 :resource #js {:buffer out}}
                                                               #js {:binding 4 :resource #js {:buffer params}}]})
-          encoder (.createCommandEncoder device) cache-pass (.beginComputePass encoder)]
+          cache-pass (.beginComputePass encoder)]
       (.setPipeline cache-pass cache-pipeline) (.setBindGroup cache-pass 0 cache-bind)
       (.dispatchWorkgroups cache-pass (Math/ceil (/ (* kv-heads head-dim) 64)))
       (.end cache-pass)
@@ -216,12 +247,34 @@
         (.setPipeline pass attention-pipeline) (.setBindGroup pass 0 attention-bind)
         (.dispatchWorkgroups pass (Math/ceil (/ (* heads head-dim) 64))) (.end pass))
       (.copyBufferToBuffer encoder out 0 read 0 (* heads head-dim 4))
-      (.submit (.-queue device) #js [(.finish encoder)])
-      (-> (.mapAsync read (.-READ map-mode))
-          (.then (fn []
-                   (reply {:ok true :id id
-                           :output (vec (js/Float32Array. (.getMappedRange read)))})
-                   (doseq [buffer [qbuf kbuf vbuf out read params]] (.destroy buffer))))))))
+      #js {:id id :read read :buffers #js [qbuf kbuf vbuf out read params]})))
+
+(defn- read-attention! [job]
+  (-> (.mapAsync (.-read job) (.-READ map-mode))
+      (.then (fn []
+               (let [result {:id (.-id job)
+                             :output (vec (js/Float32Array.
+                                          (.getMappedRange (.-read job))))}]
+                 (doseq [buffer (array-seq (.-buffers job))] (.destroy buffer))
+                 result)))))
+
+(defn- attention! [device cache-pipeline attention-pipeline command]
+  (let [encoder (.createCommandEncoder device)
+        job (encode-attention! device cache-pipeline attention-pipeline encoder command)]
+    (swap! metrics update :attention (fnil inc 0))
+    (.submit (.-queue device) #js [(.finish encoder)])
+    (-> (read-attention! job)
+        (.then #(reply (assoc % :ok true))))))
+
+(defn- attention-many! [device cache-pipeline attention-pipeline command]
+  (let [encoder (.createCommandEncoder device)
+        jobs (mapv #(encode-attention! device cache-pipeline attention-pipeline encoder %)
+                   (array-seq (aget command "requests")))]
+    (swap! metrics update :attention-many (fnil inc 0))
+    (.submit (.-queue device) #js [(.finish encoder)])
+    (-> (js/Promise.all (clj->js (map read-attention! jobs)))
+        (.then (fn [results]
+                 (reply {:ok true :results (js->clj results :keywordize-keys true)}))))))
 
 (defn- release-kv! [command]
   (let [id (aget command "id") entry (get @kv-registry id)]
@@ -272,10 +325,16 @@
                  "clone-kv" (clone-kv! device command)
                  "attention" (.catch (attention! device cache-pipeline attention-pipeline command)
                                       #(reply {:ok false :error (.-message %)}))
+                 "attention-many" (.catch
+                                   (attention-many! device cache-pipeline attention-pipeline command)
+                                   #(reply {:ok false :error (.-message %)}))
                  "release-kv" (release-kv! command)
                  "release" (release! command)
                  "stats" (reply (merge {:ok true :handles (count @registry)
-                                         :kv-handles (count @kv-registry)} @metrics))
+                                         :kv-handles (count @kv-registry)
+                                         :kv-bytes (reduce + 0 (map #(* 2 (.-bytes %))
+                                                                    (vals @kv-registry)))}
+                                        @metrics))
                  (reply {:ok false :error (str "unknown op: " op)})))
              (catch :default error
                (reply {:ok false :error (.-message error)})))))))
