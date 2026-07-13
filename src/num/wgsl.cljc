@@ -34,6 +34,12 @@
     "Run `pipeline` with `buffers` bound at @binding 0.. and `workgroups`
      [x y z] workgroup counts."))
 
+(defprotocol IGpuDeviceDType
+  "Optional physical typed-buffer operations. `n` is an element count."
+  (-create-buffer-dtype [dev n usage dtype])
+  (-write-buffer-dtype [dev buf xs dtype])
+  (-read-buffer-dtype [dev buf n dtype]))
+
 ;; ---------------------------------------------------------------------------
 ;; Compute shaders (WGSL) — compiled per-GPU by wgpu
 ;; ---------------------------------------------------------------------------
@@ -367,6 +373,89 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[outer * d.output_block + d.axis_offset + within] = input[index];
 }")
 
+(def ewise-f16-wgsl
+  "Packed physical f16 elementwise arithmetic with f32 evaluation."
+  "
+struct Params { op: u32, n: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read> y: array<u32>;
+@group(0) @binding(2) var<storage, read_write> z: array<u32>;
+@group(0) @binding(3) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x;
+  let base = word * 2u;
+  if (base >= p.n) { return; }
+  let xv = unpack2x16float(x[word]);
+  let yv = unpack2x16float(y[word]);
+  var out: vec2<f32>;
+  if (p.op == 0u) { out = xv + yv; }
+  else if (p.op == 1u) { out = xv - yv; }
+  else if (p.op == 2u) { out = xv * yv; }
+  else { out = xv / yv; }
+  if (base + 1u >= p.n) { out.y = 0.0; }
+  z[word] = pack2x16float(out);
+}")
+
+(def ewise1-f16-wgsl
+  "Packed physical f16 unary ops, with transcendental evaluation in f32."
+  "
+struct Params { op: u32, n: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> x: array<u32>;
+@group(0) @binding(1) var<storage, read_write> z: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+fn apply(v: f32) -> f32 {
+  if (p.op == 0u) { return exp(v); }
+  if (p.op == 1u) { return max(v, 0.0); }
+  if (p.op == 2u) { return -v; }
+  return v / (1.0 + exp(-v));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x;
+  let base = word * 2u;
+  if (base >= p.n) { return; }
+  let v = unpack2x16float(x[word]);
+  let second = select(apply(v.y), 0.0, base + 1u >= p.n);
+  z[word] = pack2x16float(vec2<f32>(apply(v.x), second));
+}")
+
+(def gemm-f16-wgsl
+  "Packed physical f16 GEMM with f32 accumulation and f16 output."
+  "
+struct Dims { m: u32, k: u32, n: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> A: array<u32>;
+@group(0) @binding(1) var<storage, read> B: array<u32>;
+@group(0) @binding(2) var<storage, read_write> C: array<u32>;
+@group(0) @binding(3) var<uniform> d: Dims;
+fn load_a(index: u32) -> f32 {
+  let pair = unpack2x16float(A[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_b(index: u32) -> f32 {
+  let pair = unpack2x16float(B[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn dot_at(index: u32) -> f32 {
+  let row = index / d.n;
+  let col = index % d.n;
+  var sum: f32 = 0.0;
+  for (var l: u32 = 0u; l < d.k; l = l + 1u) {
+    sum = sum + load_a(row * d.k + l) * load_b(l * d.n + col);
+  }
+  return sum;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x;
+  let base = word * 2u;
+  let total = d.m * d.n;
+  if (base >= total) { return; }
+  var second: f32 = 0.0;
+  if (base + 1u < total) { second = dot_at(base + 1u); }
+  C[word] = pack2x16float(vec2<f32>(dot_at(base), second));
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -383,6 +472,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :group-norm-nchw group-norm-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
+   :ewise-f16 ewise-f16-wgsl
+   :ewise1-f16 ewise1-f16-wgsl
+   :gemm-f16 gemm-f16-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@
   pulling in `core.async` (not needed here — no complex internal control flow, just
   a couple of `.then` chains)."
   (:require [num.protocol :as p]
+            [num.dtype :as dtype]
             [num.wgsl :as w]
             [num.wgsl-backend :as wb]))
 
@@ -121,7 +122,36 @@
            (.setBindGroup pass 0 bind-group)
            (.dispatchWorkgroups pass wx wy wz)
            (.end pass)
-           (.submit (.-queue dev) #js [(.finish encoder)]))))
+           (.submit (.-queue dev) #js [(.finish encoder)])))
+
+       w/IGpuDeviceDType
+       (-create-buffer-dtype [_ n usage dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "WebGPU typed storage currently supports f16 only"
+                           {:dtype dtype*})))
+         (.createBuffer dev #js {:size (max (* 2 (long n)) 4)
+                                 :usage (usage->flags usage)}))
+       (-write-buffer-dtype [_ buf xs dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
+         (let [encoded (js/Uint16Array.
+                        (into-array (map #(bit-and (dtype/f32->f16-bits %) 0xffff) xs)))]
+           (.writeBuffer (.-queue dev) buf 0 encoded)))
+       (-read-buffer-dtype [_ buf n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
+         (let [nbytes (max (* 2 (long n)) 4)
+               staging (.createBuffer dev #js {:size nbytes :usage readback-usage})
+               encoder (.createCommandEncoder dev)]
+           (.copyBufferToBuffer encoder buf 0 staging 0 nbytes)
+           (.submit (.-queue dev) #js [(.finish encoder)])
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [raw (js/Uint16Array. (.slice (.getMappedRange staging) 0))
+                              out (mapv dtype/f16-bits->f32
+                                        (take n (js/Array.from raw)))]
+                          (.unmap staging)
+                          out)))))))
 
      ;; --- device negotiation (the ONLY inherently-async step) ------------------
 
@@ -132,7 +162,10 @@
        (-> (.requestAdapter js/navigator.gpu)
            (.then (fn [adapter]
                     (-> (.requestDevice adapter)
-                        (.then (fn [dev] #js {:adapter adapter :device dev})))))))
+                        (.then (fn [dev]
+                                 (set! (.-onuncapturederror dev)
+                                       (fn [event] (js/console.error (.-error event))))
+                                 #js {:adapter adapter :device dev})))))))
 
      (defn adapter-description
        "Best-effort adapter description string for logging (mirrors
@@ -211,6 +244,46 @@
            (w/-write-buffer dev v (seq (:vals csr)))
            (w/-dispatch dev (wb/get-pipeline dev pipes :spmv) [rp ci v xh y] [(wb/ceil-div m 64) 1 1])
            y))
+
+       p/IDTypeStorage
+       (-alloc-dtype [_ n dtype*]
+         (w/-create-buffer-dtype dev n :storage dtype*))
+       (-copy-from-host-dtype [_ xs dtype*]
+         (let [buffer (w/-create-buffer-dtype dev (count xs) :storage dtype*)]
+           (w/-write-buffer-dtype dev buffer xs dtype*)
+           buffer))
+       (-copy-to-host-dtype [_ h n dtype*]
+         (w/-read-buffer-dtype dev h n dtype*))
+
+       p/IDTypeOps
+       (-ewise-dtype [_ op xh yh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :ewise-f16)
+                        [xh yh output
+                         (wb/uni dev (wb/u32-tag [({:add 0 :sub 1 :mul 2 :div 3} op)
+                                                  n 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+           output))
+       (-ewise1-dtype [_ op xh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1-f16)
+                        [xh output
+                         (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)
+                                                  n 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+           output))
+       (-gemm-dtype [_ Ah m k Bh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev (* m n) :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :gemm-f16)
+                        [Ah Bh output (wb/uni dev (wb/u32-tag [m k n 0]))]
+                        [(wb/ceil-div (wb/ceil-div (* m n) 2) 64) 1 1])
+           output))
 
        p/ITensorBackend
        (-conv2d-nchw [_ input-h weight-h bias-h

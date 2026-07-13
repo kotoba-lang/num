@@ -10,11 +10,16 @@
 (deftest shader-set-is-complete
   (testing "every accelerated IBackend op has a non-empty WGSL kernel"
     (doseq [op [:axpy :scal :ewise :ewise1 :reduce :gemv :gemm
+                :ewise-f16 :ewise1-f16 :gemm-f16
                 :conv2d-nchw :group-norm-nchw :upsample-nearest2d :cat-copy :spmv]]
       (is (string? (get w/shaders op)) (str "missing shader: " op))
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"
-    (is (re-find #"var<workgroup>" (:gemm w/shaders)))))
+    (is (re-find #"var<workgroup>" (:gemm w/shaders))))
+  (testing "typed kernels use packed physical halves and accumulate GEMM in f32"
+    (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
+    (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))
+    (is (re-find #"var sum: f32" (:gemm-f16 w/shaders)))))
 
 (deftest backend-namespaces-load
   (testing "the WgslBackend constructor and IGpuDevice port compile on the JVM"
