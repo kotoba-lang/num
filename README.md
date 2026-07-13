@@ -221,7 +221,8 @@ mandatory. The complete fake-driver contract passes, proving dispatch and
 lifecycle behavior without requiring CUDA on every developer machine. A native
 NVIDIA host adapter and real-GPU contract run remain required before performance
 or hardware qualification claims; see `docs/adr/0002-cuda-native-backend.md`.
-Metal/ROCm vendor-native fast paths and JVM Panama/wgpu-native remain unimplemented.
+ROCm and JVM Panama/wgpu-native remain unimplemented. The Metal native fast path
+is implemented and hardware-qualified below.
 
 The native side is implemented under `native/cuda`: a stable C ABI backed by
 CUDA Runtime, cuBLAS, cuSPARSE, Thrust reductions and a custom elementwise
@@ -252,18 +253,21 @@ the CUDA Driver API, caches seven functions and launches generated ewise/reduce
 kernels. Its contract asserts seven NVRTC compilations, compiled-kernel
 execution and zero bootstrap ewise/reduction calls.
 
-Native Metal now uses the same architecture. `num.metal/MetalBackend` defines
-buffer lifecycle, vector operations, MPS GEMV/GEMM, CSR SpMV and compiled MSL
-kernel ports, with mandatory Apple device/family/OS/compiler provenance. The
-complete injected-driver contract passes. `clojure -M:metal-verify` runtime-
-compiles compiler-generated MSL and executes ewise add plus reduction sum on an
-actual Apple M1 Max GPU; WGSL/WebGPU→Metal remains the fully hardware-tested
-portable backend while the remaining native MPS host methods are implemented.
+Native Metal now uses the same architecture. `num.metal/MetalBackend` and the
+Objective-C++ C ABI under `native/metal` implement owned `MTLBuffer` lifecycle,
+vector operations, dense GEMV/GEMM, CSR SpMV, pipeline caching, and runtime
+compilation of compiler-generated MSL. The optional JNA adapter keeps native
+dependencies outside the default graph and records Apple device, OS, runtime,
+and all seven KIR/code hashes. `scripts/verify-metal-native.sh` passes the full
+14-operation `IBackend` contract and the independent generated-MSL gate on an
+Apple M1 Max. These dense kernels are direct Metal compute kernels; using Metal
+Performance Shaders as an additional tuned implementation remains future work.
 
 ```bash
 clojure -M:test                                  # CPU + injected CUDA dispatch contracts (JVM)
 clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript
 clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs   # PROOF: live GPU ≡ CPU oracle, real Metal
+./scripts/verify-metal-native.sh                   # PROOF: native Metal 14/14 + compiler MSL gate
 ```
 
 **Portability is proven, not just claimed.** The `.cljc` core (CPU backend, array/CSR

@@ -6,15 +6,18 @@
  ;;   :wgsl  → WebGPU/wgpu (browser via cljs, native via a wgpu host) — the portable
  ;;            primary (one WGSL compute shader → Metal / Vulkan(ROCm) / DX12 / WebGPU)
  ;;   :cuda  → cuBLAS / cuSPARSE via JNI/Panama        (NVIDIA, JVM-only fast path)
- ;;   :metal → Metal Performance Shaders via FFM       (Apple, JVM-only fast path)
+ ;;   :metal → native Metal compute via JNA             (Apple, JVM-only fast path)
  ;;   :rocm  → rocBLAS / hipSPARSE via Panama          (AMD, JVM-only fast path)
- ;; `num.cuda/CudaBackend` and its injected ICudaDriver host port are implemented;
- ;; a native NVIDIA driver package remains opt-in. Metal/ROCm aliases remain specs.
+ ;; CUDA and Metal host ports are implemented and remain opt-in; ROCm is a spec.
  :deps {io.github.kotoba-lang/compiler
         {:git/url "https://github.com/kotoba-lang/compiler.git"
          :git/sha "1ed977a6c43206326fa36c1870f05b2ce878f660"}}
  :aliases
  {:cuda-jna {:extra-deps {net.java.dev.jna/jna {:mvn/version "5.16.0"}}}
+  :metal-jna {:extra-deps {net.java.dev.jna/jna {:mvn/version "5.16.0"}}}
+  :metal-native-verify {:extra-paths ["test" "native/metal"]
+                        :extra-deps {net.java.dev.jna/jna {:mvn/version "5.16.0"}}
+                        :main-opts ["-m" "num.metal-native-verify"]}
   :cuda-verify {:extra-paths ["test" "native/cuda"]
                 :extra-deps {net.java.dev.jna/jna {:mvn/version "5.16.0"}}
                 :main-opts ["-m" "num.cuda-native-verify"]}

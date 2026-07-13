@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.24)
+project(num_metal LANGUAGES CXX OBJCXX)
+add_library(num_metal SHARED num_metal.mm)
+target_compile_features(num_metal PRIVATE cxx_std_17)
+target_compile_options(num_metal PRIVATE -fobjc-arc -fblocks)
+target_link_libraries(num_metal PRIVATE "-framework Foundation" "-framework Metal")
