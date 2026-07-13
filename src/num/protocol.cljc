@@ -47,6 +47,20 @@
   [x]
   (satisfies? IBackend x))
 
+(defprotocol IDTypeStorage
+  "Optional physical storage contract for non-f32 arrays. Implementations must
+  allocate and transfer the requested dtype rather than merely tagging values."
+  (-alloc-dtype [b n dtype] "Allocate `n` physical elements of `dtype`.")
+  (-copy-from-host-dtype [b xs dtype] "Quantize/upload host values as `dtype`.")
+  (-copy-to-host-dtype [b h n dtype] "Decode/download `n` `dtype` elements."))
+
+(defprotocol IDTypeOps
+  "Optional compute contract over physical non-f32 storage. Accumulation policy
+  is backend-defined; outputs must be materialized in the requested dtype."
+  (-ewise-dtype [b op xh yh n dtype])
+  (-ewise1-dtype [b op xh n dtype])
+  (-gemm-dtype [b Ah m k Bh n dtype]))
+
 (defprotocol ITensorBackend
   "Optional device-native N-D operations. Backends that do not implement this
   protocol continue to use num.tensor's portable host oracle."

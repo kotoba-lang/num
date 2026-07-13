@@ -76,6 +76,25 @@ JVM/native only, never required.
 (a/->vec (nm/spmv b K x))               ;=> [3.0 3.0]   (sparse A·x)
 ```
 
+### Physical f16/bf16 storage
+
+`from-vec` and `zeros` accept an optional dtype, and `cast` materializes a new
+buffer rather than attaching a cosmetic label:
+
+```clojure
+(def half (a/from-vec b [0.1 0.2 0.3 0.4] [2 2] :f16))
+(def brain (a/cast half :bf16))
+(:dtype half)                              ;=> :f16
+(a/->vec half)                             ; quantized host values
+```
+
+The CPU oracle stores f16/bf16 in real two-byte elements and implements typed
+elementwise operations, activations, and GEMM with f32 accumulation followed by
+output quantization. IEEE subnormals, infinities, NaNs, and round-to-nearest-even
+are covered by tests on JVM and the core compiles and runs under ClojureScript.
+The current WGSL/Metal backend remains f32-only; typed GPU storage and kernels
+are the next backend milestone, so this is not yet end-to-end mixed precision.
+
 Ops: `axpy! scal! dot nrm2 add sub mul div sum amax amin matvec matmul spmv`.
 
 ## N-D tensors (`num.tensor`, ADR-2607051400 §Phase 1)

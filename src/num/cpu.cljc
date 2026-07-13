@@ -7,9 +7,26 @@
   backend, asserting `GpuBackend ≡ CpuBackend` to ~f32 tolerance, the same way the
   actors guarantee `MemStore ≡ DatomicStore`. A handle here is just a
   `double-array`; CSR arrays travel as host `int-array`/`double-array`."
-  (:require [num.protocol :as p]))
+  (:require [num.dtype :as dtype]
+            [num.protocol :as p]))
 
 (defn- ^double aget* [^doubles a ^long i] (aget a i))
+
+(defn- typed-values [handle]
+  (let [data (:data handle)
+        decode (case (:dtype handle)
+                 :f16 dtype/f16-bits->f32
+                 :bf16 dtype/bf16-bits->f32)]
+    (mapv #(decode (aget data %)) (range (alength data)))))
+
+(defn- typed-handle [dtype* values]
+  (let [encode (case dtype*
+                 :f16 dtype/f32->f16-bits
+                 :bf16 dtype/f32->bf16-bits)
+        encoded (mapv encode values)]
+    {:dtype dtype*
+     :data #?(:clj (short-array encoded)
+              :cljs (js/Int16Array. (into-array encoded)))}))
 
 (deftype CpuBackend []
   p/IBackend
@@ -88,7 +105,54 @@
         (let [a (aget rp i) z (aget rp (inc i))]
           (aset y i (loop [p a s 0.0]
                       (if (< p z) (recur (inc p) (+ s (* (aget v p) (aget x (aget ci p))))) s)))))
-      y)))
+      y))
+
+  p/IDTypeStorage
+  (-alloc-dtype [_ n dtype*]
+    {:dtype dtype*
+     :data #?(:clj (short-array (long n))
+              :cljs (js/Int16Array. n))})
+  (-copy-from-host-dtype [_ xs dtype*]
+    (let [encoded (mapv (case dtype*
+                          :f16 dtype/f32->f16-bits
+                          :bf16 dtype/f32->bf16-bits)
+                        xs)]
+      {:dtype dtype*
+       :data #?(:clj (short-array encoded)
+                :cljs (js/Int16Array. (into-array encoded)))}))
+  (-copy-to-host-dtype [_ h n dtype*]
+    (when-not (= dtype* (:dtype h))
+      (throw (ex-info "typed handle dtype mismatch"
+                      {:expected dtype* :actual (:dtype h)})))
+    (let [data (:data h)
+          decode (case dtype*
+                   :f16 dtype/f16-bits->f32
+                   :bf16 dtype/bf16-bits->f32)]
+      (mapv #(decode (aget data %)) (range (long n)))))
+
+  p/IDTypeOps
+  (-ewise-dtype [_ op xh yh n dtype*]
+    (let [xs (typed-values xh) ys (typed-values yh)
+          f (case op :add + :sub - :mul * :div /)]
+      (typed-handle dtype* (mapv f (take n xs) (take n ys)))))
+  (-ewise1-dtype [_ op xh n dtype*]
+    (let [f (case op
+              :exp #(Math/exp %)
+              :relu #(max % 0.0)
+              :neg -
+              :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v))))))]
+      (typed-handle dtype* (mapv f (take n (typed-values xh))))))
+  (-gemm-dtype [_ Ah m k Bh n dtype*]
+    (let [A (typed-values Ah) B (typed-values Bh)]
+      (typed-handle
+       dtype*
+       (vec
+        (for [i (range m) j (range n)]
+          (reduce + 0.0
+                  (map (fn [l]
+                         (* (nth A (+ (* i k) l))
+                            (nth B (+ (* l n) j))))
+                       (range k)))))))))
 
 (defn cpu-backend
   "Construct the pure-Clojure CPU reference backend."

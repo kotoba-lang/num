@@ -11,6 +11,12 @@
 
 (defn- be [a] (:backend a))
 (defn- n1 [a] (arr/nelems (:shape a)))
+(defn- dtype [a] (or (:dtype a) :f32))
+
+(defn- require-matching-dtype! [x y]
+  (when-not (= (dtype x) (dtype y))
+    (throw (ex-info "operands must have the same dtype"
+                    {:left (dtype x) :right (dtype y)}))))
 
 ;; --- level-1 -----------------------------------------------------------------
 
@@ -39,7 +45,18 @@
 ;; --- elementwise + reductions ------------------------------------------------
 
 (defn- ewise [op x y]
-  (arr/->NDArray (be x) (p/-ewise (be x) op (:handle x) (:handle y) (n1 x)) (:shape x)))
+  (require-matching-dtype! x y)
+  (if (= :f32 (dtype x))
+    (assoc (arr/->NDArray (be x) (p/-ewise (be x) op (:handle x) (:handle y) (n1 x))
+                          (:shape x)) :dtype :f32)
+    (do
+      (when-not (satisfies? p/IDTypeOps (be x))
+        (throw (ex-info "backend does not support typed operations" {:dtype (dtype x)})))
+      (assoc (arr/->NDArray (be x)
+                            (p/-ewise-dtype (be x) op (:handle x) (:handle y)
+                                            (n1 x) (dtype x))
+                            (:shape x))
+             :dtype (dtype x)))))
 
 (defn add [x y] (ewise :add x y))
 (defn sub [x y] (ewise :sub x y))
@@ -47,7 +64,13 @@
 (defn div [x y] (ewise :div x y))
 
 (defn- ewise1 [op x]
-  (arr/->NDArray (be x) (p/-ewise1 (be x) op (:handle x) (n1 x)) (:shape x)))
+  (if (= :f32 (dtype x))
+    (assoc (arr/->NDArray (be x) (p/-ewise1 (be x) op (:handle x) (n1 x)) (:shape x))
+           :dtype :f32)
+    (assoc (arr/->NDArray (be x)
+                          (p/-ewise1-dtype (be x) op (:handle x) (n1 x) (dtype x))
+                          (:shape x))
+           :dtype (dtype x))))
 
 (defn exp [x] (ewise1 :exp x))
 (defn relu [x] (ewise1 :relu x))
@@ -70,9 +93,15 @@
 (defn matmul
   "C = A·B for dense A (shape [m k]) and B (shape [k n]) → NDArray [m n]."
   [A B]
-  (let [b (be A) [m k] (:shape A) [_ n] (:shape B) C (p/-alloc b (* m n))]
-    (p/-gemm b 1.0 (:handle A) m k (:handle B) n 0.0 C)
-    (arr/->NDArray b C [m n])))
+  (require-matching-dtype! A B)
+  (let [b (be A) [m k] (:shape A) [_ n] (:shape B)]
+    (if (= :f32 (dtype A))
+      (let [C (p/-alloc b (* m n))]
+        (p/-gemm b 1.0 (:handle A) m k (:handle B) n 0.0 C)
+        (assoc (arr/->NDArray b C [m n]) :dtype :f32))
+      (assoc (arr/->NDArray b (p/-gemm-dtype b (:handle A) m k (:handle B) n
+                                             (dtype A)) [m n])
+             :dtype (dtype A)))))
 
 ;; --- sparse ------------------------------------------------------------------
 
