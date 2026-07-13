@@ -32,6 +32,17 @@
   (println (str (if ok? "✓" "✗") " " label))
   (if ok? (swap! pass inc) (swap! fail inc)))
 
+(defn- verify-temporary-buffer-lifetime! [backend]
+  (let [before (dg/backend-stats backend)
+        input (arr/from-vec backend [1.0 -2.0 3.0 -4.0] [4])]
+    (dotimes [_ 100]
+      (arr/release! (nm/relu input)))
+    (arr/release! input)
+    (let [after (dg/backend-stats backend)]
+      (and (= (:live-buffers before) (:live-buffers after))
+           (= (:live-bytes before) (:live-bytes after))
+           (>= (- (:destroyed-buffers after) (:destroyed-buffers before)) 201)))))
+
 (defn -main [& _]
   (let [cpu-b (cpu/cpu-backend)
         ;; --- CPU ORACLE: computed eagerly, same literals + same order as
@@ -345,6 +356,8 @@
                           (.then prom (fn [g] (record! pass fail label (okfn g)))))
                         checks)))
                  (.then (fn [_]
+                          (record! pass fail "temporary GPUBuffer lifetime"
+                                   (verify-temporary-buffer-lifetime! gpu))
                           (println (str "\nDeno WgslBackendAsync ≡ CPU oracle: " @pass " passed, " @fail " failed"))
                           (js/Deno.exit (if (pos? @fail) 1 0))))))))
         (.catch (fn [e]

@@ -28,12 +28,18 @@
    :beta (arr/from-vec backend beta-values [64])})
 
 (defn- chain [{:keys [input weight bias gamma beta]}]
-  (t/group-norm-silu-nchw
-   (t/conv2d-nchw input weight bias {:padding 1})
-   8 gamma beta 1.0e-5))
+  (let [convolved (t/conv2d-nchw input weight bias {:padding 1})
+        output (t/group-norm-silu-nchw convolved 8 gamma beta 1.0e-5)]
+    (arr/release! convolved)
+    output))
 
 (defn- force-output [output]
   (arr/->vec output))
+
+(defn- force-and-release [output]
+  (let [result (force-output output)]
+    (arr/release! output)
+    result))
 
 (defn- full-channel-benchmark [device dtype]
   (let [gpu (dg/backend device)
@@ -44,7 +50,8 @@
         weight (arr/from-vec gpu (repeat (arr/nelems weight-shape) 0.001)
                              weight-shape dtype)
         bias (arr/from-vec gpu (repeat 320 0.0) [320] dtype)
-        run (fn [] (force-output
+        baseline (dg/backend-stats gpu)
+        run (fn [] (force-and-release
                     (t/conv2d-nchw input weight bias {:padding 1})))
         cold-start (now)]
     (-> (run)
@@ -63,11 +70,14 @@
                                "->" [1 320 64 64])
                       (println "GPU cold ms:" (.toFixed cold-ms 2))
                       (println "GPU warm ms:" (.toFixed warm-ms 2))
+                      (println "GPU buffers:" (pr-str (dg/backend-stats gpu)))
                       (println "center value:" (nth warm-values center)
                                "expected:" expected)
                       (when (or (not= (count cold-values) (* 320 64 64))
                                 (> (Math/abs (- (nth warm-values center) expected))
-                                   (if (= dtype :f16) 1.0e-3 1.0e-4)))
+                                   (if (= dtype :f16) 1.0e-3 1.0e-4))
+                                (not= (:live-bytes baseline)
+                                      (:live-bytes (dg/backend-stats gpu))))
                         (throw (js/Error. "full-channel convolution check failed")))))))))))))
 
 (defn -main [& args]
@@ -87,13 +97,14 @@
          (fn [device]
            (let [gpu (dg/backend device)
                  gpu-tensors (tensors gpu)
+                 baseline (dg/backend-stats gpu)
                  cold-start (now)
-                 cold-output (force-output (chain gpu-tensors))]
+                 cold-output (force-and-release (chain gpu-tensors))]
              (.then cold-output
                     (fn [cold-values]
                       (let [cold-ms (- (now) cold-start)
                             warm-start (now)
-                            warm-output (force-output (chain gpu-tensors))]
+                            warm-output (force-and-release (chain gpu-tensors))]
                         (.then warm-output
                                (fn [warm-values]
                                  (let [warm-ms (- (now) warm-start)
@@ -109,8 +120,11 @@
                                    (println "GPU warm ms:" (.toFixed warm-ms 2))
                                    (println "warm speedup:" (.toFixed (/ cpu-ms warm-ms) 2) "x")
                                    (println "max abs error:" max-error)
+                                   (println "GPU buffers:" (pr-str (dg/backend-stats gpu)))
                                    (when (or (not= (count cold-values) (count cpu-output))
-                                             (> max-error 1.0e-4))
+                                             (> max-error 1.0e-4)
+                                             (not= (:live-bytes baseline)
+                                                   (:live-bytes (dg/backend-stats gpu))))
                                      (throw (js/Error. "GPU benchmark output differs from CPU oracle"))))))))))))
         (.catch (fn [error]
                   (println "ERROR:" (or (.-stack error) error))

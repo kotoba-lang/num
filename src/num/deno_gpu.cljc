@@ -65,12 +65,37 @@
          :uniform uniform-usage
          (:storage :read) storage-usage))
 
-     (deftype DenoGpuDevice [dev]
+     (defn- record-allocation! [stats buffer]
+       (let [bytes (.-size buffer)]
+         (swap! stats
+                (fn [state]
+                  (let [live-buffers (inc (:live-buffers state))
+                        live-bytes (+ (:live-bytes state) bytes)]
+                    (-> state
+                        (assoc :live-buffers live-buffers :live-bytes live-bytes)
+                        (update :created-buffers inc)
+                        (update :created-bytes + bytes)
+                        (update :peak-live-buffers max live-buffers)
+                        (update :peak-live-bytes max live-bytes))))))
+       buffer)
+
+     (defn- record-destroy! [stats buffer]
+       (let [bytes (.-size buffer)]
+         (swap! stats #(-> %
+                           (update :live-buffers dec)
+                           (update :live-bytes - bytes)
+                           (update :destroyed-buffers inc)
+                           (update :destroyed-bytes + bytes))))
+       (.destroy buffer))
+
+     (deftype DenoGpuDevice [dev stats]
        w/IGpuDevice
        (-create-buffer [_ n usage]
          (let [nbytes (* 4 (long n))
                floor (if (= usage :uniform) 16 4)]
-           (.createBuffer dev #js {:size (max nbytes floor) :usage (usage->flags usage)})))
+           (record-allocation!
+            stats (.createBuffer dev #js {:size (max nbytes floor)
+                                          :usage (usage->flags usage)}))))
 
        (-write-buffer [_ buf xs]
          ;; Dtype comes from `num.wgsl-backend/u32-tag` metadata, NOT from
@@ -101,6 +126,7 @@
                (.then (fn [_]
                         (let [out (vec (js/Array.from (js/Float32Array. (.slice (.getMappedRange staging) 0))))]
                           (.unmap staging)
+                          (.destroy staging)
                           out))))))
 
        (-compile [_ wgsl-src entry]
@@ -122,19 +148,27 @@
            (.setBindGroup pass 0 bind-group)
            (.dispatchWorkgroups pass wx wy wz)
            (.end pass)
-           (.submit (.-queue dev) #js [(.finish encoder)])))
+           (.submit (.-queue dev) #js [(.finish encoder)])
+           ;; Every uniform in this backend is a one-dispatch parameter buffer
+           ;; created by `wb/uni`. WebGPU guarantees already-submitted work may
+           ;; finish after destroy, so retire it immediately instead of leaking
+           ;; thousands of tiny GPUBuffer objects across diffusion steps.
+           (doseq [buffer buffers]
+             (when (not (zero? (bit-and (.-usage buffer) js/GPUBufferUsage.UNIFORM)))
+               (record-destroy! stats buffer)))))
 
        w/IGpuDeviceLifecycle
        (-destroy-buffer [_ buffer]
-         (.destroy buffer))
+         (record-destroy! stats buffer))
 
        w/IGpuDeviceDType
        (-create-buffer-dtype [_ n usage dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "WebGPU typed storage currently supports f16 only"
                            {:dtype dtype*})))
-         (.createBuffer dev #js {:size (max (* 4 (quot (+ (long n) 1) 2)) 4)
-                                 :usage (usage->flags usage)}))
+         (record-allocation!
+          stats (.createBuffer dev #js {:size (max (* 4 (quot (+ (long n) 1) 2)) 4)
+                                        :usage (usage->flags usage)})))
        (-write-buffer-dtype [_ buf xs dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
@@ -155,6 +189,7 @@
                               out (mapv dtype/f16-bits->f32
                                         (take n (js/Array.from raw)))]
                           (.unmap staging)
+                          (.destroy staging)
                           out)))))))
 
      ;; --- device negotiation (the ONLY inherently-async step) ------------------
@@ -227,9 +262,15 @@
            (w/-dispatch dev (wb/get-pipeline dev pipes :reduce)
                         [xh parts (wb/uni dev (wb/u32-tag [({:sum 0 :max 1 :min 2} op)]))] [nwg 1 1])
            (.then (w/-read-buffer dev parts nwg)                 ; => Promise<number>
-                  (fn [xs] (reduce (case op :sum + :max max :min min) xs)))))
+                  (fn [xs]
+                    (w/-destroy-buffer dev parts)
+                    (reduce (case op :sum + :max max :min min) xs)))))
 
-       (-dot [this xh yh n] (p/-reduce this :sum (p/-ewise this :mul xh yh n) n)) ; => Promise<number>, automatically
+       (-dot [this xh yh n]
+         (let [product (p/-ewise this :mul xh yh n)
+               result (p/-reduce this :sum product n)]
+           (w/-destroy-buffer dev product)
+           result))
        (-nrm2 [this xh n] (.then (p/-dot this xh xh n) (fn [d] (Math/sqrt d))))   ; => Promise<number>
 
        (-gemv [this alpha Ah m n xh beta yh]
@@ -254,6 +295,7 @@
            (w/-write-buffer dev ci (wb/u32-tag (seq (:col-idx csr))))
            (w/-write-buffer dev v (seq (:vals csr)))
            (w/-dispatch dev (wb/get-pipeline dev pipes :spmv) [rp ci v xh y] [(wb/ceil-div m 64) 1 1])
+           (doseq [temporary [rp ci v]] (w/-destroy-buffer dev temporary))
            y))
 
        p/IQuantizedOps
@@ -370,6 +412,7 @@
                         [input-h weight-h bias output
                          (wb/uni dev (wb/u32-tag (into (vec values) [0 0 0])))]
                         [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           (when-not bias-h (w/-destroy-buffer dev bias))
            output))
        (-group-norm-nchw-dtype [_ input-h weight-h bias-h
                                 {:keys [n c h width groups channels-group
@@ -390,6 +433,8 @@
                                        group-size (* h width)]))
                          (wb/uni dev [(double eps)])]
                         [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           (when-not weight-h (w/-destroy-buffer dev weight))
+           (when-not bias-h (w/-destroy-buffer dev bias))
            output))
        (-embedding-dtype [_ indices-h weight-h {:keys [tokens rows dim]} dtype*]
          (when-not (= dtype* :f16)
@@ -444,6 +489,7 @@
                    dev pipes (if oc4? :conv2d-nchw-oc4 :conv2d-nchw))
               [input-h weight-h bias output (wb/uni dev (wb/u32-tag params))]
               [(wb/ceil-div invocations 64) 1 1]))
+           (when-not bias-h (w/-destroy-buffer dev bias))
            output))
        (-group-norm-nchw [_ input-h weight-h bias-h
                           {:keys [n c h width groups channels-group group-size eps]
@@ -463,6 +509,8 @@
                         [input-h weight bias output (wb/uni dev (wb/u32-tag dims))
                          (wb/uni dev [(double eps)])]
                         [(* n groups) 1 1])
+           (when-not weight-h (w/-destroy-buffer dev weight))
+           (when-not bias-h (w/-destroy-buffer dev bias))
            output))
        (-embedding [_ indices-h weight-h {:keys [tokens rows dim]}]
          (let [total (* tokens dim)
@@ -648,6 +696,7 @@
                                        (if causal? 1 0)
                                        (if has-key-padding-mask? 1 0) 0]))]
                         [(wb/ceil-div total 64) 1 1])
+           (when-not key-padding-mask-h (w/-destroy-buffer dev mask))
            output))
        (-multi-head-attention-backward [_ query-h key-h value-h key-padding-mask-h
                                         grad-output-h
@@ -670,6 +719,7 @@
                                        (if causal? 1 0)
                                        (if has-key-padding-mask? 1 0) 0 0 0]))]
                         [(wb/ceil-div total 64) 1 1])
+           (when-not key-padding-mask-h (w/-destroy-buffer dev mask))
            {:query grad-query :key grad-key :value grad-value})))
 
      (defn backend
@@ -678,7 +728,21 @@
        Deno hosts. Pipelines compile lazily on first use, exactly like
        num.wgsl-backend/wgsl-backend."
        [r]
-       (->WgslBackendAsync (->DenoGpuDevice (.-device r)) (atom {})))
+       (->WgslBackendAsync
+        (->DenoGpuDevice
+         (.-device r)
+         (atom {:live-buffers 0 :live-bytes 0
+                :peak-live-buffers 0 :peak-live-bytes 0
+                :created-buffers 0 :created-bytes 0
+                :destroyed-buffers 0 :destroyed-bytes 0}))
+        (atom {})))
+
+     (defn backend-stats
+       "Snapshot tracked storage/uniform GPUBuffer lifetime counters. Readback
+       staging buffers are intentionally excluded because they are scoped to a
+       Promise and destroyed immediately after unmap."
+       [backend]
+       @(.-stats (.-dev backend)))
 
      (defn gpu-backend
        "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.

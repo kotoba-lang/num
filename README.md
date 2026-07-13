@@ -375,18 +375,26 @@ full `NCHW conv(pad=1) → GroupNorm(8) → SiLU` chain:
 
 | path | elapsed |
 |---|---:|
-| ClojureScript CPU oracle | 980.92 ms |
-| Metal cold (pipeline compile included) | 39.57 ms |
-| Metal warm | 25.66 ms |
+| ClojureScript CPU oracle | 1019.63 ms |
+| Metal cold (pipeline compile included) | 35.04 ms |
+| Metal warm | 31.80 ms |
 
-Warm speedup is **38.23×**, with maximum absolute error `2.38e-6` against the
+Warm speedup is **32.06×**, with maximum absolute error `2.38e-6` against the
 CPU oracle. The full-width mode separately measures a real latent-resolution
 `[1,320,64,64] × [320,320,3,3]` convolution. The four-output-channel kernel
-reduced it from 184.51 ms to 107.95 ms warm (41.5% lower), with its interior
+now measures 109.01 ms warm, with its interior
 constant-input result within `4.51e-7` of the analytic value. Packed physical
-f16 currently takes 714.76 ms on the same case: Deno's Naga rejects native WGSL
+f16 currently takes 621.65 ms on the same case: Deno's Naga rejects native WGSL
 `enable f16` despite the adapter advertising `shader-f16`, so f16 remains a
 correctness/storage path rather than a performance claim.
+The benchmark also checks explicit GPUBuffer lifetime. After two warm/cold
+executions the 32→64 chain returns to its five persistent input/weight buffers
+(`598,784` bytes) from a `2,695,984`-byte peak; the 320-channel case returns to
+three persistent buffers (`8,930,560` bytes) from a `14,173,520`-byte peak.
+Per-dispatch uniform buffers, implicit no-bias/no-mask buffers, and readback
+staging buffers are destroyed after submission/use rather than accumulating
+across diffusion steps. The live verifier repeats 100 temporary dispatches and
+asserts both live buffer count and bytes return exactly to their baseline.
 These are concrete completed-work measurements, not a claim of PyTorch/MPS-wide
 parity: end-to-end model memory pressure, mixed precision, fusion, and complete
 UNet throughput still require separate benchmarks.
@@ -394,7 +402,7 @@ UNet throughput still require separate benchmarks.
 This cross-checks the live GPU backend against `num.cpu`'s reference oracle (dispatched
 through `num.core`/`num.array`, i.e. through `IBackend`, the same seam any real caller
 uses) — **verified passing on real Apple M4 Metal hardware while building this**:
-`Deno WgslBackendAsync ≡ CPU oracle: 47 passed, 0 failed` (BLAS, reductions,
+`Deno WgslBackendAsync ≡ CPU oracle: 48 passed, 0 failed` (BLAS, reductions,
 sparse matvec, unary exp/relu/neg/SiLU/sigmoid/tanh/GELU and activation derivatives,
 full NCHW/depthwise convolution, and
 affine/non-affine GroupNorm, upsampling, skip concatenation, bias broadcasting,
