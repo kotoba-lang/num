@@ -489,3 +489,15 @@
                                          (arr/from-vec backend (range 4) [1 4])
                                          (arr/from-vec backend (range 4) [1 4])
                                          3)))))
+
+(deftest immutable-sgd-step
+  (let [parameter (arr/from-vec backend [1.0 -2.0 3.0 -4.0] [2 2])
+        gradient (arr/from-vec backend [0.5 -1.0 2.0 4.0] [2 2])
+        updated (t/sgd-step parameter gradient 0.1)]
+    (is (contract/approx-vec? [0.95 -1.9 2.8 -4.4] (arr/->vec updated)))
+    (is (= [1.0 -2.0 3.0 -4.0] (arr/->vec parameter))
+        "the original parameter remains immutable")
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/sgd-step parameter gradient 0.0)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/sgd-step parameter (arr/from-vec backend [1.0] [1]) 0.1)))))

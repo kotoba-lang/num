@@ -197,6 +197,14 @@
                     (uni dev (u32-tag [count]))]
                    [(ceil-div count 64) 1 1])
       gradient))
+  (-sgd-step [_ parameter-h gradient-h {:keys [count learning-rate]}]
+    (let [output (w/-create-buffer dev count :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :sgd-step)
+                   [parameter-h gradient-h output
+                    (uni dev [(double learning-rate)])
+                    (uni dev (u32-tag [count]))]
+                   [(ceil-div count 64) 1 1])
+      output))
   (-multi-head-attention [_ query-h key-h value-h
                           {:keys [seq-q seq-k d-model heads head-dim total]}]
     (let [output (w/-create-buffer dev total :storage)]

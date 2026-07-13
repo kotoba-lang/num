@@ -8,7 +8,8 @@
   (:require [num.array :as arr]
             [num.autograd :as ag :include-macros true]
             [num.cpu :as cpu]
-            [num.deno-gpu :as dg]))
+            [num.deno-gpu :as dg]
+            [num.tensor :as t]))
 
 (def query-values
   [0.2 -0.1 0.3 0.4
@@ -86,8 +87,13 @@
            (into {}
                  (map (fn [[param-name parameter]]
                         [(keyword (str "projected-" (name param-name)))
-                         @(:grad parameter)])
-                      (:params graph))))))
+                         @(:grad parameter)]))
+                 (:params graph))
+           (into {}
+                 (map (fn [[param-name parameter]]
+                        [(keyword (str "updated-" (name param-name)))
+                         (t/sgd-step (:data parameter) @(:grad parameter) 0.05)]))
+                 (:params graph)))))
 
 (defn- close? [actual expected]
   (and (= (count actual) (count expected))

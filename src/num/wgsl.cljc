@@ -801,6 +801,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   parameter[i] = parameter[i] - p.learning_rate * gradient[i];
 }")
 
+(def sgd-step-wgsl
+  "Out-of-place parameter - learning_rate * gradient update."
+  "
+@group(0) @binding(0) var<storage, read> parameter: array<f32>;
+@group(0) @binding(1) var<storage, read> gradient: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> learning_rate: f32;
+@group(0) @binding(4) var<uniform> count: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= count) { return; }
+  output[i] = parameter[i] - learning_rate * gradient[i];
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."
@@ -1161,6 +1175,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :bias-gradient bias-gradient-wgsl
    :mse-loss mse-loss-wgsl
    :mse-gradient mse-gradient-wgsl
+   :sgd-step sgd-step-wgsl
    :multi-head-attention multi-head-attention-wgsl
    :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl

@@ -192,6 +192,34 @@
 (defn mul "Broadcasting elementwise x * y (Hadamard, not matmul)." [x y] (ewise-bc :mul x y))
 (defn div "Broadcasting elementwise x / y." [x y] (ewise-bc :div x y))
 
+(defn sgd-step
+  "Immutable SGD update `parameter - learning-rate * gradient`.
+
+  f32 tensors on an `ITensorBackend` are updated into a newly allocated device
+  buffer; the input parameter and gradient remain unchanged. Other backends use
+  the portable host oracle with identical semantics."
+  [parameter gradient learning-rate]
+  (when-not (= (:shape parameter) (:shape gradient))
+    (throw (ex-info "num.tensor/sgd-step: gradient shape must match parameter"
+                    {:parameter (:shape parameter) :gradient (:shape gradient)})))
+  (when-not (and (number? learning-rate) (pos? learning-rate))
+    (throw (ex-info "num.tensor/sgd-step: learning-rate must be positive"
+                    {:learning-rate learning-rate})))
+  (let [backend (:backend parameter)
+        count (arr/nelems (:shape parameter))]
+    (if (and (= backend (:backend gradient))
+             (= :f32 (array-dtype parameter) (array-dtype gradient))
+             (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray
+              backend
+              (p/-sgd-step backend (:handle parameter) (:handle gradient)
+                           {:count count :learning-rate learning-rate})
+              (:shape parameter)) :dtype :f32)
+      (arr/from-vec backend
+                    (mapv #(- %1 (* learning-rate %2))
+                          (arr/->vec parameter) (arr/->vec gradient))
+                    (:shape parameter) (array-dtype parameter)))))
+
 ;; --- reshape / transpose / squeeze / unsqueeze --------------------------------
 
 (defn reshape

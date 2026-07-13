@@ -200,9 +200,10 @@ forward plus all three gradients against the independently decomposed CPU autogr
 graph on real Apple M4 Metal. A second graph adds learned Q/K/V/output matrices and
 all four biases, exercising device-native GEMM, 2-D transpose, row reduction, fused
 attention backward, shared-input gradient accumulation, and a device-resident MSE
-loss reduction/VJP. Together, loss, output, and all gradients pass 15/15 checks
-without intermediate host readback. Only the final loss/verification values are
-downloaded.
+loss reduction/VJP. Immutable SGD updates allocate new GPU buffers while leaving
+the source parameters unchanged. Together, loss, output, all gradients, and all
+eight updated projection tensors pass 23/23 checks without intermediate host
+readback. Only final verification values are downloaded.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
