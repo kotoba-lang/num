@@ -28,15 +28,17 @@
 
 (defn- reply [value] (.write (.-stdout js/process) (str (js/JSON.stringify (clj->js value)) "\n")))
 
-(defn- upload! [device pipeline command]
+(defn- upload! [device pipeline bytes-per-block command]
   (let [id (aget command "id") rows (aget command "rows") cols (aget command "cols")
         blocks (/ cols 32) source (decode-base64 (aget command "data"))
-        qbytes (js/Uint8Array. (* rows blocks 32)) scales (js/Float32Array. (* rows blocks))]
+        qbytes (js/Uint8Array. (* rows blocks bytes-per-block))
+        scales (js/Float32Array. (* rows blocks))]
     (dotimes [block (* rows blocks)]
-      (let [src (* block 34) bits (bit-or (aget source src)
+      (let [src (* block (+ bytes-per-block 2)) bits (bit-or (aget source src)
                                           (bit-shift-left (aget source (inc src)) 8))]
         (aset scales block (half bits))
-        (.set qbytes (.subarray source (+ src 2) (+ src 34)) (* block 32))))
+        (.set qbytes (.subarray source (+ src 2) (+ src 2 bytes-per-block))
+              (* block bytes-per-block))))
     (let [storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
           qbuf (gpu-buffer device (js/Uint32Array. (.-buffer qbytes)) storage)
           sbuf (gpu-buffer device scales storage)
@@ -132,17 +134,21 @@
     (reply {:ok true :id id})))
 
 (defn- serve! [device]
-  (let [module (.createShaderModule device #js {:code wgsl/q8-0-gemv-wgsl})
-        pipeline (.createComputePipeline device
-                                         #js {:layout "auto"
-                                              :compute #js {:module module :entryPoint "main"}})
+  (let [pipeline (fn [source]
+                   (let [module (.createShaderModule device #js {:code source})]
+                     (.createComputePipeline device
+                                             #js {:layout "auto"
+                                                  :compute #js {:module module :entryPoint "main"}})))
+        q8-pipeline (pipeline wgsl/q8-0-gemv-wgsl)
+        q4-pipeline (pipeline wgsl/q4-0-gemv-wgsl)
         lines (.createInterface readline #js {:input (.-stdin js/process)})]
     (.on lines "line"
          (fn [line]
            (try
              (let [command (js/JSON.parse line) op (aget command "op")]
                (case op
-                 "upload-q8" (upload! device pipeline command)
+                 "upload-q8" (upload! device q8-pipeline 32 command)
+                 "upload-q4" (upload! device q4-pipeline 16 command)
                  "gemv" (.catch (gemv! device command)
                                  #(reply {:ok false :error (.-message %)}))
                  "gemv-many" (.catch (gemv-many! device command)

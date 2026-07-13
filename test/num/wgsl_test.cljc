@@ -31,3 +31,8 @@
   (is (string? w/q8-0-gemv-wgsl))
   (is (re-find #"signed_byte" w/q8-0-gemv-wgsl))
   (is (re-find #"scale \* signed_byte" w/q8-0-gemv-wgsl)))
+
+(deftest q4-gemv-shader-decodes-low-and-high-nibbles
+  (is (string? w/q4-0-gemv-wgsl))
+  (is (re-find #"packed & 15u" w/q4-0-gemv-wgsl))
+  (is (re-find #"packed >> 4u" w/q4-0-gemv-wgsl)))

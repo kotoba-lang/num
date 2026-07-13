@@ -262,6 +262,39 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   y[row] = sum;
 }")
 
+(def q4-0-gemv-wgsl
+  "GGML Q4_0 GEMV without dense dequantization. Each 32-value block stores
+  sixteen bytes; low nibbles are columns 0..15 and high nibbles 16..31."
+  "
+@group(0) @binding(0) var<storage, read>       q: array<u32>;
+@group(0) @binding(1) var<storage, read>       scales: array<f32>;
+@group(0) @binding(2) var<storage, read>       x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform>             d: vec3<u32>; // rows, cols, blocks/row
+
+fn packed_byte(byte_index: u32) -> u32 {
+  let word = q[byte_index / 4u];
+  return (word >> ((byte_index % 4u) * 8u)) & 255u;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= d.x) { return; }
+  var sum: f32 = 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let scale = scales[row * d.z + block];
+    let qbase = (row * d.z + block) * 16u;
+    let xbase = block * 32u;
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+      let packed = packed_byte(qbase + i);
+      sum = sum + scale * (f32(packed & 15u) - 8.0) * x[xbase + i];
+      sum = sum + scale * (f32(packed >> 4u) - 8.0) * x[xbase + i + 16u];
+    }
+  }
+  y[row] = sum;
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."
