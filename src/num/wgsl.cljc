@@ -162,6 +162,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   z[i] = r;
 }")
 
+(def ewise1-wgsl
+  "UNARY elementwise z = op(x); op ∈ {0:exp 1:relu 2:neg} via a uniform. Same
+  shape as ewise-wgsl, one input instead of two — the primitive softmax/attention
+  need that the level-1/level-2/level-3 BLAS set doesn't provide."
+  "
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> z: array<f32>;
+@group(0) @binding(2) var<uniform>             op: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= arrayLength(&z)) { return; }
+  let a = x[i]; var r: f32 = 0.0;
+  switch op { case 0u { r = exp(a); } case 1u { r = max(a, 0.0); }
+              case 2u { r = -a; } default { r = 0.0; } }
+  z[i] = r;
+}")
+
 (def reduce-wgsl
   "Tree reduction with op ∈ {0:sum 1:max 2:min} via a uniform; each 256-wide
   workgroup writes its partial to `partials[wid]`, the host combines partials with
@@ -212,6 +230,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   {:axpy   axpy-wgsl
    :scal   scal-wgsl
    :ewise  ewise-wgsl
+   :ewise1 ewise1-wgsl
    :reduce reduce-wgsl
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl

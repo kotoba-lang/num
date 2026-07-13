@@ -42,6 +42,12 @@
       (dotimes [i n] (aset z i (double (f (aget x i) (aget y i)))))
       z))
 
+  (-ewise1 [_ op xh n]
+    (let [^doubles x xh n (long n) z (double-array n)
+          f (case op :exp #(Math/exp %) :relu #(max % 0.0) :neg -)]
+      (dotimes [i n] (aset z i (double (f (aget x i)))))
+      z))
+
   (-reduce [_ op xh n]
     (let [^doubles x xh n (long n)]
       (case op

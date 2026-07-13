@@ -46,6 +46,13 @@
 (defn mul [x y] (ewise :mul x y))         ; Hadamard (elementwise) product
 (defn div [x y] (ewise :div x y))
 
+(defn- ewise1 [op x]
+  (arr/->NDArray (be x) (p/-ewise1 (be x) op (:handle x) (n1 x)) (:shape x)))
+
+(defn exp [x] (ewise1 :exp x))
+(defn relu [x] (ewise1 :relu x))
+(defn neg [x] (ewise1 :neg x))
+
 (defn sum [x] (p/-reduce (be x) :sum (:handle x) (n1 x)))
 (defn amax [x] (p/-reduce (be x) :max (:handle x) (n1 x)))
 (defn amin [x] (p/-reduce (be x) :min (:handle x) (n1 x)))

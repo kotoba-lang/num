@@ -34,8 +34,25 @@
   contiguous layout, inserting/removing a size-1 axis or relabeling the shape
   without touching axis ORDER never moves data, so those three are pure
   metadata edits (`assoc :shape`) — zero-copy, zero host round-trip, on any
-  backend."
+  backend.
+
+  KNOWN GAP (found live 2026-07-13, ADR-2607131500 Phase 1): every op here
+  that DOES round-trip assumes `num.array/->vec` returns an immediate value —
+  true for `num.cpu`'s CpuBackend and `num.wgsl-backend`'s synchronous
+  WgslBackend, but NOT true for `num.deno-gpu`'s WgslBackendAsync, whose
+  `-copy-to-host` returns a JS Promise (WebGPU readback is inherently async —
+  see that namespace's docstring). Calling any op below (including the
+  `softmax`/`conv2d`/`attention` this phase adds) against a Deno GPU backend
+  throws (`[object Promise] is not ISeqable`), confirmed by direct test.
+  So: every op in this namespace is verified real on the CPU oracle backend
+  (below and `test/num/tensor_test.cljc`); NONE of them are yet verified
+  live on Metal the way the raw IBackend ops are (`num.deno-gpu-verify`,
+  17/17 on real Apple M4). Making this namespace async-aware (Promise-
+  chaining through every op) or building the JVM-blocking wgpu-native device
+  ADR-2607051400 §Phase 2 already flagged as \"Remaining\" would both close
+  this gap; neither is attempted in this pass."
   (:require [num.array :as arr]
+            [num.core :as nm]
             [num.protocol :as p]))
 
 ;; --- shape / stride helpers ---------------------------------------------------
@@ -303,3 +320,66 @@
                             s))]
                   (aset out (+ c-off (* i n) j) s))))))
         (arr/from-vec (:backend A) (vec out) (into batch-shape [m n]))))))
+
+;; --- softmax (ADR-2607131500 Phase 1) ------------------------------------------
+;; Everything below reuses ONLY the primitives already real above (amax/sub/sum/
+;; div, all real ops going through IBackend, not new host-only shortcuts) plus
+;; num.core's exp (the one genuinely-new device primitive this phase adds — see
+;; num.protocol/-ewise1, verified on real Metal via num.deno-gpu-verify).
+
+(defn softmax
+  "Numerically-stable softmax along `axis` (default: last axis) — subtract the
+  per-axis max before exponentiating so large inputs don't overflow, matching
+  PyTorch's `nn.functional.softmax` semantics. `exp(x - max) / sum(exp(x - max))`."
+  ([a] (softmax a (dec (count (:shape a)))))
+  ([a axis]
+   (let [mx (amax a axis {:keepdims? true})
+         shifted (sub a mx)
+         ex (nm/exp shifted)
+         s (sum ex axis {:keepdims? true})]
+     (div ex s))))
+
+;; --- conv2d (ADR-2607131500 Phase 1) --------------------------------------------
+
+(defn conv2d
+  "2-D 'valid' convolution (no padding, stride 1), SINGLE channel, SINGLE
+  image: `a` is `[H W]`, `kernel` is `[kh kw]` → NDArray `[H-kh+1, W-kw+1]`.
+
+  im2col + matmul: patch extraction (below) is the one genuinely new op this
+  adds, and it is a host round-trip like every other op in this namespace —
+  the actual multiply-accumulate FLOPs run through `matmul` (already verified
+  real on Metal). Multi-channel / batched / padded / strided conv is real conv
+  but a materially bigger op — deliberately NOT attempted here; see
+  ADR-2607131500 for the explicit Phase 1 scope fence."
+  [a kernel]
+  (let [[H W] (:shape a) [kh kw] (:shape kernel)
+        oh (inc (- (long H) (long kh))) ow (inc (- (long W) (long kw)))]
+    (when (or (< oh 1) (< ow 1))
+      (throw (ex-info "num.tensor/conv2d: kernel larger than input"
+                       {:input [H W] :kernel [kh kw]})))
+    (let [xs (double-array (arr/->vec a))
+          W (long W) kh (long kh) kw (long kw)
+          patches (double-array (* oh ow kh kw))]
+      (dotimes [oi oh]
+        (dotimes [oj ow]
+          (dotimes [ki kh]
+            (dotimes [kj kw]
+              (aset patches (+ (* (+ (* oi ow) oj) kh kw) (* ki kw) kj)
+                    (aget xs (+ (* (+ oi ki) W) (+ oj kj))))))))
+      (let [P (arr/from-vec (:backend a) (vec patches) [(* oh ow) (* kh kw)])
+            kflat (reshape kernel [(* kh kw) 1])]
+        (reshape (matmul P kflat) [oh ow])))))
+
+;; --- attention (ADR-2607131500 Phase 1) -----------------------------------------
+
+(defn attention
+  "Single-head scaled dot-product attention: `softmax(QK^T / √d) · V`. `Q` is
+  `[seqQ d]`, `K`/`V` are `[seqK d]` (cross-attention: seqQ may differ from
+  seqK). No batching, no multi-head split, no causal/padding mask — the
+  honest minimal form; see ADR-2607131500 for what's deliberately deferred."
+  [Q K V]
+  (let [d (long (last (:shape Q)))
+        scores (matmul Q (transpose K))
+        scaled (nm/scal! (/ 1.0 (Math/sqrt d)) scores)
+        weights (softmax scaled)]
+    (matmul weights V)))
