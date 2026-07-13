@@ -157,7 +157,7 @@
             out (double-array n)]
         (dotimes [oi n]
           (aset out oi (aget xs (ravel (unravel oi target-shape out-strides) eff-strides))))
-        (arr/from-vec (:backend a) (vec out) target-shape)))))
+        (arr/from-vec (:backend a) (vec out) target-shape (array-dtype a))))))
 
 (defn- ewise-bc
   "Broadcasting elementwise dispatch: broadcast both operands to their common
@@ -168,8 +168,8 @@
   (let [shape (broadcast-shapes (:shape x) (:shape y))
         x' (broadcast-to x shape)
         y' (broadcast-to y shape)
-        b (:backend x')]
-    (arr/->NDArray b (p/-ewise b op (:handle x') (:handle y') (arr/nelems shape)) shape)))
+        _ (require-same-dtype! "num.tensor elementwise" [x' y'])]
+    ((case op :add nm/add :sub nm/sub :mul nm/mul :div nm/div) x' y')))
 
 (defn add "Broadcasting x + y." [x y] (ewise-bc :add x y))
 (defn sub "Broadcasting x - y." [x y] (ewise-bc :sub x y))

@@ -131,7 +131,9 @@
   [pred target]
   (let [diff (t/sub (:data pred) target)
         n (double (arr/nelems (:shape diff)))
-        loss-val (/ (nm/sum (nm/mul diff diff)) n)]
+        loss-val (if (= :f32 (or (:dtype diff) :f32))
+                   (/ (nm/sum (nm/mul diff diff)) n)
+                   (/ (reduce + (map #(* % %) (arr/->vec diff))) n))]
     (node (arr/from-vec (:backend (:data pred)) [loss-val] [])
           [pred]
           (fn [self]
