@@ -6,6 +6,7 @@
 (def map-mode (.-GPUMapMode js/globalThis))
 (def readline (js/require "node:readline"))
 (def registry (atom {}))
+(def metrics (atom {:gemv 0 :gemv-many 0 :submissions 0}))
 
 (defn- gpu-buffer [device typed-array flags]
   (let [buffer (.createBuffer device #js {:size (max 4 (.-byteLength typed-array))
@@ -69,12 +70,59 @@
       (.setPipeline pass (.-pipeline entry)) (.setBindGroup pass 0 bind)
       (.dispatchWorkgroups pass (Math/ceil (/ rows 64))) (.end pass)
       (.copyBufferToBuffer encoder ybuf 0 read 0 (* rows 4))
+      (swap! metrics #(-> % (update :gemv inc) (update :submissions inc)))
       (.submit (.-queue device) #js [(.finish encoder)])
       (-> (.mapAsync read (.-READ map-mode))
           (.then (fn []
                    (let [output (vec (js/Float32Array. (.getMappedRange read)))]
                      (reply {:ok true :id id :y output})
                      (.destroy xbuf) (.destroy ybuf) (.destroy read))))))))
+
+(defn- encode-gemv! [device encoder request]
+  (let [id (aget request "id") entry (get @registry id)]
+    (when-not entry (throw (js/Error. (str "unknown Q8 handle: " id))))
+    (let [rows (.-rows entry) cols (.-cols entry)
+          values (js/Float32Array. (aget request "x"))
+          _ (when-not (= cols (.-length values))
+              (throw (js/Error. "GEMV input length mismatch")))
+          storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
+          xbuf (gpu-buffer device values storage)
+          ybuf (.createBuffer device #js {:size (* rows 4)
+                                           :usage (bit-or (.-STORAGE usage) (.-COPY_SRC usage))})
+          read (.createBuffer device #js {:size (* rows 4)
+                                           :usage (bit-or (.-COPY_DST usage) (.-MAP_READ usage))})
+          bind (.createBindGroup device
+                                 #js {:layout (.getBindGroupLayout (.-pipeline entry) 0)
+                                      :entries #js [#js {:binding 0 :resource #js {:buffer (.-q entry)}}
+                                                    #js {:binding 1 :resource #js {:buffer (.-scales entry)}}
+                                                    #js {:binding 2 :resource #js {:buffer xbuf}}
+                                                    #js {:binding 3 :resource #js {:buffer ybuf}}
+                                                    #js {:binding 4 :resource #js {:buffer (.-params entry)}}]})
+          pass (.beginComputePass encoder)]
+      (.setPipeline pass (.-pipeline entry)) (.setBindGroup pass 0 bind)
+      (.dispatchWorkgroups pass (Math/ceil (/ rows 64))) (.end pass)
+      (.copyBufferToBuffer encoder ybuf 0 read 0 (* rows 4))
+      #js {:id id :x xbuf :y ybuf :read read})))
+
+(defn- gemv-many! [device command]
+  (let [encoder (.createCommandEncoder device)
+        jobs (mapv #(encode-gemv! device encoder %)
+                   (array-seq (aget command "requests")))]
+    (swap! metrics #(-> % (update :gemv-many inc) (update :submissions inc)))
+    (.submit (.-queue device) #js [(.finish encoder)])
+    (-> (js/Promise.all
+         (clj->js
+          (map (fn [job]
+                 (-> (.mapAsync (.-read job) (.-READ map-mode))
+                     (.then (fn []
+                              (let [result {:id (.-id job)
+                                            :y (vec (js/Float32Array.
+                                                     (.getMappedRange (.-read job))))}]
+                                (.destroy (.-x job)) (.destroy (.-y job))
+                                (.destroy (.-read job)) result)))))
+               jobs)))
+        (.then (fn [results]
+                 (reply {:ok true :results (js->clj results :keywordize-keys true)}))))))
 
 (defn- release! [command]
   (let [id (aget command "id") entry (get @registry id)]
@@ -97,8 +145,10 @@
                  "upload-q8" (upload! device pipeline command)
                  "gemv" (.catch (gemv! device command)
                                  #(reply {:ok false :error (.-message %)}))
+                 "gemv-many" (.catch (gemv-many! device command)
+                                      #(reply {:ok false :error (.-message %)}))
                  "release" (release! command)
-                 "stats" (reply {:ok true :handles (count @registry)})
+                 "stats" (reply (merge {:ok true :handles (count @registry)} @metrics))
                  (reply {:ok false :error (str "unknown op: " op)})))
              (catch :default error
                (reply {:ok false :error (.-message error)})))))))
