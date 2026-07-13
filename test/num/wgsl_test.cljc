@@ -47,3 +47,9 @@
   (is (re-find #"- 16.0" w/q5-0-gemv-wgsl))
   (is (re-find #"high_bit" w/q5-1-gemv-wgsl))
   (is (re-find #"dm.y" w/q5-1-gemv-wgsl)))
+
+(deftest k-quant-gemv-shaders-cover-five-and-six-bit-superblocks
+  (is (re-find #"176u" w/q5-k-gemv-wgsl))
+  (is (re-find #"let high" w/q5-k-gemv-wgsl))
+  (is (re-find #"210u" w/q6-k-gemv-wgsl))
+  (is (re-find #"signed_byte" w/q6-k-gemv-wgsl)))

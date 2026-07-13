@@ -410,6 +410,86 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   y[row] = sum;
 }")
 
+(def q5-k-gemv-wgsl
+  "GGML Q5_K GEMV directly over 176-byte superblocks."
+  "
+@group(0) @binding(0) var<storage, read> raw: array<u32>;
+@group(0) @binding(1) var<storage, read> dummy: array<f32>;
+@group(0) @binding(2) var<storage, read> x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform> d: vec3<u32>;
+fn byte_at(i: u32) -> u32 { return (raw[i / 4u] >> ((i % 4u) * 8u)) & 255u; }
+fn gs(b: u32, g: u32) -> u32 {
+  if (g < 4u) { return byte_at(b + 4u + g) & 63u; }
+  return (byte_at(b + 8u + g) & 15u) | (((byte_at(b + g) >> 6u) & 3u) << 4u);
+}
+fn gm(b: u32, g: u32) -> u32 {
+  if (g < 4u) { return byte_at(b + 8u + g) & 63u; }
+  return ((byte_at(b + 8u + g) >> 4u) & 15u) |
+         (((byte_at(b + 4u + g) >> 6u) & 3u) << 4u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x; if (row >= d.x) { return; }
+  var sum: f32 = dummy[0] * 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let b = (row * d.z + block) * 176u;
+    let dm = unpack2x16float(raw[b / 4u]);
+    for (var g: u32 = 0u; g < 8u; g = g + 1u) {
+      for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+        let packed = byte_at(b + 48u + (g / 2u) * 32u + i);
+        let low = select(packed & 15u, packed >> 4u, g % 2u == 1u);
+        let high = ((byte_at(b + 16u + i) >> g) & 1u) << 4u;
+        let q = low | high;
+        sum = sum + (dm.x * f32(gs(b, g)) * f32(q) - dm.y * f32(gm(b, g))) *
+                    x[block * 256u + g * 32u + i];
+      }
+    }
+  }
+  y[row] = sum;
+}")
+
+(def q6-k-gemv-wgsl
+  "GGML Q6_K GEMV directly over signed 6-bit, 210-byte superblocks."
+  "
+@group(0) @binding(0) var<storage, read> raw: array<u32>;
+@group(0) @binding(1) var<storage, read> dummy: array<f32>;
+@group(0) @binding(2) var<storage, read> x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform> d: vec3<u32>;
+fn byte_at(i: u32) -> u32 { return (raw[i / 4u] >> ((i % 4u) * 8u)) & 255u; }
+fn signed_byte(i: u32) -> i32 {
+  let v = byte_at(i); return select(i32(v), i32(v) - 256, v >= 128u);
+}
+fn half_at(i: u32) -> f32 {
+  let p = unpack2x16float(raw[i / 4u]); return select(p.x, p.y, i % 4u == 2u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x; if (row >= d.x) { return; }
+  var sum: f32 = dummy[0] * 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let b = (row * d.z + block) * 210u; let scale = half_at(b + 208u);
+    for (var hb: u32 = 0u; hb < 2u; hb = hb + 1u) {
+      for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+        let la = byte_at(b + hb * 64u + i);
+        let lb = byte_at(b + hb * 64u + 32u + i);
+        let hi = byte_at(b + 128u + hb * 32u + i);
+        let qs = array<i32, 4>(i32((la & 15u) | ((hi & 3u) << 4u)) - 32,
+          i32((lb & 15u) | (((hi >> 2u) & 3u) << 4u)) - 32,
+          i32((la >> 4u) | (((hi >> 4u) & 3u) << 4u)) - 32,
+          i32((lb >> 4u) | (((hi >> 6u) & 3u) << 4u)) - 32);
+        for (var seg: u32 = 0u; seg < 4u; seg = seg + 1u) {
+          let si = hb * 8u + seg * 2u + i / 16u;
+          let weight = scale * f32(signed_byte(b + 192u + si)) * f32(qs[seg]);
+          sum = sum + weight * x[block * 256u + hb * 128u + seg * 32u + i];
+        }
+      }
+    }
+  }
+  y[row] = sum;
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."

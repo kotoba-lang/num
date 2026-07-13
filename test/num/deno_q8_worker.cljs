@@ -160,6 +160,8 @@
         q4k-pipeline (pipeline wgsl/q4-k-gemv-wgsl)
         q5-pipeline (pipeline wgsl/q5-0-gemv-wgsl)
         q5-1-pipeline (pipeline wgsl/q5-1-gemv-wgsl)
+        q5k-pipeline (pipeline wgsl/q5-k-gemv-wgsl)
+        q6k-pipeline (pipeline wgsl/q6-k-gemv-wgsl)
         lines (.createInterface readline #js {:input (.-stdin js/process)})]
     (.on lines "line"
          (fn [line]
@@ -171,6 +173,8 @@
                  "upload-q4k" (upload-raw! device q4k-pipeline 144 256 command)
                  "upload-q5" (upload-raw! device q5-pipeline 22 32 command)
                  "upload-q5-1" (upload-raw! device q5-1-pipeline 24 32 command)
+                 "upload-q5k" (upload-raw! device q5k-pipeline 176 256 command)
+                 "upload-q6k" (upload-raw! device q6k-pipeline 210 256 command)
                  "gemv" (.catch (gemv! device command)
                                  #(reply {:ok false :error (.-message %)}))
                  "gemv-many" (.catch (gemv-many! device command)
