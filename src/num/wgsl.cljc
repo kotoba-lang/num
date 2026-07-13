@@ -34,6 +34,10 @@
     "Run `pipeline` with `buffers` bound at @binding 0.. and `workgroups`
      [x y z] workgroup counts."))
 
+(defprotocol IGpuDeviceLifecycle
+  "Optional explicit lifetime hook for device buffers."
+  (-destroy-buffer [dev buffer]))
+
 (defprotocol IGpuDeviceDType
   "Optional physical typed-buffer operations. `n` is an element count."
   (-create-buffer-dtype [dev n usage dtype])

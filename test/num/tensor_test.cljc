@@ -572,3 +572,14 @@
            (arr/->vec padded)))
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (t/slice-axis input 1 3 5)))))
+
+(deftest explicit-release-deduplicates-aliased-handles
+  (let [array (arr/from-vec backend [1 2 3 4] [2 2])
+        alias (t/reshape array [4])
+        released (atom [])]
+    (with-redefs [arr/release! (fn [value]
+                                (swap! released conj value)
+                                nil)]
+      (is (nil? (arr/release-all! [array alias nil])))
+      (is (= 1 (count @released)))
+      (is (identical? (:handle array) (:handle (first @released)))))))

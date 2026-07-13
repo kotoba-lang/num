@@ -77,3 +77,25 @@
   "An uninitialized NDArray with the same backend/shape as `a`."
   [a]
   (zeros (:backend a) (:shape a) (or (:dtype a) :f32)))
+
+(defn release!
+  "Explicitly release an NDArray's backing storage. Required for predictable
+  GPU memory use in long-running workloads; CPU/GC backends may treat it as a
+  no-op. The NDArray must not be used after this call."
+  [a]
+  (when a
+    (p/-free (:backend a) (:handle a)))
+  nil)
+
+(defn release-all!
+  "Release each distinct backing handle in `arrays` once. This is safe for
+  reshape/transpose aliases that share a handle. All arrays become invalid."
+  [arrays]
+  (loop [remaining (seq arrays) seen #{}]
+    (when-let [a (first remaining)]
+      (let [handle (:handle a)]
+        (if (contains? seen handle)
+          (recur (next remaining) seen)
+          (do (release! a)
+              (recur (next remaining) (conj seen handle)))))))
+  nil)

@@ -124,6 +124,10 @@
            (.end pass)
            (.submit (.-queue dev) #js [(.finish encoder)])))
 
+       w/IGpuDeviceLifecycle
+       (-destroy-buffer [_ buffer]
+         (.destroy buffer))
+
        w/IGpuDeviceDType
        (-create-buffer-dtype [_ n usage dtype*]
          (when-not (= dtype* :f16)
@@ -181,7 +185,9 @@
        p/IBackend
        (-backend-name [_] :wgsl-deno)
        (-alloc [_ n] (w/-create-buffer dev n :storage))
-       (-free [_ _] nil)
+       (-free [_ h]
+         (w/-destroy-buffer dev h)
+         nil)
        (-copy-from-host [_ xs]
          (let [b (w/-create-buffer dev (count xs) :storage)] (w/-write-buffer dev b (map double xs)) b))
        (-copy-to-host [_ h n] (w/-read-buffer dev h n))          ; => Promise<vector> — see ns docstring

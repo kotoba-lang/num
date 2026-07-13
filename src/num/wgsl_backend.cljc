@@ -53,7 +53,10 @@
   p/IBackend
   (-backend-name [_] :wgsl)
   (-alloc [_ n] (w/-create-buffer dev n :storage))
-  (-free [_ _] nil)
+  (-free [_ h]
+    (when (satisfies? w/IGpuDeviceLifecycle dev)
+      (w/-destroy-buffer dev h))
+    nil)
   (-copy-from-host [_ xs]
     ;; Force `double` here exactly like num.cpu's -copy-from-host does: callers
     ;; routinely pass literal integers (e.g. `(arr/from-vec b [1 2 3 4] [4])`

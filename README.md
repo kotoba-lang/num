@@ -186,6 +186,12 @@ padding are verified against the CPU oracle on Apple M4 Metal. None of these
 paths downloads intermediate tensors.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
+
+Long-running graphs can explicitly end tensor lifetimes with
+`num.array/release!`; `release-all!` deduplicates reshape/transpose aliases that
+share one backing handle. Deno/WebGPU maps this to `GPUBuffer.destroy()`, while
+GC-owned CPU storage treats it as a no-op. A released NDArray must never be used
+again; model runtimes remain responsible for liveness/ownership scheduling.
 `silu*` and `group-norm-nchw*` provide the
 corresponding training path; GroupNorm propagates input plus affine weight/bias
 gradients and the composed GroupNorm→SiLU chain is checked against central
