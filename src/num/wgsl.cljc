@@ -295,6 +295,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   y[row] = sum;
 }")
 
+(def q4-k-gemv-wgsl
+  "GGML Q4_K GEMV directly over its 256-value, 144-byte superblocks."
+  "
+@group(0) @binding(0) var<storage, read>       raw: array<u32>;
+@group(0) @binding(1) var<storage, read>       dummy: array<f32>;
+@group(0) @binding(2) var<storage, read>       x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform>             d: vec3<u32>; // rows, cols, blocks/row
+
+fn byte_at(index: u32) -> u32 {
+  return (raw[index / 4u] >> ((index % 4u) * 8u)) & 255u;
+}
+fn group_scale(base: u32, group: u32) -> u32 {
+  if (group < 4u) { return byte_at(base + 4u + group) & 63u; }
+  return (byte_at(base + 8u + group) & 15u) |
+         (((byte_at(base + group) >> 6u) & 3u) << 4u);
+}
+fn group_min(base: u32, group: u32) -> u32 {
+  if (group < 4u) { return byte_at(base + 8u + group) & 63u; }
+  return ((byte_at(base + 8u + group) >> 4u) & 15u) |
+         (((byte_at(base + 4u + group) >> 6u) & 3u) << 4u);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= d.x) { return; }
+  var sum: f32 = dummy[0] * 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let base = (row * d.z + block) * 144u;
+    let dm = unpack2x16float(raw[base / 4u]);
+    for (var group: u32 = 0u; group < 8u; group = group + 1u) {
+      let scale = f32(group_scale(base, group));
+      let minimum = f32(group_min(base, group));
+      let qbase = base + 16u + (group / 2u) * 32u;
+      let xbase = block * 256u + group * 32u;
+      for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+        let packed = byte_at(qbase + i);
+        let q = select(packed & 15u, packed >> 4u, group % 2u == 1u);
+        sum = sum + (dm.x * scale * f32(q) - dm.y * minimum) * x[xbase + i];
+      }
+    }
+  }
+  y[row] = sum;
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."

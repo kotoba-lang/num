@@ -48,6 +48,20 @@
                                     :rows rows :cols cols :pipeline pipeline})
       (reply {:ok true :id id :gpu-bytes (+ (.-size qbuf) (.-size sbuf))}))))
 
+(defn- upload-raw! [device pipeline block-size block-elements command]
+  (let [id (aget command "id") rows (aget command "rows") cols (aget command "cols")
+        blocks (/ cols block-elements) source (decode-base64 (aget command "data"))
+        storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
+        qbuf (gpu-buffer device (js/Uint32Array. (.-buffer source)) storage)
+        sbuf (gpu-buffer device (js/Float32Array. #js [0]) storage)
+        params (gpu-buffer device (js/Uint32Array. #js [rows cols blocks 0])
+                           (bit-or (.-UNIFORM usage) (.-COPY_DST usage)))]
+    (when-not (= (.-byteLength source) (* rows blocks block-size))
+      (throw (js/Error. "quantized matrix byte length mismatch")))
+    (swap! registry assoc id #js {:q qbuf :scales sbuf :params params
+                                  :rows rows :cols cols :pipeline pipeline})
+    (reply {:ok true :id id :gpu-bytes (+ (.-size qbuf) (.-size sbuf))})))
+
 (defn- gemv! [device command]
   (let [id (aget command "id") entry (get @registry id)]
     (when-not entry (throw (js/Error. (str "unknown Q8 handle: " id))))
@@ -141,6 +155,7 @@
                                                   :compute #js {:module module :entryPoint "main"}})))
         q8-pipeline (pipeline wgsl/q8-0-gemv-wgsl)
         q4-pipeline (pipeline wgsl/q4-0-gemv-wgsl)
+        q4k-pipeline (pipeline wgsl/q4-k-gemv-wgsl)
         lines (.createInterface readline #js {:input (.-stdin js/process)})]
     (.on lines "line"
          (fn [line]
@@ -149,6 +164,7 @@
                (case op
                  "upload-q8" (upload! device q8-pipeline 32 command)
                  "upload-q4" (upload! device q4-pipeline 16 command)
+                 "upload-q4k" (upload-raw! device q4k-pipeline 144 256 command)
                  "gemv" (.catch (gemv! device command)
                                  #(reply {:ok false :error (.-message %)}))
                  "gemv-many" (.catch (gemv-many! device command)

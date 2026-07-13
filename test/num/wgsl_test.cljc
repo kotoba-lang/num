@@ -36,3 +36,8 @@
   (is (string? w/q4-0-gemv-wgsl))
   (is (re-find #"packed & 15u" w/q4-0-gemv-wgsl))
   (is (re-find #"packed >> 4u" w/q4-0-gemv-wgsl)))
+
+(deftest q4-k-gemv-shader-decodes-superblock-scales-and-minima
+  (is (string? w/q4-k-gemv-wgsl))
+  (is (re-find #"unpack2x16float" w/q4-k-gemv-wgsl))
+  (is (re-find #"group_min" w/q4-k-gemv-wgsl)))
