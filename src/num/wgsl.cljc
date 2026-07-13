@@ -580,16 +580,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 (def multi-head-attention-wgsl
   "Fused rank-2 Q/K/V multi-head attention with stable online softmax passes."
   "
-struct Params { seq_q: u32, seq_k: u32, model: u32, heads: u32,
-                head_dim: u32, total: u32, pad0: u32, pad1: u32 }
+struct Params { batch: u32, seq_q: u32, seq_k: u32, model: u32, heads: u32,
+                head_dim: u32, total: u32, causal: u32, has_mask: u32,
+                pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> key: array<f32>;
 @group(0) @binding(2) var<storage, read> value: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-fn score(row: u32, head: u32, token: u32) -> f32 {
-  let qbase = row * p.model + head * p.head_dim;
-  let kbase = token * p.model + head * p.head_dim;
+@group(0) @binding(3) var<storage, read> key_padding_mask: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> p: Params;
+fn allowed(batch: u32, row: u32, token: u32) -> bool {
+  return !((p.causal != 0u && token > row) ||
+           (p.has_mask != 0u && key_padding_mask[batch * p.seq_k + token] != 0.0));
+}
+fn score(batch: u32, row: u32, head: u32, token: u32) -> f32 {
+  let qbase = (batch * p.seq_q + row) * p.model + head * p.head_dim;
+  let kbase = (batch * p.seq_k + token) * p.model + head * p.head_dim;
   var sum: f32 = 0.0;
   for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
     sum = sum + query[qbase + d] * key[kbase + d];
@@ -599,19 +605,128 @@ fn score(row: u32, head: u32, token: u32) -> f32 {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x; if (i >= p.total) { return; }
-  let row = i / p.model; let component = i % p.model;
+  let flat_row = i / p.model; let batch = flat_row / p.seq_q;
+  let row = flat_row % p.seq_q; let component = i % p.model;
   let head = component / p.head_dim;
   var maximum: f32 = -3.402823e38;
   for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
-    maximum = max(maximum, score(row, head, token));
+    if (allowed(batch, row, token)) {
+      maximum = max(maximum, score(batch, row, head, token));
+    }
   }
   var denominator: f32 = 0.0; var result: f32 = 0.0;
   for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
-    let weight = exp(score(row, head, token) - maximum);
-    denominator = denominator + weight;
-    result = result + weight * value[token * p.model + component];
+    if (allowed(batch, row, token)) {
+      let weight = exp(score(batch, row, head, token) - maximum);
+      denominator = denominator + weight;
+      result = result + weight * value[(batch * p.seq_k + token) * p.model + component];
+    }
   }
-  output[i] = result / denominator;
+  output[i] = select(0.0, result / denominator, denominator > 0.0);
+}")
+
+(def multi-head-attention-backward-wgsl
+  "Recompute stable softmax and produce Q/K/V gradients without host tensors."
+  "
+struct Params { batch: u32, seq_q: u32, seq_k: u32, model: u32, heads: u32,
+                head_dim: u32, total_q: u32, total_k: u32, total: u32,
+                causal: u32, has_mask: u32, pad0: u32 }
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key: array<f32>;
+@group(0) @binding(2) var<storage, read> value: array<f32>;
+@group(0) @binding(3) var<storage, read> key_padding_mask: array<f32>;
+@group(0) @binding(4) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_query: array<f32>;
+@group(0) @binding(6) var<storage, read_write> grad_key: array<f32>;
+@group(0) @binding(7) var<storage, read_write> grad_value: array<f32>;
+@group(0) @binding(8) var<uniform> p: Params;
+fn allowed(batch: u32, row: u32, token: u32) -> bool {
+  return !((p.causal != 0u && token > row) ||
+           (p.has_mask != 0u && key_padding_mask[batch * p.seq_k + token] != 0.0));
+}
+fn score(batch: u32, row: u32, head: u32, token: u32) -> f32 {
+  let qb = (batch * p.seq_q + row) * p.model + head * p.head_dim;
+  let kb = (batch * p.seq_k + token) * p.model + head * p.head_dim;
+  var sum: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    sum = sum + query[qb + d] * key[kb + d];
+  }
+  return sum * inverseSqrt(f32(p.head_dim));
+}
+fn softmax_max(batch: u32, row: u32, head: u32) -> f32 {
+  var maximum: f32 = -3.402823e38;
+  for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
+    if (allowed(batch, row, k)) {
+      maximum = max(maximum, score(batch, row, head, k));
+    }
+  }
+  return maximum;
+}
+fn softmax_denominator(batch: u32, row: u32, head: u32, maximum: f32) -> f32 {
+  var denominator: f32 = 0.0;
+  for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
+    if (allowed(batch, row, k)) {
+      denominator = denominator + exp(score(batch, row, head, k) - maximum);
+    }
+  }
+  return denominator;
+}
+fn probability(batch: u32, row: u32, head: u32, token: u32,
+               maximum: f32, denominator: f32) -> f32 {
+  if (!allowed(batch, row, token) || denominator == 0.0) { return 0.0; }
+  return exp(score(batch, row, head, token) - maximum) / denominator;
+}
+fn grad_probability(batch: u32, row: u32, head: u32, token: u32) -> f32 {
+  let ob = (batch * p.seq_q + row) * p.model + head * p.head_dim;
+  let vb = (batch * p.seq_k + token) * p.model + head * p.head_dim;
+  var sum: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    sum = sum + grad_output[ob + d] * value[vb + d];
+  }
+  return sum;
+}
+fn grad_expectation(batch: u32, row: u32, head: u32,
+                    maximum: f32, denominator: f32) -> f32 {
+  var expected: f32 = 0.0;
+  for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
+    expected = expected + probability(batch, row, head, k, maximum, denominator) *
+                          grad_probability(batch, row, head, k);
+  }
+  return expected;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; let scale = inverseSqrt(f32(p.head_dim));
+  if (i < p.total_q) {
+    let flat_row = i / p.model; let batch = flat_row / p.seq_q;
+    let row = flat_row % p.seq_q; let component = i % p.model;
+    let head = component / p.head_dim;
+    let maximum = softmax_max(batch, row, head);
+    let denominator = softmax_denominator(batch, row, head, maximum);
+    let expected = grad_expectation(batch, row, head, maximum, denominator);
+    var dq: f32 = 0.0;
+    for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
+      let prob = probability(batch, row, head, token, maximum, denominator);
+      let ds = prob * (grad_probability(batch, row, head, token) - expected);
+      dq = dq + ds * key[(batch * p.seq_k + token) * p.model + component] * scale;
+    }
+    grad_query[i] = dq;
+  }
+  if (i < p.total_k) {
+    let flat_token = i / p.model; let batch = flat_token / p.seq_k;
+    let token = flat_token % p.seq_k; let component = i % p.model;
+    let head = component / p.head_dim; var dk: f32 = 0.0; var dv: f32 = 0.0;
+    for (var row: u32 = 0u; row < p.seq_q; row = row + 1u) {
+      let maximum = softmax_max(batch, row, head);
+      let denominator = softmax_denominator(batch, row, head, maximum);
+      let prob = probability(batch, row, head, token, maximum, denominator);
+      let expected = grad_expectation(batch, row, head, maximum, denominator);
+      let ds = prob * (grad_probability(batch, row, head, token) - expected);
+      dk = dk + ds * query[(batch * p.seq_q + row) * p.model + component] * scale;
+      dv = dv + prob * grad_output[(batch * p.seq_q + row) * p.model + component];
+    }
+    grad_key[i] = dk; grad_value[i] = dv;
+  }
 }")
 
 (def add-bias-rows-wgsl
@@ -626,17 +741,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   matrix[i] = matrix[i] + bias[i % dims.y];
 }")
 
-(def mse-gradient-wgsl
-  "Elementwise derivative 2*(prediction-target)/N for mean squared error."
+(def mse-loss-wgsl
+  "Mean squared error reduced into one device-resident scalar."
   "
 @group(0) @binding(0) var<storage, read> prediction: array<f32>;
 @group(0) @binding(1) var<storage, read> expected: array<f32>;
-@group(0) @binding(2) var<storage, read_write> gradient: array<f32>;
+@group(0) @binding(2) var<storage, read_write> loss: array<f32>;
 @group(0) @binding(3) var<uniform> count: u32;
+var<workgroup> partial: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid3: vec3<u32>) {
+  let lid = lid3.x;
+  var sum: f32 = 0.0;
+  for (var i: u32 = lid; i < count; i = i + 64u) {
+    let difference = prediction[i] - expected[i];
+    sum = sum + difference * difference;
+  }
+  partial[lid] = sum;
+  workgroupBarrier();
+  var stride: u32 = 32u;
+  loop {
+    if (stride == 0u) { break; }
+    if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+  if (lid == 0u) { loss[0] = partial[0] / f32(count); }
+}")
+
+(def mse-gradient-wgsl
+  "MSE vector-Jacobian product, including the upstream scalar seed."
+  "
+@group(0) @binding(0) var<storage, read> prediction: array<f32>;
+@group(0) @binding(1) var<storage, read> expected: array<f32>;
+@group(0) @binding(2) var<storage, read> upstream: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gradient: array<f32>;
+@group(0) @binding(4) var<uniform> count: u32;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x; if (i >= count) { return; }
-  gradient[i] = 2.0 * (prediction[i] - expected[i]) / f32(count);
+  gradient[i] = upstream[0] * 2.0 * (prediction[i] - expected[i]) / f32(count);
 }")
 
 (def relu-backward-wgsl
@@ -679,6 +823,20 @@ struct Params { learning_rate: f32, count: u32, pad0: u32, pad1: u32 }
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x; if (i >= p.count) { return; }
   parameter[i] = parameter[i] - p.learning_rate * gradient[i];
+}")
+
+(def sgd-step-wgsl
+  "Out-of-place parameter - learning_rate * gradient update."
+  "
+@group(0) @binding(0) var<storage, read> parameter: array<f32>;
+@group(0) @binding(1) var<storage, read> gradient: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> learning_rate: f32;
+@group(0) @binding(4) var<uniform> count: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= count) { return; }
+  output[i] = parameter[i] - learning_rate * gradient[i];
 }")
 
 (def conv2d-nchw-wgsl
@@ -1037,7 +1195,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
    :add-last-axis-bias add-last-axis-bias-wgsl
+   :transpose-2d transpose-2d-wgsl
+   :bias-gradient bias-gradient-wgsl
+   :mse-loss mse-loss-wgsl
+   :mse-gradient mse-gradient-wgsl
+   :sgd-step sgd-step-wgsl
    :multi-head-attention multi-head-attention-wgsl
+   :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl
    :ewise1-f16 ewise1-f16-wgsl
    :gemm-f16 gemm-f16-wgsl

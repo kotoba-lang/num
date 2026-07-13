@@ -5,10 +5,10 @@
   against numerical/finite-difference gradients, the standard autograd
   correctness check — see test/num/autograd_test.cljc) for exactly the ops a
   tiny linear/relu/linear/softmax(+mse-loss) network needs, matching
-  torch-clj's own README example architecture. CPU-backend only (`num.cpu`)
-  — num.tensor's sync-only host-round-trip design (see its own docstring)
-  means this doesn't reach the async Deno GPU backend either, same
-  documented gap as the rest of the tensor layer.
+  torch-clj's own README example architecture. Most general tensor gradients
+  remain host-materialized on GPU backends, but multi-head-attention has a fused
+  `ITensorBackend` forward/backward path verified through async Deno WebGPU on
+  Apple Metal; its Q/K/V tensors and gradients stay device-resident.
 
   Design: a small tape-based (Wengert-list) autograd. `with-tape` binds a
   fresh tape; every op below (`matmul*`/`add-bias*`/`relu*`/`softmax*`/
@@ -23,6 +23,7 @@
   autograd needs and this one deliberately does not attempt."
   (:require [num.array :as arr]
             [num.core :as nm]
+            [num.protocol :as p]
             [num.tensor :as t]))
 
 (def ^:dynamic *tape* nil)
@@ -129,18 +130,44 @@
   `target` is a plain NDArray, not a Value — nothing needs its gradient.
   dL/dpred = 2*(pred - target) / N."
   [pred target]
-  (let [diff (t/sub (:data pred) target)
-        n (double (arr/nelems (:shape diff)))
-        loss-val (if (= :f32 (or (:dtype diff) :f32))
-                   (/ (nm/sum (nm/mul diff diff)) n)
-                   (/ (reduce + (map #(* % %) (arr/->vec diff))) n))]
-    (node (arr/from-vec (:backend (:data pred)) [loss-val] [])
-          [pred]
-          (fn [self]
-            (when-let [g @(:grad self)]
-              (let [scale (* 2.0 (arr/->scalar g) (/ 1.0 n))
-                    diff-copy (arr/from-vec (:backend diff) (arr/->vec diff) (:shape diff))]
-                (accumulate! pred (nm/scal! scale diff-copy))))))))
+  (let [prediction (:data pred)
+        backend (:backend prediction)
+        shape (:shape prediction)
+        count (arr/nelems shape)]
+    (when-not (= shape (:shape target))
+      (throw (ex-info "num.autograd/mse-loss*: target shape must match prediction"
+                      {:prediction shape :target (:shape target)})))
+    (if (and (= backend (:backend target))
+             (= :f32 (:dtype prediction :f32) (:dtype target :f32))
+             (satisfies? p/ITensorBackend backend))
+      (node (assoc (arr/->NDArray
+                    backend
+                    (p/-mse-loss backend (:handle prediction) (:handle target)
+                                 {:count count})
+                    []) :dtype :f32)
+            [pred]
+            (fn [self]
+              (when-let [g @(:grad self)]
+                (accumulate!
+                 pred
+                 (assoc (arr/->NDArray
+                         backend
+                         (p/-mse-gradient backend (:handle prediction)
+                                          (:handle target) (:handle g)
+                                          {:count count})
+                         shape) :dtype :f32)))))
+      (let [diff (t/sub prediction target)
+            n (double count)
+            loss-val (if (= :f32 (or (:dtype diff) :f32))
+                       (/ (nm/sum (nm/mul diff diff)) n)
+                       (/ (reduce + (map #(* % %) (arr/->vec diff))) n))]
+        (node (arr/from-vec backend [loss-val] [])
+              [pred]
+              (fn [self]
+                (when-let [g @(:grad self)]
+                  (let [scale (* 2.0 (arr/->scalar g) (/ 1.0 n))
+                        diff-copy (arr/from-vec backend (arr/->vec diff) shape)]
+                    (accumulate! pred (nm/scal! scale diff-copy))))))))))
 
 ;; --- conv2d (2026-07-13 "raise the maturity" loop) --------------------------
 ;; num.tensor/conv2d bundles im2col + matmul + reshape into one opaque
@@ -272,33 +299,103 @@
         weights (softmax* scaled)]
     (matmul* weights V)))
 
+(defn- add-constant* [x constant]
+  (node (t/add (:data x) constant)
+        [x]
+        (fn [self]
+          (when-let [g @(:grad self)] (accumulate! x g)))))
+
+(defn- attention-mask-nd
+  [backend batch seq-q seq-k causal? key-padding-mask]
+  (when (or causal? key-padding-mask)
+    (let [padding (when key-padding-mask (vec (arr/->vec key-padding-mask)))]
+      (arr/from-vec
+       backend
+       (mapv (fn [index]
+               (let [k (mod index seq-k)
+                     q (mod (quot index seq-k) seq-q)
+                     b (quot index (* seq-q seq-k))]
+                 (if (or (and causal? (> k q))
+                         (and padding
+                              (not (zero? (nth padding (+ (* b seq-k) k))))))
+                   -1.0e30 0.0)))
+             (range (* batch seq-q seq-k)))
+       [batch 1 seq-q seq-k]))))
+
 (defn multi-head-attention*
-  "Differentiable multi-head scaled dot-product attention matching
-  `num.tensor/multi-head-attention`. Q is `[seqQ d-model]`, K/V are
-  `[seqK d-model]`; `num-heads` evenly divides d-model."
-  [Q K V num-heads]
-  (let [[seq-q d-model] (:shape (:data Q))
-        [seq-k k-d-model] (:shape (:data K))
-        [_ v-d-model] (:shape (:data V))
-        heads (long num-heads)]
-    (when-not (and (pos? heads)
-                   (= d-model k-d-model v-d-model)
-                   (zero? (mod (long d-model) heads)))
-      (throw (ex-info "num.autograd/multi-head-attention*: incompatible dimensions"
-                      {:q-shape (:shape (:data Q))
-                       :k-shape (:shape (:data K))
-                       :v-shape (:shape (:data V))
-                       :num-heads heads})))
-    (let [d-head (quot (long d-model) heads)
-          split-heads (fn [x seq-len]
-                        (transpose* (reshape* x [seq-len heads d-head]) [1 0 2]))
-          qh (split-heads Q seq-q)
-          kh (split-heads K seq-k)
-          vh (split-heads V seq-k)
-          scores (matmul* qh (transpose* kh [0 2 1]))
-          weights (softmax* (scale* (/ 1.0 (Math/sqrt d-head)) scores))
-          heads-out (matmul* weights vh)]
-      (reshape* (transpose* heads-out [1 0 2]) [seq-q d-model]))))
+  "Differentiable rank-2/rank-3 multi-head attention, including causal and
+  key-padding masks. Options match `num.tensor/multi-head-attention`."
+  ([Q K V num-heads] (multi-head-attention* Q K V num-heads {}))
+  ([Q K V num-heads {:keys [causal? key-padding-mask] :as opts
+                      :or {causal? false}}]
+   (let [q-data (:data Q) k-data (:data K) v-data (:data V)
+         q-shape (:shape q-data) k-shape (:shape k-data)
+         v-shape (:shape v-data) rank (count q-shape)
+         [batch seq-q d-model] (if (= rank 2) (into [1] q-shape) q-shape)
+         [k-batch seq-k k-d-model] (if (= rank 2) (into [1] k-shape) k-shape)
+         expected-mask (if (= rank 2) [seq-k] [batch seq-k])
+         heads (long num-heads)]
+     (when-not (and (#{2 3} rank) (= rank (count k-shape) (count v-shape))
+                    (= k-shape v-shape) (= batch k-batch)
+                    (= d-model k-d-model) (pos? heads)
+                    (zero? (mod (long d-model) heads))
+                    (or (nil? key-padding-mask)
+                        (= (:shape key-padding-mask) expected-mask)
+                        (and (= rank 2)
+                             (= (:shape key-padding-mask) [1 seq-k]))))
+       (throw (ex-info "num.autograd/multi-head-attention*: incompatible dimensions or mask"
+                       {:query q-shape :key k-shape :value v-shape
+                        :key-padding-mask (:shape key-padding-mask)
+                        :num-heads heads})))
+     (let [d-head (quot (long d-model) heads)
+           backend (:backend q-data)
+           output-shape (if (= rank 2) [seq-q d-model] [batch seq-q d-model])
+           fused? (and (= backend (:backend k-data) (:backend v-data))
+                       (or (nil? key-padding-mask)
+                           (= backend (:backend key-padding-mask)))
+                       (= :f32 (:dtype q-data :f32)
+                          (:dtype k-data :f32) (:dtype v-data :f32))
+                       (satisfies? p/ITensorBackend backend))]
+       (if fused?
+         (node
+          (t/multi-head-attention q-data k-data v-data heads opts)
+          [Q K V]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [params {:batch batch :seq-q seq-q :seq-k seq-k
+                            :d-model d-model :heads heads :head-dim d-head
+                            :causal? causal?
+                            :has-key-padding-mask? (boolean key-padding-mask)}
+                    gradients (p/-multi-head-attention-backward
+                               backend (:handle q-data) (:handle k-data)
+                               (:handle v-data)
+                               (when key-padding-mask (:handle key-padding-mask))
+                               (:handle g) params)
+                    ndarray (fn [handle shape]
+                              (assoc (arr/->NDArray backend handle shape)
+                                     :dtype :f32))]
+                (accumulate! Q (ndarray (:query gradients) q-shape))
+                (accumulate! K (ndarray (:key gradients) k-shape))
+                (accumulate! V (ndarray (:value gradients) (:shape v-data)))))))
+         (let [q3 (if (= rank 2) (reshape* Q [1 seq-q d-model]) Q)
+               k3 (if (= rank 2) (reshape* K [1 seq-k d-model]) K)
+               v3 (if (= rank 2) (reshape* V [1 seq-k d-model]) V)
+               split-heads (fn [x seq-len]
+                             (transpose* (reshape* x [batch seq-len heads d-head])
+                                         [0 2 1 3]))
+               qh (split-heads q3 seq-q)
+               kh (split-heads k3 seq-k)
+               vh (split-heads v3 seq-k)
+               scores (scale* (/ 1.0 (Math/sqrt d-head))
+                              (matmul* qh (transpose* kh [0 1 3 2])))
+               mask (attention-mask-nd backend batch seq-q seq-k
+                                       causal? key-padding-mask)
+               masked (if mask (add-constant* scores mask) scores)
+               weights (softmax* masked)
+               heads-out (matmul* weights vh)
+               merged (reshape* (transpose* heads-out [0 2 1 3])
+                                [batch seq-q d-model])]
+           (if (= rank 2) (reshape* merged output-shape) merged)))))))
 (defn- pair-option [value]
   (mapv long (if (sequential? value) value [value value])))
 

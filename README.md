@@ -187,17 +187,33 @@ training graph; a branched upsample+channel-concat+SiLU loss matches central
 finite differences for both source tensors.
 
 Transformer forward execution now has two further device-native operations:
-rank-1 last-axis bias broadcasting and fused rank-2 multi-head attention. The
-attention kernel accepts different query/key sequence lengths, performs stable
-per-head softmax, and emits concatenated heads without materializing transpose,
-batched-matmul, or probability tensors on the host. Both kernels match the CPU
+rank-1 last-axis bias broadcasting and fused rank-2/rank-3 multi-head attention.
+The attention kernel accepts batches and different query/key sequence lengths,
+performs stable per-head softmax, and emits concatenated heads without materializing
+transpose, batched-matmul, or probability tensors on the host. `:causal?` and a
+PyTorch-semantics `[batch,seqK]` key-padding mask apply in both forward and backward.
+Both kernels match the CPU
 oracle on Apple M4 Metal and allow learned Q/K/V/output projection attention to
-remain GPU-resident through its complete forward pass.
+remain GPU-resident through its complete forward pass. Its fused backward kernel
+recomputes the stable softmax on-device and returns gradients for Q, K, and V;
+`num.autograd/multi-head-attention*` selects that kernel automatically for an f32
+`ITensorBackend`. A two-head cross-attention fixture (`seqQ=2`, `seqK=3`) verifies
+forward plus all three gradients against the independently decomposed CPU autograd
+graph on real Apple M4 Metal. A second graph adds learned Q/K/V/output matrices and
+all four biases, exercising device-native GEMM, 2-D transpose, row reduction, fused
+attention backward, shared-input gradient accumulation, and a device-resident MSE
+loss reduction/VJP. Immutable SGD updates allocate new GPU buffers while leaving
+the source parameters unchanged. Together, loss, output, all gradients, and all
+eight updated projection tensors plus batched causal+padding output/Q/K/V gradients
+pass 27/27 checks without intermediate host
+readback. Only final verification values are downloaded.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
 flat contiguous buffer. Except for the native last-axis bias and fused attention
-specializations above, general `broadcast-to`/`transpose`/axis-reductions/`matmul` read
+specializations above, rank-2 same-backend `matmul`, 2-D matrix transpose, and row-sum
+are also device-native (these cover learned Linear backward). General
+`broadcast-to`/arbitrary-rank `transpose`/axis-reductions/batched `matmul` still read
 operands back via `arr/->vec`, compute with plain `double-array` loops (same style as
 `num.cpu`'s reference loops), and re-upload via `arr/from-vec` — correct on ANY backend
 today, but a host round-trip. `reshape`/`squeeze`/`unsqueeze` are the exception: for a
@@ -333,6 +349,7 @@ vendor-native (`:cuda`/`:metal`/`:rocm`) fast-path backends — see
 clojure -X:test                                  # CPU backend satisfies the full IBackend contract (JVM)
 clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript
 clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs   # PROOF: live GPU ≡ CPU oracle, real Metal
+clojure -M:deno-attention-backward-verify && deno run --allow-all target/deno-attention-backward-verify.cjs # fused attention gradients on Metal
 ```
 
 **Portability is proven, not just claimed.** The `.cljc` core (CPU backend, array/CSR
@@ -341,7 +358,7 @@ types, the full op contract) compiles to JS via ClojureScript and runs green on 
 **Apple M4/M1 Metal** three separate ways now: the standalone harness
 (`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
 (`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
-`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 24/24 against the CPU
+`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 26/26 against the CPU
 oracle). So num-clj
 genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
 longer only exercised by a script outside the Clojure dispatch seam.

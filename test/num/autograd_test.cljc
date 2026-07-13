@@ -238,6 +238,34 @@
             (str "analytic=" (arr/->vec analytic)
                  " numeric=" (arr/->vec numeric)))))))
 
+(deftest batched-masked-attention-gradient-matches-finite-differences
+  (let [xd (arr/from-vec backend
+                         [0.2 -0.1, 0.3 0.4,
+                          -0.2 0.1, 0.5 -0.3] [2 2 2])
+        target (arr/from-vec backend (repeat 8 0.0) [2 2 2])
+        padding (arr/from-vec backend [0 1, 0 0] [2 2])
+        opts {:causal? true :key-padding-mask padding}
+        loss-of (fn [xd']
+                  (let [[loss _]
+                        (ag/with-tape
+                          (let [x (ag/value xd')]
+                            (ag/mse-loss*
+                             (ag/multi-head-attention* x x x 1 opts) target)))]
+                    (arr/->scalar (:data loss))))
+        [result tape]
+        (ag/with-tape
+          (let [x (ag/value xd)
+                prediction (ag/multi-head-attention* x x x 1 opts)
+                loss (ag/mse-loss* prediction target)]
+            {:loss loss :prediction prediction :x x}))]
+    (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+    (let [analytic @(:grad (:x result))
+          numeric (numerical-grad loss-of xd 1.0e-5)]
+      (is (= [2 2 2] (:shape (:data (:prediction result)))))
+      (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 2.0e-4)
+          (str "analytic=" (arr/->vec analytic)
+               " numeric=" (arr/->vec numeric))))))
+
 (deftest conv2d-nchw-gradients-match-finite-differences
   (testing "batched/channel-aware convolution differentiates input, grouped
             weights, and bias under padding+stride, not only valid 2-D toys"

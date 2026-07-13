@@ -489,3 +489,35 @@
                                          (arr/from-vec backend (range 4) [1 4])
                                          (arr/from-vec backend (range 4) [1 4])
                                          3)))))
+
+(deftest immutable-sgd-step
+  (let [parameter (arr/from-vec backend [1.0 -2.0 3.0 -4.0] [2 2])
+        gradient (arr/from-vec backend [0.5 -1.0 2.0 4.0] [2 2])
+        updated (t/sgd-step parameter gradient 0.1)]
+    (is (contract/approx-vec? [0.95 -1.9 2.8 -4.4] (arr/->vec updated)))
+    (is (= [1.0 -2.0 3.0 -4.0] (arr/->vec parameter))
+        "the original parameter remains immutable")
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/sgd-step parameter gradient 0.0)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/sgd-step parameter (arr/from-vec backend [1.0] [1]) 0.1)))))
+
+(deftest batched-causal-padding-multi-head-attention
+  (let [query (arr/from-vec backend (repeat 12 0.0) [2 3 2])
+        key (arr/from-vec backend (repeat 12 0.0) [2 3 2])
+        value (arr/from-vec backend
+                            [1 2, 10 20, 5 6,
+                             2 4, 6 8, 100 200] [2 3 2])
+        padding (arr/from-vec backend [0 1 0, 0 0 1] [2 3])
+        output (t/multi-head-attention
+                query key value 1
+                {:causal? true :key-padding-mask padding})]
+    (is (= [2 3 2] (:shape output)))
+    (is (contract/approx-vec?
+         [1 2, 1 2, 3 4,
+          2 4, 4 6, 4 6]
+         (arr/->vec output)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/multi-head-attention
+                  query key value 1
+                  {:key-padding-mask (arr/from-vec backend [0 1 0] [3])})))))

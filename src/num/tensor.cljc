@@ -192,6 +192,34 @@
 (defn mul "Broadcasting elementwise x * y (Hadamard, not matmul)." [x y] (ewise-bc :mul x y))
 (defn div "Broadcasting elementwise x / y." [x y] (ewise-bc :div x y))
 
+(defn sgd-step
+  "Immutable SGD update `parameter - learning-rate * gradient`.
+
+  f32 tensors on an `ITensorBackend` are updated into a newly allocated device
+  buffer; the input parameter and gradient remain unchanged. Other backends use
+  the portable host oracle with identical semantics."
+  [parameter gradient learning-rate]
+  (when-not (= (:shape parameter) (:shape gradient))
+    (throw (ex-info "num.tensor/sgd-step: gradient shape must match parameter"
+                    {:parameter (:shape parameter) :gradient (:shape gradient)})))
+  (when-not (and (number? learning-rate) (pos? learning-rate))
+    (throw (ex-info "num.tensor/sgd-step: learning-rate must be positive"
+                    {:learning-rate learning-rate})))
+  (let [backend (:backend parameter)
+        count (arr/nelems (:shape parameter))]
+    (if (and (= backend (:backend gradient))
+             (= :f32 (array-dtype parameter) (array-dtype gradient))
+             (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray
+              backend
+              (p/-sgd-step backend (:handle parameter) (:handle gradient)
+                           {:count count :learning-rate learning-rate})
+              (:shape parameter)) :dtype :f32)
+      (arr/from-vec backend
+                    (mapv #(- %1 (* learning-rate %2))
+                          (arr/->vec parameter) (arr/->vec gradient))
+                    (:shape parameter) (array-dtype parameter)))))
+
 ;; --- reshape / transpose / squeeze / unsqueeze --------------------------------
 
 (defn reshape
@@ -246,19 +274,29 @@
        (throw (ex-info "num.tensor/transpose: perm must be a permutation of 0..rank-1"
                         {:shape shape :perm perm})))
      (let [out-shape (mapv shape perm)
-           in-strides (row-major-strides shape)
-           out-strides (row-major-strides out-shape)
-           xs (double-array (arr/->vec a))
-           n (arr/nelems out-shape)
-           out (double-array n)]
-       (dotimes [oi n]
-         (let [out-idx (unravel oi out-shape out-strides)
-               ;; out axis i reads from in axis perm[i]: in-idx[perm[i]] = out-idx[i]
-               in-idx (reduce (fn [v [i p]] (assoc v p (nth out-idx i)))
-                               (vec (repeat r 0))
-                               (map-indexed vector perm))]
-           (aset out oi (aget xs (ravel in-idx in-strides)))))
-       (arr/from-vec (:backend a) (vec out) out-shape)))))
+           backend (:backend a)]
+       (if (and (= r 2) (= perm [1 0]) (= :f32 (array-dtype a))
+                (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray
+                 backend
+                 (p/-transpose-2d backend (:handle a)
+                                  {:rows (long (first shape))
+                                   :cols (long (second shape))})
+                 out-shape)
+                :dtype :f32)
+         (let [in-strides (row-major-strides shape)
+               out-strides (row-major-strides out-shape)
+               xs (double-array (arr/->vec a))
+               n (arr/nelems out-shape)
+               out (double-array n)]
+           (dotimes [oi n]
+             (let [out-idx (unravel oi out-shape out-strides)
+                   ;; out axis i reads from in axis perm[i]: in-idx[perm[i]] = out-idx[i]
+                   in-idx (reduce (fn [v [i p]] (assoc v p (nth out-idx i)))
+                                  (vec (repeat r 0))
+                                  (map-indexed vector perm))]
+               (aset out oi (aget xs (ravel in-idx in-strides)))))
+           (arr/from-vec backend (vec out) out-shape)))))))
 
 ;; --- axis-parameterized reductions ---------------------------------------------
 
@@ -298,7 +336,21 @@
   `opts` is `{:keepdims? bool}` (default false, NumPy/PyTorch convention)."
   ([a] (sum a nil {}))
   ([a axes] (sum a axes {}))
-  ([a axes {:keys [keepdims?] :or {keepdims? false}}] (reduce-axes a axes keepdims? :sum)))
+  ([a axes {:keys [keepdims?] :or {keepdims? false}}]
+   (let [shape (:shape a)
+         backend (:backend a)
+         axes-set (when-not (nil? axes) (normalize-axes (count shape) axes))]
+     (if (and (= 2 (count shape)) (= #{0} axes-set)
+              (= :f32 (array-dtype a))
+              (satisfies? p/ITensorBackend backend))
+       (let [[rows cols] (mapv long shape)
+             out-shape (if keepdims? [1 cols] [cols])]
+         (assoc (arr/->NDArray backend
+                               (p/-sum-rows backend (:handle a)
+                                            {:rows rows :cols cols})
+                               out-shape)
+                :dtype :f32))
+       (reduce-axes a axes keepdims? :sum)))))
 
 (defn amax
   "Max along `axes` (nil = all axes) → NDArray."
@@ -335,27 +387,29 @@
       (when-not (= ka kb)
         (throw (ex-info "num.tensor/matmul: inner dimensions must match"
                          {:shape-a sa :shape-b sb})))
-      (let [batch-a (vec (drop-last 2 sa))
-            batch-b (vec (drop-last 2 sb))
-            batch-shape (broadcast-shapes batch-a batch-b)
-            nb (long (arr/nelems batch-shape))
-            A' (broadcast-to A (into batch-shape [m ka]))
-            B' (broadcast-to B (into batch-shape [ka n]))
-            xa (double-array (arr/->vec A'))
-            xb (double-array (arr/->vec B'))
-            out (double-array (* nb m n))]
-        (dotimes [bi nb]
-          (let [a-off (* bi m ka) b-off (* bi ka n) c-off (* bi m n)]
-            (dotimes [i m]
-              (dotimes [j n]
-                (let [s (loop [l 0 s 0.0]
-                          (if (< l ka)
-                            (recur (inc l)
-                                   (+ s (* (aget xa (+ a-off (* i ka) l))
-                                           (aget xb (+ b-off (* l n) j)))))
-                            s))]
-                  (aset out (+ c-off (* i n) j) s))))))
-        (arr/from-vec (:backend A) (vec out) (into batch-shape [m n]))))))
+      (if (and (= 2 ra rb) (= (:backend A) (:backend B)))
+        (nm/matmul A B)
+        (let [batch-a (vec (drop-last 2 sa))
+              batch-b (vec (drop-last 2 sb))
+              batch-shape (broadcast-shapes batch-a batch-b)
+              nb (long (arr/nelems batch-shape))
+              A' (broadcast-to A (into batch-shape [m ka]))
+              B' (broadcast-to B (into batch-shape [ka n]))
+              xa (double-array (arr/->vec A'))
+              xb (double-array (arr/->vec B'))
+              out (double-array (* nb m n))]
+          (dotimes [bi nb]
+            (let [a-off (* bi m ka) b-off (* bi ka n) c-off (* bi m n)]
+              (dotimes [i m]
+                (dotimes [j n]
+                  (let [s (loop [l 0 s 0.0]
+                            (if (< l ka)
+                              (recur (inc l)
+                                     (+ s (* (aget xa (+ a-off (* i ka) l))
+                                             (aget xb (+ b-off (* l n) j)))))
+                              s))]
+                    (aset out (+ c-off (* i n) j) s))))))
+          (arr/from-vec (:backend A) (vec out) (into batch-shape [m n])))))))
 
 ;; --- softmax (ADR-2607131500 Phase 1) ------------------------------------------
 ;; Everything below reuses ONLY the primitives already real above (amax/sub/sum/
@@ -772,55 +826,82 @@
 
 ;; --- multi-head attention (2026-07-13 "raise the maturity" loop) ---------------
 
-(defn multi-head-attention
-  "Multi-head scaled dot-product attention — `attention` generalized the way
-  a real transformer/UNet attention block actually needs it (single-head was
-  ADR-2607131500 Phase 1's honest-minimal simplification). `Q` is
-  `[seqQ d_model]`, `K`/`V` are `[seqK d_model]` (cross-attention: seqQ may
-  differ from seqK) — UNLIKE `attention`, `V`'s last dim MUST equal Q/K's
-  `d_model` here (the standard transformer convention: V gets split into
-  heads the same way Q/K do, so heads can concatenate back to `d_model`;
-  `attention` never splits into heads so it tolerates a different `d_v`).
-  `num-heads` must evenly divide `d_model`; `num-heads=1`
-  reduces to EXACTLY `attention`'s own result (see
-  `test/num/tensor_test.cljc`, verified against `attention` directly, not
-  just internally consistent). No batching (a single Q/K/V triple, not a
-  batch of them) and no causal/padding mask — still deferred, same as
-  `attention`'s own scope fence.
+(defn- materialize-attention-mask
+  [backend batch seq-q seq-k causal? key-padding-mask]
+  (when (or causal? key-padding-mask)
+    (let [padding (when key-padding-mask (vec (arr/->vec key-padding-mask)))]
+      (arr/from-vec
+       backend
+       (mapv (fn [index]
+               (let [k (mod index seq-k)
+                     q (mod (quot index seq-k) seq-q)
+                     b (quot index (* seq-q seq-k))
+                     padded? (and padding (not (zero? (nth padding (+ (* b seq-k) k)))))]
+                 (if (or (and causal? (> k q)) padded?) -1.0e30 0.0)))
+             (range (* batch seq-q seq-k)))
+       [batch 1 seq-q seq-k]))))
 
-  Built from already-real, already-verified primitives only — no new WGSL
-  kernel, no new host-round-trip primitive: `reshape`/`transpose` split
-  `[seq d_model]` into `[num-heads seq d_head]` and merge back, `matmul`
-  handles the per-head matmuls directly (already batched, see its own
-  docstring — no new op needed), `softmax` handles the per-head-per-row
-  normalization (last axis, already correct for a 3-D `[h seqQ seqK]`
-  scores tensor)."
-  [Q K V num-heads]
-  (let [[seqQ d-model] (:shape Q) [seqK _] (:shape K) h (long num-heads)]
-    (when-not (and (= 2 (count (:shape Q)) (count (:shape K)) (count (:shape V)))
-                   (= (:shape K) (:shape V))
-                   (= d-model (last (:shape K))) (pos? h)
-                   (zero? (mod (long d-model) h)))
-      (throw (ex-info "num.tensor/multi-head-attention: num-heads must evenly divide d_model"
-                       {:query (:shape Q) :key (:shape K) :value (:shape V)
-                        :d-model d-model :num-heads h})))
-    (let [backend (:backend Q) d-head (/ (long d-model) h)]
-      (if (and (= backend (:backend K) (:backend V))
-               (= :f32 (array-dtype Q) (array-dtype K) (array-dtype V))
-               (satisfies? p/ITensorBackend backend))
-        (assoc (arr/->NDArray
-                backend
-                (p/-multi-head-attention
-                 backend (:handle Q) (:handle K) (:handle V)
-                 {:seq-q seqQ :seq-k seqK :d-model d-model :heads h
-                  :head-dim d-head :total (* seqQ d-model)})
-                [seqQ d-model]) :dtype :f32)
-        (let [
-          split-heads (fn [x seq-len] (transpose (reshape x [seq-len h d-head]) [1 0 2]))
-          Qh (split-heads Q seqQ) Kh (split-heads K seqK) Vh (split-heads V seqK)
-          scores (matmul Qh (transpose Kh [0 2 1]))
-          scaled (nm/scal! (/ 1.0 (Math/sqrt d-head)) scores)
-          weights (softmax scaled)
-          heads-out (matmul weights Vh)
-          merged (transpose heads-out [1 0 2])]
-          (reshape merged [seqQ d-model]))))))
+(defn multi-head-attention
+  "Multi-head scaled dot-product attention for `[seq,d]` or `[batch,seq,d]`.
+
+  Q is `[B,seqQ,d_model]`; K/V are `[B,seqK,d_model]` with rank-2 forms
+  treated as B=1 and returned rank-2 for compatibility. Options:
+  `:causal?` prevents query row q from attending to keys k>q, and
+  `:key-padding-mask` is `[B,seqK]` (or `[seqK]` for rank-2 input), where a
+  non-zero value marks a key to ignore, matching PyTorch boolean-mask meaning."
+  ([Q K V num-heads] (multi-head-attention Q K V num-heads {}))
+  ([Q K V num-heads {:keys [causal? key-padding-mask]
+                      :or {causal? false}}]
+   (let [q-shape (:shape Q) k-shape (:shape K) v-shape (:shape V)
+         rank (count q-shape) h (long num-heads)
+         [batch seq-q d-model] (if (= rank 2) (into [1] q-shape) q-shape)
+         [k-batch seq-k k-model] (if (= rank 2) (into [1] k-shape) k-shape)
+         expected-mask-shape (if (= rank 2) [seq-k] [batch seq-k])
+         mask-shape (:shape key-padding-mask)]
+     (when-not (and (#{2 3} rank) (= rank (count k-shape) (count v-shape))
+                    (= k-shape v-shape) (= batch k-batch)
+                    (= d-model k-model) (pos? h)
+                    (zero? (mod (long d-model) h))
+                    (or (nil? key-padding-mask)
+                        (= mask-shape expected-mask-shape)
+                        (and (= rank 2) (= mask-shape [1 seq-k]))))
+       (throw (ex-info "num.tensor/multi-head-attention: incompatible batch, model, heads, or mask"
+                       {:query q-shape :key k-shape :value v-shape
+                        :key-padding-mask mask-shape :expected-mask expected-mask-shape
+                        :num-heads h})))
+     (let [backend (:backend Q) d-head (quot (long d-model) h)
+           mask-backend (when key-padding-mask (:backend key-padding-mask))
+           output-shape (if (= rank 2) [seq-q d-model] [batch seq-q d-model])
+           params {:batch batch :seq-q seq-q :seq-k seq-k :d-model d-model
+                   :heads h :head-dim d-head :causal? causal?
+                   :has-key-padding-mask? (boolean key-padding-mask)
+                   :total (* batch seq-q d-model)}]
+       (if (and (= backend (:backend K) (:backend V))
+                (or (nil? key-padding-mask) (= backend mask-backend))
+                (= :f32 (array-dtype Q) (array-dtype K) (array-dtype V))
+                (or (nil? key-padding-mask) (= :f32 (array-dtype key-padding-mask)))
+                (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray
+                 backend
+                 (p/-multi-head-attention
+                  backend (:handle Q) (:handle K) (:handle V)
+                  (when key-padding-mask (:handle key-padding-mask)) params)
+                 output-shape) :dtype :f32)
+         (let [q3 (if (= rank 2) (reshape Q [1 seq-q d-model]) Q)
+               k3 (if (= rank 2) (reshape K [1 seq-k d-model]) K)
+               v3 (if (= rank 2) (reshape V [1 seq-k d-model]) V)
+               split-heads (fn [x seq-len]
+                             (transpose (reshape x [batch seq-len h d-head])
+                                        [0 2 1 3]))
+               qh (split-heads q3 seq-q) kh (split-heads k3 seq-k)
+               vh (split-heads v3 seq-k)
+               scores (matmul qh (transpose kh [0 1 3 2]))
+               scaled (nm/scal! (/ 1.0 (Math/sqrt d-head)) scores)
+               additive-mask (materialize-attention-mask
+                              backend batch seq-q seq-k causal? key-padding-mask)
+               masked (if additive-mask (add scaled additive-mask) scaled)
+               weights (softmax masked)
+               heads-out (matmul weights vh)
+               merged (reshape (transpose heads-out [0 2 1 3])
+                               [batch seq-q d-model])]
+           (if (= rank 2) (reshape merged output-shape) merged)))))))

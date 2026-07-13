@@ -172,15 +172,72 @@
                    [input-h bias-h output (uni dev (u32-tag [total width 0 0]))]
                    [(ceil-div total 64) 1 1])
       output))
-  (-multi-head-attention [_ query-h key-h value-h
-                          {:keys [seq-q seq-k d-model heads head-dim total]}]
-    (let [output (w/-create-buffer dev total :storage)]
+  (-transpose-2d [_ input-h {:keys [rows cols]}]
+    (let [output (w/-create-buffer dev (* rows cols) :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :transpose-2d)
+                   [input-h output (uni dev (u32-tag [rows cols]))]
+                   [(ceil-div cols 16) (ceil-div rows 16) 1])
+      output))
+  (-sum-rows [_ input-h {:keys [rows cols]}]
+    (let [output (w/-create-buffer dev cols :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :bias-gradient)
+                   [input-h output (uni dev (u32-tag [rows cols]))]
+                   [(ceil-div cols 64) 1 1])
+      output))
+  (-mse-loss [_ prediction-h target-h {:keys [count]}]
+    (let [loss (w/-create-buffer dev 1 :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :mse-loss)
+                   [prediction-h target-h loss (uni dev (u32-tag [count]))]
+                   [1 1 1])
+      loss))
+  (-mse-gradient [_ prediction-h target-h upstream-h {:keys [count]}]
+    (let [gradient (w/-create-buffer dev count :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :mse-gradient)
+                   [prediction-h target-h upstream-h gradient
+                    (uni dev (u32-tag [count]))]
+                   [(ceil-div count 64) 1 1])
+      gradient))
+  (-sgd-step [_ parameter-h gradient-h {:keys [count learning-rate]}]
+    (let [output (w/-create-buffer dev count :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :sgd-step)
+                   [parameter-h gradient-h output
+                    (uni dev [(double learning-rate)])
+                    (uni dev (u32-tag [count]))]
+                   [(ceil-div count 64) 1 1])
+      output))
+  (-multi-head-attention [_ query-h key-h value-h key-padding-mask-h
+                          {:keys [batch seq-q seq-k d-model heads head-dim total
+                                  causal? has-key-padding-mask?]}]
+    (let [output (w/-create-buffer dev total :storage)
+          mask (or key-padding-mask-h
+                   (w/-create-buffer dev (* batch seq-k) :storage))]
       (w/-dispatch dev (get-pipeline dev pipes :multi-head-attention)
-                   [query-h key-h value-h output
-                    (uni dev (u32-tag [seq-q seq-k d-model heads
-                                       head-dim total 0 0]))]
+                   [query-h key-h value-h mask output
+                    (uni dev (u32-tag [batch seq-q seq-k d-model heads
+                                       head-dim total (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0 0 0]))]
                    [(ceil-div total 64) 1 1])
-      output)))
+      output))
+  (-multi-head-attention-backward [_ query-h key-h value-h key-padding-mask-h
+                                   grad-output-h
+                                   {:keys [batch seq-q seq-k d-model heads head-dim
+                                           causal? has-key-padding-mask?]}]
+    (let [total-q (* batch seq-q d-model)
+          total-k (* batch seq-k d-model)
+          total (max total-q total-k)
+          mask (or key-padding-mask-h
+                   (w/-create-buffer dev (* batch seq-k) :storage))
+          grad-query (w/-create-buffer dev total-q :storage)
+          grad-key (w/-create-buffer dev total-k :storage)
+          grad-value (w/-create-buffer dev total-k :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :multi-head-attention-backward)
+                   [query-h key-h value-h mask grad-output-h
+                    grad-query grad-key grad-value
+                    (uni dev (u32-tag [batch seq-q seq-k d-model heads head-dim
+                                       total-q total-k total (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0]))]
+                   [(ceil-div total 64) 1 1])
+      {:query grad-query :key grad-key :value grad-value})))
 
 (defn wgsl-backend
   "Construct a WgslBackend over an injected `IGpuDevice` (native, blocking

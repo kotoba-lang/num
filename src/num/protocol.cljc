@@ -80,5 +80,18 @@
     "Concatenate contiguous tensors along an arbitrary axis; returns a new handle.")
   (-add-last-axis-bias [b input-h bias-h params]
     "Broadcast-add a rank-1 bias over every contiguous last-axis row.")
-  (-multi-head-attention [b query-h key-h value-h params]
-    "Fused unmasked scaled dot-product attention over rank-2 Q/K/V."))
+  (-transpose-2d [b input-h params]
+    "Out-of-place transpose of a contiguous f32 matrix.")
+  (-sum-rows [b input-h params]
+    "Reduce a contiguous f32 matrix over its row axis.")
+  (-mse-loss [b prediction-h target-h params]
+    "Mean squared error as a device-resident scalar handle.")
+  (-mse-gradient [b prediction-h target-h upstream-h params]
+    "MSE vector-Jacobian product as a device-resident tensor handle.")
+  (-sgd-step [b parameter-h gradient-h params]
+    "Out-of-place immutable SGD update as a new device tensor handle.")
+  (-multi-head-attention [b query-h key-h value-h key-padding-mask-h params]
+    "Fused batched scaled dot-product attention with causal/padding masks.")
+  (-multi-head-attention-backward [b query-h key-h value-h key-padding-mask-h
+                                   grad-output-h params]
+    "Fused attention backward; returns {:query :key :value} gradient handles."))
