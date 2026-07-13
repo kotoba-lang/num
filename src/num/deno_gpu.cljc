@@ -45,6 +45,7 @@
   pulling in `core.async` (not needed here — no complex internal control flow, just
   a couple of `.then` chains)."
   (:require [num.protocol :as p]
+            [num.array :as arr]
             [num.dtype :as dtype]
             [num.wgsl :as w]
             [num.wgsl-backend :as wb]))
@@ -751,6 +752,35 @@
        [backend]
        @(.-stats (.-dev backend)))
 
+     (defn upload-byte-view
+       "Upload an already encoded little-endian f32/f16 ArrayBufferView without
+       expanding it into a JavaScript number sequence. The queue copies the
+       supplied bytes before returning; the source view may therefore alias a
+       mapped checkpoint file."
+       [backend bytes shape dtype*]
+       (dtype/check dtype*)
+       (when-not (or (= dtype* :f32) (= dtype* :f16))
+         (throw (ex-info "raw WebGPU upload supports f32/f16"
+                         {:dtype dtype*})))
+       (let [elements (arr/nelems shape)
+             expected (* elements (dtype/element-bytes dtype*))
+             actual (.-byteLength bytes)]
+         (when-not (= expected actual)
+           (throw (ex-info "raw byte length does not match shape/dtype"
+                           {:expected expected :actual actual :shape shape
+                            :dtype dtype*})))
+         (let [device (.-dev (.-dev backend))
+               buffer (if (= dtype* :f32)
+                        (w/-create-buffer (.-dev backend) elements :storage)
+                        (w/-create-buffer-dtype (.-dev backend) elements :storage :f16))
+               source (if (zero? (mod actual 4))
+                        bytes
+                        (let [padded (js/Uint8Array. (* 4 (Math/ceil (/ actual 4))))]
+                          (.set padded bytes)
+                          padded))]
+           (.writeBuffer (.-queue device) buffer 0 source)
+           (assoc (arr/->NDArray backend buffer (vec shape)) :dtype dtype*))))
+
      (defn gpu-backend
        "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.
        Mirrors num.cpu/cpu-backend's explicit-construction pattern (num has no
@@ -767,4 +797,5 @@
      (defn request-device [] (throw (ex-info "num.deno-gpu/request-device requires ClojureScript compiled for a Deno/WebGPU host — see README 'Live GPU backend (Deno)'." {})))
      (defn adapter-description [_] (throw (ex-info "num.deno-gpu/adapter-description requires a cljs/Deno host." {})))
      (defn backend [_] (throw (ex-info "num.deno-gpu/backend requires a cljs/Deno host." {})))
+     (defn upload-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-byte-view requires a cljs/Deno host." {})))
      (defn gpu-backend [] (throw (ex-info "num.deno-gpu/gpu-backend requires a cljs/Deno host." {})))))

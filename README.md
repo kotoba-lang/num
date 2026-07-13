@@ -356,6 +356,17 @@ no `--unstable-webgpu` flag needed):
 clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
 ```
 
+Large checkpoint hosts can bypass per-element JavaScript number allocation with
+`num.deno-gpu/upload-byte-view`. It validates shape × dtype byte length and sends
+an existing little-endian `ArrayBufferView` directly to WebGPU storage for f32
+or f16 (padding only an odd f16 tail to WebGPU's four-byte write alignment).
+The live raw-upload gate covers both physical formats and exact buffer cleanup:
+
+```bash
+clojure -M:deno-raw-upload-verify
+deno run --allow-all target/deno-raw-upload-verify.cjs
+```
+
 ### UNet Metal benchmark
 
 The benchmark forces final readback, so it measures completed GPU work rather
