@@ -54,10 +54,10 @@
                                                 [context ({:sum 0 :max 1 :min 2} op) x (int n) out])]
       (checked this "reduction" s {:op op}) (.getValue out)))
   (-mps-gemv! [this a A m n x b y]
-    (checked this "GEMV" (invoke-int (function library "num_metal_gemv")
+    (checked this "MPS GEMV" (invoke-int (function library "num_metal_mps_gemv")
                                      [context (float a) A (int m) (int n) x (float b) y]) {}))
   (-mps-gemm! [this a A m k B n b C]
-    (checked this "GEMM" (invoke-int (function library "num_metal_gemm")
+    (checked this "MPS GEMM" (invoke-int (function library "num_metal_mps_gemm")
                                      [context (float a) A (int m) (int k) B (int n) (float b) C]) {}))
   (-metal-spmv! [this csr x y]
     (let [rp (int-array (:row-ptr csr)) ci (int-array (:col-idx csr)) values (float-array (map float (:vals csr)))]
@@ -93,7 +93,8 @@
                           :metal/family "runtime-metal"
                           :metal/os-version (System/getProperty "os.version")
                           :metal/compiler-version "MTLLibrary runtime MSL"
-                          :metal/native-api "Metal"}
+                          :metal/native-api "Metal"
+                          :metal/dense-provider "MetalPerformanceShaders"}
                          (atom []))))))
 
 (defn backend []

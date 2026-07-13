@@ -260,8 +260,8 @@ compilation of compiler-generated MSL. The optional JNA adapter keeps native
 dependencies outside the default graph and records Apple device, OS, runtime,
 and all seven KIR/code hashes. `scripts/verify-metal-native.sh` passes the full
 14-operation `IBackend` contract and the independent generated-MSL gate on an
-Apple M1 Max. These dense kernels are direct Metal compute kernels; using Metal
-Performance Shaders as an additional tuned implementation remains future work.
+Apple M1 Max. GEMV/GEMM dispatch through Metal Performance Shaders; the direct
+Metal compute implementations remain available as explicit native fallbacks.
 
 ```bash
 clojure -M:test                                  # CPU + injected CUDA dispatch contracts (JVM)

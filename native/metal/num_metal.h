@@ -16,6 +16,8 @@ int num_metal_dot(num_metal_context*c,void*x,void*y,uint32_t n,float*out);int nu
 int num_metal_ewise(num_metal_context*c,int op,void*x,void*y,void*z,uint32_t n);int num_metal_reduce(num_metal_context*c,int op,void*x,uint32_t n,float*out);
 int num_metal_gemv(num_metal_context*c,float a,void*A,uint32_t m,uint32_t n,void*x,float b,void*y);
 int num_metal_gemm(num_metal_context*c,float a,void*A,uint32_t m,uint32_t k,void*B,uint32_t n,float b,void*C);
+int num_metal_mps_gemv(num_metal_context*c,float a,void*A,uint32_t m,uint32_t n,void*x,float b,void*y);
+int num_metal_mps_gemm(num_metal_context*c,float a,void*A,uint32_t m,uint32_t k,void*B,uint32_t n,float b,void*C);
 int num_metal_spmv(num_metal_context*c,uint32_t rows,uint32_t cols,uint32_t nnz,const int*rp,const int*ci,const float*v,void*x,void*y);
 int num_metal_compile(num_metal_context*c,const char*source,const char*name,num_metal_kernel**out);int num_metal_kernel_destroy(num_metal_context*c,num_metal_kernel*k);
 int num_metal_launch_ewise(num_metal_context*c,num_metal_kernel*k,void*x,void*y,void*z,uint32_t n,uint32_t wg);

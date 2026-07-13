@@ -22,6 +22,7 @@ the dependency-free portable core. Compiler artifacts are recompiled through
 `scripts/verify-metal-native.sh` builds the dylib and passes all 14 operations
 (DOT, NRM2, AXPY, SCAL, four ewise, three reductions, GEMV, GEMM, CSR SpMV)
 against the CPU oracle on an Apple M1 Max. It then runs an independent gate for
-compiler-generated add and sum MSL. Dense GEMV/GEMM currently use direct Metal
-compute kernels rather than Metal Performance Shaders; MPS is an optional future
-throughput implementation and is not part of this qualification claim.
+compiler-generated add and sum MSL. Dense GEMV/GEMM use
+`MPSMatrixMultiplication` (including GEMV as matrix × single-column matrix),
+with direct Metal compute kernels retained as a fallback implementation. Runtime
+provenance reports `MetalPerformanceShaders` as the selected dense provider.
