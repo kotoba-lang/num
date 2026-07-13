@@ -74,6 +74,26 @@
         dmin (dtype/f16-bits->f32 (packed-u16 bytes (+ block-offset 2)))]
     (- (* d scale quant) (* dmin minimum))))
 
+(defn- signed-byte [value]
+  (if (< value 128) value (- value 256)))
+
+(defn- q6-k-value [bytes row cols column]
+  (let [block-index (+ (* row (quot cols 256)) (quot column 256))
+        block-offset (* block-index 210)
+        local (mod column 256) half (quot local 128) position (mod local 128)
+        group (quot position 32) lane (mod position 32)
+        low-index (+ block-offset (* half 64) lane (if (odd? group) 32 0))
+        low-byte (nth bytes low-index)
+        high-byte (nth bytes (+ block-offset 128 (* half 32) lane))
+        low-bits (if (< group 2) (bit-and low-byte 0x0f)
+                     (bit-shift-right low-byte 4))
+        high-bits (bit-and (bit-shift-right high-byte (* group 2)) 0x03)
+        quant (- (bit-or low-bits (bit-shift-left high-bits 4)) 32)
+        scale-index (+ block-offset 192 (* half 8) (quot lane 16) (* group 2))
+        scale (signed-byte (nth bytes scale-index))
+        d (dtype/f16-bits->f32 (packed-u16 bytes (+ block-offset 208)))]
+    (* d scale quant)))
+
 (deftype CpuBackend []
   p/IBackend
   (-backend-name [_] :cpu)
@@ -172,9 +192,10 @@
   (-quantized-from-host [_ bytes params]
     {:bytes (mapv #(bit-and 0xff %) bytes) :params params})
   (-quantized-matmul [_ input weight {:keys [quant-type m k n]}]
-    (when-not (= :q4-k quant-type)
+    (when-not (#{:q4-k :q6-k} quant-type)
       (throw (ex-info "unsupported CPU quantized matmul" {:quant-type quant-type})))
-    (let [^doubles input input bytes (:bytes weight) output (double-array (* m n))]
+    (let [^doubles input input bytes (:bytes weight) output (double-array (* m n))
+          value-at (case quant-type :q4-k q4-k-value :q6-k q6-k-value)]
       (dotimes [row m]
         (dotimes [column n]
           (aset output (+ (* row n) column)
@@ -182,7 +203,7 @@
                   (if (< inner k)
                     (recur (inc inner)
                            (+ sum (* (aget input (+ (* row k) inner))
-                                     (q4-k-value bytes column k inner))))
+                                     (value-at bytes column k inner))))
                     sum)))))
       output))
 

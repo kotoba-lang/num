@@ -1638,6 +1638,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = sum;
 }")
 
+(def q6-k-matmul-wgsl
+  "Dense f32 activations times packed GGML Q6_K weights."
+  "
+struct Params { m: u32, k: u32, n: u32, blocks_per_row: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+fn byte_at(offset: u32) -> u32 {
+  return (weight[offset / 4u] >> ((offset % 4u) * 8u)) & 255u;
+}
+fn signed_byte(offset: u32) -> i32 {
+  let raw = byte_at(offset);
+  return select(i32(raw), i32(raw) - 256, raw >= 128u);
+}
+fn value_at(row: u32, column: u32) -> f32 {
+  let block_index = row * p.blocks_per_row + column / 256u;
+  let block = block_index * 210u; let local = column % 256u;
+  let half = local / 128u; let position = local % 128u;
+  let group = position / 32u; let lane = position % 32u;
+  let low = byte_at(block + half * 64u + lane + select(0u, 32u, group % 2u == 1u));
+  let high = byte_at(block + 128u + half * 32u + lane);
+  let low_bits = select(low & 15u, low >> 4u, group >= 2u);
+  let high_bits = (high >> (group * 2u)) & 3u;
+  let quant = i32(low_bits | (high_bits << 4u)) - 32;
+  let scale = signed_byte(block + 192u + half * 8u + lane / 16u + group * 2u);
+  let d_bits = byte_at(block + 208u) | (byte_at(block + 209u) << 8u);
+  let d = unpack2x16float(d_bits).x;
+  return d * f32(scale * quant);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.m * p.n) { return; }
+  let row = index / p.n; let column = index % p.n;
+  var sum: f32 = 0.0;
+  for (var inner: u32 = 0u; inner < p.k; inner = inner + 1u) {
+    sum = sum + input[row * p.k + inner] * value_at(column, inner);
+  }
+  output[index] = sum;
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -1658,6 +1699,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :rotary-embedding rotary-embedding-wgsl
    :copy-into copy-into-wgsl
    :q4-k-matmul q4-k-matmul-wgsl
+   :q6-k-matmul q6-k-matmul-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl

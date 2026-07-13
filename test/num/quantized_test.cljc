@@ -26,6 +26,14 @@
                                  (* dmin (nth mins index))))))
                (range 8))))
 
+(defn- q6-block [d]
+  (vec (concat (repeat (+ 128 64) 0)
+               (map #(bit-and % 0xff) (range -8 8))
+               (half-bytes d))))
+
+(defn- q6-dense-row [d]
+  (vec (mapcat #(repeat 16 (* d % -32.0)) (range -8 8))))
+
 (deftest q4-k-matmul-matches-dense-oracle-without-expanding-weight
   (let [backend (cpu/cpu-backend)
         bytes (vec (concat (block 0.5 0.25) (block -0.125 0.5)))
@@ -40,6 +48,22 @@
         dense (arr/from-vec backend dense-values [256 2])]
     (is (= [256 2] (:shape weight)))
     (is (= 288 (:byte-count weight)))
+    (is (< (:byte-count weight) (* 4 (arr/nelems (:shape weight)))))
+    (is (contract/approx-vec? (arr/->vec (nm/matmul input dense))
+                              (arr/->vec (q/matmul input weight))))))
+
+(deftest q6-k-matmul-matches-dense-oracle-without-expanding-weight
+  (let [backend (cpu/cpu-backend)
+        bytes (vec (concat (q6-block 0.25) (q6-block -0.125)))
+        weight (q/matrix backend bytes [2 256] :q6-k)
+        input (arr/from-vec backend (repeat 256 1.0) [1 256])
+        dense (arr/from-vec
+               backend
+               (vec (mapcat (fn [inner]
+                              [(nth (q6-dense-row 0.25) inner)
+                               (nth (q6-dense-row -0.125) inner)])
+                            (range 256))) [256 2])]
+    (is (= 420 (:byte-count weight)))
     (is (< (:byte-count weight) (* 4 (arr/nelems (:shape weight)))))
     (is (contract/approx-vec? (arr/->vec (nm/matmul input dense))
                               (arr/->vec (q/matmul input weight))))))

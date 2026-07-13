@@ -10,8 +10,8 @@
   the returned matrix presents `[in,out]` so it composes with `num.core/matmul`."
   [backend bytes source-shape quant-type]
   (let [[out in] source-shape
-        block-size ({:q4-k 256} quant-type)
-        bytes-per-block ({:q4-k 144} quant-type)]
+        block-size ({:q4-k 256 :q6-k 256} quant-type)
+        bytes-per-block ({:q4-k 144 :q6-k 210} quant-type)]
     (when-not (and (= 2 (count source-shape)) block-size bytes-per-block
                    (pos-int? out) (pos-int? in)
                    (zero? (mod in block-size))

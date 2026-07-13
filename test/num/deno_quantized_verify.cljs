@@ -22,25 +22,46 @@
 (def inputs (vec (concat (repeat 256 1.0)
                          (map #(if (even? %) 0.5 -0.25) (range 256)))))
 
-(defn run [backend]
+(defn run-q4 [backend]
   (q/matmul (arr/from-vec backend inputs [2 256])
             (q/matrix backend packed-bytes [2 256] :q4-k)))
+
+(defn q6-block [d]
+  (vec (concat (repeat (+ 128 64) 0)
+               (map #(bit-and % 0xff) (range -8 8))
+               (half-bytes d))))
+
+(def q6-bytes (vec (concat (q6-block 0.25) (q6-block -0.125))))
+
+(defn run-q6 [backend]
+  (q/matmul (arr/from-vec backend inputs [2 256])
+            (q/matrix backend q6-bytes [2 256] :q6-k)))
 
 (defn close? [left right]
   (every? #(< (js/Math.abs %) 2.0e-3) (map - left right)))
 
 (defn -main [& _]
-  (let [expected (arr/->vec (run (cpu/cpu-backend)))]
+  (let [cpu (cpu/cpu-backend)
+        q4-expected (arr/->vec (run-q4 cpu))
+        q6-expected (arr/->vec (run-q6 cpu))]
     (-> (dg/request-device)
         (.then (fn [request]
                  (println "Packed Q4_K matmul on" (dg/adapter-description request))
-                 (arr/->vec (run (dg/backend request)))))
+                 (let [gpu (dg/backend request)]
+                   (js/Promise.all
+                    #js [(arr/->vec (run-q4 gpu))
+                         (arr/->vec (run-q6 gpu))]))))
         (.then (fn [actual]
-                 (let [ok? (close? actual expected)]
+                 (let [q4-ok? (close? (aget actual 0) q4-expected)
+                       q6-ok? (close? (aget actual 1) q6-expected)
+                       ok? (and q4-ok? q6-ok?)]
                    (println (str "Q4_K CPU/Metal parity: "
-                                 (if ok? "passed" "failed")))
+                                 (if q4-ok? "passed" "failed")))
+                   (println (str "Q6_K CPU/Metal parity: "
+                                 (if q6-ok? "passed" "failed")))
                    (when-not ok?
-                     (println "expected=" expected "actual=" actual))
+                     (println "q4 expected=" q4-expected "actual=" (aget actual 0))
+                     (println "q6 expected=" q6-expected "actual=" (aget actual 1)))
                    (js/Deno.exit (if ok? 0 1)))))
         (.catch (fn [error]
                   (println "ERROR:" (or (.-stack error) (str error)))
