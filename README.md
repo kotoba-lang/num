@@ -138,8 +138,11 @@ device-native NCHW convolution is still required for production throughput.
 The same NCHW layer also includes the other structural UNet primitives:
 `silu`, PyTorch-compatible biased-variance `group-norm-nchw`, `cat` for skip
 connections, and integer `upsample-nearest2d`. Their forward values and shape
-validation are hand-checked. Autograd for GroupNorm/SiLU and device-native
-kernels remain open; only `conv2d-nchw*` currently has the full training path.
+validation are hand-checked. `silu*` and `group-norm-nchw*` provide the
+corresponding training path; GroupNorm propagates input plus affine weight/bias
+gradients and the composed GroupNorm→SiLU chain is checked against central
+finite differences. Device-native kernels and gradients for `cat`/upsampling
+remain open.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque

@@ -325,3 +325,106 @@
                    (accumulate! bias
                                 (arr/from-vec (:backend bias-data) (vec db-gradient)
                                               (:shape bias-data)))))))))))
+
+;; --- UNet activations / normalization -----------------------------------------
+
+(defn silu*
+  "Differentiable SiLU. `d/dx silu(x) = sigmoid(x) *
+  (1 + x * (1 - sigmoid(x)))`."
+  [x]
+  (let [input-data (:data x)]
+    (node (t/silu input-data)
+          [x]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [xs (arr/->vec input-data)
+                    gs (arr/->vec g)
+                    dx (mapv (fn [value upstream]
+                               (let [sigmoid (/ 1.0 (+ 1.0 (Math/exp (- (double value)))))
+                                     derivative (* sigmoid
+                                                   (+ 1.0 (* value (- 1.0 sigmoid))))]
+                                 (* upstream derivative)))
+                             xs gs)]
+                (accumulate! x (arr/from-vec (:backend input-data) dx
+                                             (:shape input-data)))))))))
+
+(defn group-norm-nchw*
+  "Differentiable PyTorch-style GroupNorm. Optional affine `weight`/`bias`
+  are Values with shape `[C]`; gradients are accumulated for input and every
+  supplied affine parameter."
+  ([x num-groups] (group-norm-nchw* x num-groups nil nil 1.0e-5))
+  ([x num-groups weight bias eps]
+   (let [input-data (:data x)
+         weight-data (when weight (:data weight))
+         bias-data (when bias (:data bias))
+         output (t/group-norm-nchw input-data num-groups weight-data bias-data eps)
+         [N C H W] (mapv long (:shape input-data))
+         groups (long num-groups)
+         channels-per-group (quot C groups)
+         group-size (* channels-per-group H W)]
+     (node output
+           (cond-> [x] weight (conj weight) bias (conj bias))
+           (fn [self]
+             (when-let [g @(:grad self)]
+               (let [xs (double-array (arr/->vec input-data))
+                     gs (double-array (arr/->vec g))
+                     ws (when weight (double-array (arr/->vec weight-data)))
+                     dx (double-array (* N C H W))
+                     dw (when weight (double-array C))
+                     dbias (when bias (double-array C))]
+                 (dotimes [n N]
+                   (dotimes [group groups]
+                     (let [base (+ (* n C H W) (* group group-size))
+                           mean (/ (loop [i 0 sum 0.0]
+                                     (if (< i group-size)
+                                       (recur (inc i) (+ sum (aget xs (+ base i))))
+                                       sum))
+                                   group-size)
+                           variance (/ (loop [i 0 sum 0.0]
+                                         (if (< i group-size)
+                                           (let [d (- (aget xs (+ base i)) mean)]
+                                             (recur (inc i) (+ sum (* d d))))
+                                           sum))
+                                       group-size)
+                           inv-std (/ 1.0 (Math/sqrt (+ variance eps)))
+                           sum-dy (loop [i 0 sum 0.0]
+                                    (if (< i group-size)
+                                      (let [channel (+ (* group channels-per-group)
+                                                       (quot i (* H W)))
+                                            gamma (if ws (aget ws channel) 1.0)]
+                                        (recur (inc i) (+ sum (* (aget gs (+ base i)) gamma))))
+                                      sum))
+                           sum-dy-xhat
+                           (loop [i 0 sum 0.0]
+                             (if (< i group-size)
+                               (let [channel (+ (* group channels-per-group)
+                                                (quot i (* H W)))
+                                     gamma (if ws (aget ws channel) 1.0)
+                                     xhat (* (- (aget xs (+ base i)) mean) inv-std)]
+                                 (recur (inc i)
+                                        (+ sum (* (aget gs (+ base i)) gamma xhat))))
+                               sum))]
+                       (dotimes [i group-size]
+                         (let [index (+ base i)
+                               channel (+ (* group channels-per-group)
+                                          (quot i (* H W)))
+                               upstream (aget gs index)
+                               gamma (if ws (aget ws channel) 1.0)
+                               xhat (* (- (aget xs index) mean) inv-std)
+                               dx-value (* (/ inv-std group-size)
+                                           (- (* group-size upstream gamma)
+                                              sum-dy
+                                              (* xhat sum-dy-xhat)))]
+                           (aset dx index dx-value)
+                           (when dw
+                             (aset dw channel (+ (aget dw channel) (* upstream xhat))))
+                           (when dbias
+                             (aset dbias channel (+ (aget dbias channel) upstream))))))))
+                 (accumulate! x (arr/from-vec (:backend input-data) (vec dx)
+                                              (:shape input-data)))
+                 (when weight
+                   (accumulate! weight (arr/from-vec (:backend weight-data) (vec dw)
+                                                     (:shape weight-data))))
+                 (when bias
+                   (accumulate! bias (arr/from-vec (:backend bias-data) (vec dbias)
+                                                   (:shape bias-data)))))))))))

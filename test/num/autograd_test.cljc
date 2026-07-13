@@ -244,3 +244,43 @@
           (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
               (str label " analytic=" (arr/->vec analytic)
                    " numeric=" (arr/->vec numeric))))))))
+
+(deftest groupnorm-silu-gradients-match-finite-differences
+  (testing "UNet normalization+activation differentiates NCHW input and both
+            affine parameters, including GroupNorm's coupled group reduction"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1 -0.3 0.8 1.4 -0.9]
+                           [1 4 2 1])
+          wd (arr/from-vec backend [0.8 1.1 -0.7 1.3] [4])
+          bd (arr/from-vec backend [0.1 -0.2 0.05 0.3] [4])
+          target (arr/from-vec backend [0.0 0.2 -0.1 0.5 0.4 -0.3 0.8 0.1]
+                               [1 4 2 1])
+          loss-of
+          (fn [xd' wd' bd']
+            (let [[loss _]
+                  (ag/with-tape
+                    (ag/mse-loss*
+                     (ag/silu*
+                      (ag/group-norm-nchw* (ag/value xd') 2
+                                           (ag/value wd') (ag/value bd') 1.0e-5))
+                     target))]
+              (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) weight (ag/value wd) bias (ag/value bd)
+                  normalized (ag/group-norm-nchw* x 2 weight bias 1.0e-5)
+                  loss (ag/mse-loss* (ag/silu* normalized) target)]
+              {:loss loss :x x :weight weight :bias bias}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["weight" :weight wd] ["bias" :bias bd]]]
+        (let [numeric
+              (numerical-grad
+               (fn [perturbed]
+                 (loss-of (if (= key :x) perturbed xd)
+                          (if (= key :weight) perturbed wd)
+                          (if (= key :bias) perturbed bd)))
+               data 1.0e-5)
+              analytic @(:grad (get result key))]
+          (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+              (str label " analytic=" (arr/->vec analytic)
+                   " numeric=" (arr/->vec numeric))))))))
