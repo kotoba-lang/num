@@ -133,6 +133,15 @@
                       (if (< p z) (recur (inc p) (+ s (* (aget v p) (aget x (aget ci p))))) s)))))
       y))
 
+  p/IMutableBufferOps
+  (-copy-into! [_ destination source offset n dtype*]
+    (let [destination (if (= dtype* :f32) destination (:data destination))
+          source (if (= dtype* :f32) source (:data source))
+          offset (long offset) n (long n)]
+      #?(:clj (System/arraycopy source 0 destination offset n)
+         :cljs (dotimes [i n] (aset destination (+ offset i) (aget source i))))
+      destination))
+
   p/IDTypeStorage
   (-alloc-dtype [_ n dtype*]
     {:dtype dtype*

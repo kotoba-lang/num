@@ -61,6 +61,11 @@
   (-ewise1-dtype [b op xh n dtype])
   (-gemm-dtype [b Ah m k Bh n dtype]))
 
+(defprotocol IMutableBufferOps
+  "Optional bounded device-to-device writes used by preallocated caches."
+  (-copy-into! [b destination-h source-h destination-offset n dtype]
+    "Copy `n` contiguous elements into destination at an element offset."))
+
 (defprotocol IDTypeTensorOps
   "Optional N-D compute operations over physical typed storage."
   (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])

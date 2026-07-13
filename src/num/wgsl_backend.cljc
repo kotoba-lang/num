@@ -131,6 +131,16 @@
       (w/-dispatch dev (get-pipeline dev pipes :spmv) [rp ci v xh y] [(ceil-div m 64) 1 1])
       y))
 
+  p/IMutableBufferOps
+  (-copy-into! [_ destination source offset n dtype*]
+    (when-not (= dtype* :f32)
+      (throw (ex-info "synchronous WGSL copy-into supports f32 only"
+                      {:dtype dtype*})))
+    (w/-dispatch dev (get-pipeline dev pipes :copy-into)
+                 [destination source (uni dev (u32-tag [offset n 0 0]))]
+                 [(ceil-div n 64) 1 1])
+    destination)
+
   p/ITensorBackend
   (-conv2d-nchw [_ input-h weight-h bias-h
                  {:keys [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw groups]}]

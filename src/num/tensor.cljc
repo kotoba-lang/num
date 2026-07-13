@@ -877,6 +877,27 @@
                       (mapv #(* (double factor) %) (arr/->vec copy))
                       shape dtype)))))
 
+(defn copy-into!
+  "Copy all contiguous elements of `source` into preallocated `destination`
+  at a linear element offset. Mutates and returns destination."
+  [destination source destination-offset]
+  (require-same-dtype! "num.tensor/copy-into!" [destination source])
+  (let [backend (:backend destination)
+        offset (long destination-offset)
+        n (arr/nelems (:shape source))
+        capacity (arr/nelems (:shape destination))
+        dtype (array-dtype destination)]
+    (when-not (= backend (:backend source))
+      (throw (ex-info "copy-into arrays must share a backend" {})))
+    (when-not (and (<= 0 offset) (<= (+ offset n) capacity))
+      (throw (ex-info "copy-into destination range is out of bounds"
+                      {:offset offset :count n :capacity capacity})))
+    (when-not (satisfies? p/IMutableBufferOps backend)
+      (throw (ex-info "backend does not support device buffer writes"
+                      {:backend (p/-backend-name backend)})))
+    (p/-copy-into! backend (:handle destination) (:handle source) offset n dtype)
+    destination))
+
 (defn group-norm-nchw
   "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
   (`unbiased=false`), as in `torch.nn.GroupNorm`. Optional affine `weight` and

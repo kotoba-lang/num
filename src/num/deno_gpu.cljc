@@ -256,6 +256,27 @@
            (w/-dispatch dev (wb/get-pipeline dev pipes :spmv) [rp ci v xh y] [(wb/ceil-div m 64) 1 1])
            y))
 
+       p/IMutableBufferOps
+       (-copy-into! [_ destination source offset n dtype*]
+         (case dtype*
+           :f32
+           (w/-dispatch dev (wb/get-pipeline dev pipes :copy-into)
+                        [destination source
+                         (wb/uni dev (wb/u32-tag [offset n 0 0]))]
+                        [(wb/ceil-div n 64) 1 1])
+           :f16
+           (do
+             (when-not (and (even? offset) (even? n))
+               (throw (ex-info "f16 copy-into requires even offset and count"
+                               {:offset offset :count n})))
+             (w/-dispatch dev (wb/get-pipeline dev pipes :copy-into-f16)
+                          [destination source
+                           (wb/uni dev (wb/u32-tag
+                                        [(quot offset 2) (quot n 2) 0 0]))]
+                          [(wb/ceil-div (quot n 2) 64) 1 1]))
+           (throw (ex-info "GPU copy-into supports f32/f16" {:dtype dtype*})))
+         destination)
+
        p/IDTypeStorage
        (-alloc-dtype [_ n dtype*]
          (w/-create-buffer-dtype dev n :storage dtype*))

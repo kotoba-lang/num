@@ -1553,6 +1553,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[word] = pack2x16float(vec2<f32>(rotate(base), second));
 }")
 
+(def copy-into-wgsl
+  "Bounded f32 device-buffer copy into a preallocated destination."
+  "
+struct Params { offset: u32, n: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read_write> destination: array<f32>;
+@group(0) @binding(1) var<storage, read> source: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i < p.n) { destination[p.offset + i] = source[i]; }
+}")
+
+(def copy-into-f16-wgsl
+  "Packed f16 device-buffer copy; caller guarantees even offset/count."
+  "
+struct Params { word_offset: u32, words: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read_write> destination: array<u32>;
+@group(0) @binding(1) var<storage, read> source: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i < p.words) { destination[p.word_offset + i] = source[i]; }
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -1571,6 +1597,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :embedding embedding-wgsl
    :rms-norm rms-norm-wgsl
    :rotary-embedding rotary-embedding-wgsl
+   :copy-into copy-into-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
@@ -1594,6 +1621,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :embedding-f16 embedding-f16-wgsl
    :rms-norm-f16 rms-norm-f16-wgsl
    :rotary-embedding-f16 rotary-embedding-f16-wgsl
+   :copy-into-f16 copy-into-f16-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------
