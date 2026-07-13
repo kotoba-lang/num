@@ -1128,6 +1128,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
    :add-last-axis-bias add-last-axis-bias-wgsl
+   :transpose-2d transpose-2d-wgsl
+   :bias-gradient bias-gradient-wgsl
    :multi-head-attention multi-head-attention-wgsl
    :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl

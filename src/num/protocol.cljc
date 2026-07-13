@@ -80,6 +80,10 @@
     "Concatenate contiguous tensors along an arbitrary axis; returns a new handle.")
   (-add-last-axis-bias [b input-h bias-h params]
     "Broadcast-add a rank-1 bias over every contiguous last-axis row.")
+  (-transpose-2d [b input-h params]
+    "Out-of-place transpose of a contiguous f32 matrix.")
+  (-sum-rows [b input-h params]
+    "Reduce a contiguous f32 matrix over its row axis.")
   (-multi-head-attention [b query-h key-h value-h params]
     "Fused unmasked scaled dot-product attention over rank-2 Q/K/V.")
   (-multi-head-attention-backward [b query-h key-h value-h grad-output-h params]

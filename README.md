@@ -197,12 +197,17 @@ recomputes the stable softmax on-device and returns gradients for Q, K, and V;
 `num.autograd/multi-head-attention*` selects that kernel automatically for an f32
 `ITensorBackend`. A two-head cross-attention fixture (`seqQ=2`, `seqK=3`) verifies
 forward plus all three gradients against the independently decomposed CPU autograd
-graph on real Apple M4 Metal: 4/4 checks pass without gradient readback between ops.
+graph on real Apple M4 Metal. A second graph adds learned Q/K/V/output matrices and
+all four biases, exercising device-native GEMM, 2-D transpose, row reduction, fused
+attention backward, and shared-input gradient accumulation. Together, output and
+all gradients pass 14/14 checks without intermediate host readback.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
 flat contiguous buffer. Except for the native last-axis bias and fused attention
-specializations above, general `broadcast-to`/`transpose`/axis-reductions/`matmul` read
+specializations above, rank-2 same-backend `matmul`, 2-D matrix transpose, and row-sum
+are also device-native (these cover learned Linear backward). General
+`broadcast-to`/arbitrary-rank `transpose`/axis-reductions/batched `matmul` still read
 operands back via `arr/->vec`, compute with plain `double-array` loops (same style as
 `num.cpu`'s reference loops), and re-upload via `arr/from-vec` — correct on ANY backend
 today, but a host round-trip. `reshape`/`squeeze`/`unsqueeze` are the exception: for a

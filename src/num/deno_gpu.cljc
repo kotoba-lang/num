@@ -373,6 +373,20 @@
                          (wb/uni dev (wb/u32-tag [total width 0 0]))]
                         [(wb/ceil-div total 64) 1 1])
            output))
+       (-transpose-2d [_ input-h {:keys [rows cols]}]
+         (let [output (w/-create-buffer dev (* rows cols) :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-2d)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [rows cols]))]
+                        [(wb/ceil-div cols 16) (wb/ceil-div rows 16) 1])
+           output))
+       (-sum-rows [_ input-h {:keys [rows cols]}]
+         (let [output (w/-create-buffer dev cols :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :bias-gradient)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [rows cols]))]
+                        [(wb/ceil-div cols 64) 1 1])
+           output))
        (-multi-head-attention [_ query-h key-h value-h
                                {:keys [seq-q seq-k d-model heads head-dim total]}]
          (let [output (w/-create-buffer dev total :storage)]

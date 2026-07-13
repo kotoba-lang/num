@@ -28,6 +28,20 @@
   [0.3 -0.2 0.5 0.1
    -0.4 0.6 -0.1 0.2])
 
+(def projection-values
+  {:qw [0.2 -0.1 0.0 0.3, 0.1 0.4 -0.2 0.0,
+        -0.3 0.2 0.5 0.1, 0.0 -0.2 0.1 0.4]
+   :kw [0.1 0.0 -0.2 0.3, -0.1 0.5 0.2 0.0,
+        0.4 -0.3 0.1 0.2, 0.2 0.1 -0.1 0.3]
+   :vw [0.3 -0.2 0.1 0.0, 0.0 0.2 0.4 -0.1,
+        -0.2 0.1 0.3 0.5, 0.1 0.0 -0.3 0.2]
+   :ow [0.2 0.1 -0.1 0.3, -0.3 0.4 0.2 0.0,
+        0.1 -0.2 0.5 0.1, 0.0 0.3 -0.1 0.4]
+   :qb [0.01 -0.02 0.03 -0.01]
+   :kb [-0.02 0.01 0.0 0.02]
+   :vb [0.03 0.0 -0.01 0.01]
+   :ob [0.0 0.02 -0.03 0.01]})
+
 (defn- run-graph [backend]
   (let [[graph tape]
         (ag/with-tape
@@ -42,6 +56,37 @@
      :key @(:grad (:k graph))
      :value @(:grad (:v graph))}))
 
+(defn- run-projected-graph [backend]
+  (let [[graph tape]
+        (ag/with-tape
+          (let [x (ag/value (arr/from-vec backend query-values [2 4]))
+                params (into {}
+                             (map (fn [[param-name values]]
+                                    [param-name (ag/value
+                                           (arr/from-vec backend values
+                                                         (if (= 16 (count values))
+                                                           [4 4] [4])))])
+                                  projection-values))
+                project (fn [weight bias]
+                          (ag/add-bias* (ag/matmul* x (get params weight))
+                                        (get params bias)))
+                q (project :qw :qb)
+                k (project :kw :kb)
+                v (project :vw :vb)
+                attention (ag/multi-head-attention* q k v 2)
+                out (ag/add-bias* (ag/matmul* attention (:ow params))
+                                  (:ob params))]
+            {:x x :params params :out out}))]
+    (ag/backward! (:out graph)
+                  (arr/from-vec backend grad-output-values [2 4]) tape)
+    (merge {:projected-out (:data (:out graph))
+            :projected-input @(:grad (:x graph))}
+           (into {}
+                 (map (fn [[param-name parameter]]
+                        [(keyword (str "projected-" (name param-name)))
+                         @(:grad parameter)])
+                      (:params graph))))))
+
 (defn- close? [actual expected]
   (and (= (count actual) (count expected))
        (every? true? (map #(< (js/Math.abs (- %1 %2)) 2.0e-4)
@@ -55,13 +100,16 @@
     (swap! (if ok? pass fail) inc)))
 
 (defn -main [& _]
-  (let [cpu-result (run-graph (cpu/cpu-backend))
+  (let [cpu-backend (cpu/cpu-backend)
+        cpu-result (merge (run-graph cpu-backend)
+                          (run-projected-graph cpu-backend))
         expected (into {} (map (fn [[k a]] [k (arr/->vec a)]) cpu-result))]
     (-> (dg/request-device)
         (.then
          (fn [request]
            (println "Fused attention backward on" (dg/adapter-description request))
-           (let [result (run-graph (dg/backend request))
+           (let [gpu (dg/backend request)
+                 result (merge (run-graph gpu) (run-projected-graph gpu))
                  pass (atom 0)
                  fail (atom 0)]
              (-> (js/Promise.all

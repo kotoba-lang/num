@@ -14,7 +14,8 @@
                 :conv2d-nchw-f16 :group-norm-nchw-f16
                 :conv2d-nchw :group-norm-nchw :upsample-nearest2d :cat-copy
                 :add-last-axis-bias :multi-head-attention
-                :multi-head-attention-backward :spmv]]
+                :multi-head-attention-backward :transpose-2d :bias-gradient
+                :spmv]]
       (is (string? (get w/shaders op)) (str "missing shader: " op))
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"

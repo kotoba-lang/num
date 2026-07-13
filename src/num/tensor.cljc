@@ -246,19 +246,29 @@
        (throw (ex-info "num.tensor/transpose: perm must be a permutation of 0..rank-1"
                         {:shape shape :perm perm})))
      (let [out-shape (mapv shape perm)
-           in-strides (row-major-strides shape)
-           out-strides (row-major-strides out-shape)
-           xs (double-array (arr/->vec a))
-           n (arr/nelems out-shape)
-           out (double-array n)]
-       (dotimes [oi n]
-         (let [out-idx (unravel oi out-shape out-strides)
-               ;; out axis i reads from in axis perm[i]: in-idx[perm[i]] = out-idx[i]
-               in-idx (reduce (fn [v [i p]] (assoc v p (nth out-idx i)))
-                               (vec (repeat r 0))
-                               (map-indexed vector perm))]
-           (aset out oi (aget xs (ravel in-idx in-strides)))))
-       (arr/from-vec (:backend a) (vec out) out-shape)))))
+           backend (:backend a)]
+       (if (and (= r 2) (= perm [1 0]) (= :f32 (array-dtype a))
+                (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray
+                 backend
+                 (p/-transpose-2d backend (:handle a)
+                                  {:rows (long (first shape))
+                                   :cols (long (second shape))})
+                 out-shape)
+                :dtype :f32)
+         (let [in-strides (row-major-strides shape)
+               out-strides (row-major-strides out-shape)
+               xs (double-array (arr/->vec a))
+               n (arr/nelems out-shape)
+               out (double-array n)]
+           (dotimes [oi n]
+             (let [out-idx (unravel oi out-shape out-strides)
+                   ;; out axis i reads from in axis perm[i]: in-idx[perm[i]] = out-idx[i]
+                   in-idx (reduce (fn [v [i p]] (assoc v p (nth out-idx i)))
+                                  (vec (repeat r 0))
+                                  (map-indexed vector perm))]
+               (aset out oi (aget xs (ravel in-idx in-strides)))))
+           (arr/from-vec backend (vec out) out-shape)))))))
 
 ;; --- axis-parameterized reductions ---------------------------------------------
 
@@ -298,7 +308,21 @@
   `opts` is `{:keepdims? bool}` (default false, NumPy/PyTorch convention)."
   ([a] (sum a nil {}))
   ([a axes] (sum a axes {}))
-  ([a axes {:keys [keepdims?] :or {keepdims? false}}] (reduce-axes a axes keepdims? :sum)))
+  ([a axes {:keys [keepdims?] :or {keepdims? false}}]
+   (let [shape (:shape a)
+         backend (:backend a)
+         axes-set (when-not (nil? axes) (normalize-axes (count shape) axes))]
+     (if (and (= 2 (count shape)) (= #{0} axes-set)
+              (= :f32 (array-dtype a))
+              (satisfies? p/ITensorBackend backend))
+       (let [[rows cols] (mapv long shape)
+             out-shape (if keepdims? [1 cols] [cols])]
+         (assoc (arr/->NDArray backend
+                               (p/-sum-rows backend (:handle a)
+                                            {:rows rows :cols cols})
+                               out-shape)
+                :dtype :f32))
+       (reduce-axes a axes keepdims? :sum)))))
 
 (defn amax
   "Max along `axes` (nil = all axes) → NDArray."
@@ -335,27 +359,29 @@
       (when-not (= ka kb)
         (throw (ex-info "num.tensor/matmul: inner dimensions must match"
                          {:shape-a sa :shape-b sb})))
-      (let [batch-a (vec (drop-last 2 sa))
-            batch-b (vec (drop-last 2 sb))
-            batch-shape (broadcast-shapes batch-a batch-b)
-            nb (long (arr/nelems batch-shape))
-            A' (broadcast-to A (into batch-shape [m ka]))
-            B' (broadcast-to B (into batch-shape [ka n]))
-            xa (double-array (arr/->vec A'))
-            xb (double-array (arr/->vec B'))
-            out (double-array (* nb m n))]
-        (dotimes [bi nb]
-          (let [a-off (* bi m ka) b-off (* bi ka n) c-off (* bi m n)]
-            (dotimes [i m]
-              (dotimes [j n]
-                (let [s (loop [l 0 s 0.0]
-                          (if (< l ka)
-                            (recur (inc l)
-                                   (+ s (* (aget xa (+ a-off (* i ka) l))
-                                           (aget xb (+ b-off (* l n) j)))))
-                            s))]
-                  (aset out (+ c-off (* i n) j) s))))))
-        (arr/from-vec (:backend A) (vec out) (into batch-shape [m n]))))))
+      (if (and (= 2 ra rb) (= (:backend A) (:backend B)))
+        (nm/matmul A B)
+        (let [batch-a (vec (drop-last 2 sa))
+              batch-b (vec (drop-last 2 sb))
+              batch-shape (broadcast-shapes batch-a batch-b)
+              nb (long (arr/nelems batch-shape))
+              A' (broadcast-to A (into batch-shape [m ka]))
+              B' (broadcast-to B (into batch-shape [ka n]))
+              xa (double-array (arr/->vec A'))
+              xb (double-array (arr/->vec B'))
+              out (double-array (* nb m n))]
+          (dotimes [bi nb]
+            (let [a-off (* bi m ka) b-off (* bi ka n) c-off (* bi m n)]
+              (dotimes [i m]
+                (dotimes [j n]
+                  (let [s (loop [l 0 s 0.0]
+                            (if (< l ka)
+                              (recur (inc l)
+                                     (+ s (* (aget xa (+ a-off (* i ka) l))
+                                             (aget xb (+ b-off (* l n) j)))))
+                              s))]
+                    (aset out (+ c-off (* i n) j) s))))))
+          (arr/from-vec (:backend A) (vec out) (into batch-shape [m n])))))))
 
 ;; --- softmax (ADR-2607131500 Phase 1) ------------------------------------------
 ;; Everything below reuses ONLY the primitives already real above (amax/sub/sum/
