@@ -51,6 +51,11 @@
                    :main-opts ["-m" "cljs.main"
                                "-co" "{:optimizations :simple :target :nodejs :main num.deno-q8-verify :output-to \"target/deno-q8-verify.cjs\"}"
                                "-c" "num.deno-q8-verify"]}
+  :deno-q8-worker {:extra-paths ["test"]
+                   :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
+                   :main-opts ["-m" "cljs.main"
+                               "-co" "{:optimizations :simple :target :nodejs :main num.deno-q8-worker :output-to \"target/deno-q8-worker.cjs\"}"
+                               "-c" "num.deno-q8-worker"]}
   ;; ADR-2607131500: num.tensor-async (conv2d/attention's Deno-async twins)
   ;; on real Metal, cross-checked against num.tensor's CPU-sync oracle.
   ;;   clojure -M:tensor-async-verify && deno run --allow-all target/tensor-async-verify.cjs
