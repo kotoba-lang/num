@@ -552,3 +552,18 @@
                  (t/multi-head-attention
                   query key value 1
                   {:key-padding-mask (arr/from-vec backend [0 1 0] [3])})))))
+
+(deftest contiguous-axis-slice-and-asymmetric-nchw-padding
+  (let [input (arr/from-vec backend (range 1 17) [2 4 1 2])
+        sliced (t/slice-axis input 1 1 3)
+        image (arr/from-vec backend [1 2, 3 4, 5 6, 7 8] [1 2 2 2])
+        padded (t/pad-right-bottom-nchw image)]
+    (is (= [2 2 1 2] (:shape sliced)))
+    (is (= [3.0 4.0 5.0 6.0, 11.0 12.0 13.0 14.0]
+           (arr/->vec sliced)))
+    (is (= [1 2 3 3] (:shape padded)))
+    (is (= [1.0 2.0 0.0, 3.0 4.0 0.0, 0.0 0.0 0.0,
+            5.0 6.0 0.0, 7.0 8.0 0.0, 0.0 0.0 0.0]
+           (arr/->vec padded)))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/slice-axis input 1 3 5)))))

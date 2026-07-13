@@ -366,6 +366,21 @@
                            (wb/uni dev (wb/u32-tag [total block output-block axis-offset]))]
                           [(wb/ceil-div total 64) 1 1]))
            output))
+       (-slice-axis [_ input-h {:keys [total input-block output-block input-offset]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :slice-axis)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [total input-block output-block input-offset]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-pad-right-bottom-nchw [_ input-h {:keys [total h width output-width]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :pad-right-bottom-nchw)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [total h width output-width]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
        (-add-last-axis-bias [_ input-h bias-h {:keys [total width]}]
          (let [output (w/-create-buffer dev total :storage)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :add-last-axis-bias)

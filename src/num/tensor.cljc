@@ -789,6 +789,78 @@
             (arr/from-vec backend (vec out) out-shape
                           (array-dtype (first tensors)))))))))
 
+(defn slice-axis
+  "Select the half-open contiguous range `[start,end)` along `axis`, matching
+  the basic (step=1) PyTorch slice. Device tensor backends copy device-to-device."
+  [input axis start end]
+  (let [shape (:shape input)
+        rank (count shape)
+        axis (long (if (neg? axis) (+ rank axis) axis))]
+    (when-not (< -1 axis rank)
+      (throw (ex-info "num.tensor/slice-axis axis out of range"
+                      {:axis axis :rank rank})))
+    (let [axis-size (long (nth shape axis))
+          start (long start)
+          end (long end)]
+      (when-not (<= 0 start end axis-size)
+        (throw (ex-info "num.tensor/slice-axis range out of bounds"
+                        {:shape shape :axis axis :start start :end end})))
+      (let [inner (long (arr/nelems (subvec shape (inc axis))))
+            input-block (* axis-size inner)
+            output-block (* (- end start) inner)
+            out-shape (assoc shape axis (- end start))
+            total (arr/nelems out-shape)
+            backend (:backend input)
+            dtype (array-dtype input)]
+        (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+          (assoc (arr/->NDArray
+                  backend
+                  (p/-slice-axis backend (:handle input)
+                                 {:total total :input-block input-block
+                                  :output-block output-block
+                                  :input-offset (* start inner)})
+                  out-shape)
+                 :dtype :f32)
+          (let [source (arr/->vec input)
+                outer (arr/nelems (subvec shape 0 axis))
+                output (vec
+                        (mapcat (fn [outer-index]
+                                  (let [base (+ (* outer-index input-block)
+                                                (* start inner))]
+                                    (subvec source base (+ base output-block))))
+                                (range outer)))]
+            (arr/from-vec backend output out-shape dtype)))))))
+
+(defn pad-right-bottom-nchw
+  "Append one zero column and one zero row to an NCHW tensor. This is the
+  asymmetric padding used by Diffusers AutoencoderKL downsampling."
+  [input]
+  (let [[n c h width :as shape] (:shape input)]
+    (when-not (= 4 (count shape))
+      (throw (ex-info "num.tensor/pad-right-bottom-nchw requires rank-4 NCHW"
+                      {:shape shape})))
+    (let [out-shape [n c (inc h) (inc width)]
+          total (arr/nelems out-shape)
+          backend (:backend input)
+          dtype (array-dtype input)]
+      (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+        (assoc (arr/->NDArray
+                backend
+                (p/-pad-right-bottom-nchw
+                 backend (:handle input)
+                 {:total total :h h :width width :output-width (inc width)})
+                out-shape)
+               :dtype :f32)
+        (let [source (arr/->vec input)
+              output (vec
+                      (for [plane (range (* n c))
+                            y (range (inc h))
+                            x (range (inc width))]
+                        (if (or (= y h) (= x width))
+                          0.0
+                          (nth source (+ (* plane h width) (* y width) x)))))]
+          (arr/from-vec backend output out-shape dtype))))))
+
 (defn group-norm-nchw
   "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
   (`unbiased=false`), as in `torch.nn.GroupNorm`. Optional affine `weight` and

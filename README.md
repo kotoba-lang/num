@@ -170,15 +170,17 @@ padding, and dilation. A 2×4×16×16 grouped fixture plus a depthwise+dilated
 fixture pass against the CPU oracle on Apple M4 Metal. Other backends retain
 the portable host implementation.
 
-The same NCHW layer also includes the other structural UNet primitives:
+The same NCHW layer also includes the other structural UNet/VAE primitives:
 `silu`, PyTorch-compatible biased-variance `group-norm-nchw`, `cat` for skip
-connections, and integer `upsample-nearest2d`. Their forward values and shape
-validation are hand-checked. SiLU dispatches through one device-native unary
+connections, integer `upsample-nearest2d`, contiguous `slice-axis`, and
+`pad-right-bottom-nchw` for Diffusers AutoencoderKL downsampling. Their forward
+values and shape validation are hand-checked. SiLU dispatches through one device-native unary
 WGSL kernel, GroupNorm uses one 256-thread reduction workgroup per normalization
 group, nearest upsampling maps one thread per output, and `cat` uses queue-ordered
 device-to-device slice dispatches. None requires tensor host readback. A complete
-`GroupNorm → SiLU → upsample → skip cat` chain is verified against the CPU oracle
-on Apple M4 Metal, alongside affine and non-affine normalization cases.
+`GroupNorm → SiLU → upsample → skip cat` chain plus slicing and asymmetric
+padding are verified against the CPU oracle on Apple M4 Metal. None of these
+paths downloads intermediate tensors.
 `silu*` and `group-norm-nchw*` provide the
 corresponding training path; GroupNorm propagates input plus affine weight/bias
 gradients and the composed GroupNorm→SiLU chain is checked against central

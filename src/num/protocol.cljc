@@ -78,6 +78,10 @@
     "Integer nearest-neighbor NCHW upsampling; returns a new handle.")
   (-cat [b input-handles params]
     "Concatenate contiguous tensors along an arbitrary axis; returns a new handle.")
+  (-slice-axis [b input-h params]
+    "Copy a contiguous range along one tensor axis into a new handle.")
+  (-pad-right-bottom-nchw [b input-h params]
+    "Append one zero column and row to a contiguous NCHW tensor.")
   (-add-last-axis-bias [b input-h bias-h params]
     "Broadcast-add a rank-1 bias over every contiguous last-axis row.")
   (-transpose-2d [b input-h params]

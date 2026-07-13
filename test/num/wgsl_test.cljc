@@ -13,6 +13,7 @@
                 :ewise-f16 :ewise1-f16 :gemm-f16
                 :conv2d-nchw-f16 :group-norm-nchw-f16
                 :conv2d-nchw :group-norm-nchw :upsample-nearest2d :cat-copy
+                :slice-axis :pad-right-bottom-nchw
                 :add-last-axis-bias :multi-head-attention
                 :multi-head-attention-backward :transpose-2d :bias-gradient
                 :mse-loss :mse-gradient :sgd-step :adamw-step

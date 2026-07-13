@@ -1029,6 +1029,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[outer * d.output_block + d.axis_offset + within] = input[index];
 }")
 
+(def slice-axis-wgsl
+  "Copy a contiguous range from each flattened outer block."
+  "
+struct Dims {
+  total: u32, input_block: u32, output_block: u32, input_offset: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> d: Dims;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  if (index >= d.total) { return; }
+  let outer = index / d.output_block;
+  let within = index % d.output_block;
+  output[index] = input[outer * d.input_block + d.input_offset + within];
+}")
+
+(def pad-right-bottom-nchw-wgsl
+  "Append a zero-valued right column and bottom row to every NCHW plane."
+  "
+struct Dims { total: u32, h: u32, w: u32, output_w: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> d: Dims;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  if (index >= d.total) { return; }
+  let x = index % d.output_w;
+  let y = (index / d.output_w) % (d.h + 1u);
+  if (x == d.w || y == d.h) {
+    output[index] = 0.0;
+  } else {
+    let plane = index / (d.output_w * (d.h + 1u));
+    output[index] = input[(plane * d.h + y) * d.w + x];
+  }
+}")
+
 (def ewise-f16-wgsl
   "Packed physical f16 elementwise arithmetic with f32 evaluation."
   "
@@ -1241,6 +1280,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :group-norm-nchw group-norm-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
+   :slice-axis slice-axis-wgsl
+   :pad-right-bottom-nchw pad-right-bottom-nchw-wgsl
    :add-last-axis-bias add-last-axis-bias-wgsl
    :transpose-2d transpose-2d-wgsl
    :bias-gradient bias-gradient-wgsl

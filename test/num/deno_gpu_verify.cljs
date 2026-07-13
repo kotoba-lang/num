@@ -119,6 +119,14 @@
         exp-cat (arr/->vec
                  (t/cat [(t/upsample-nearest2d (nm/silu cpu-groupnorm) 2)
                          (t/upsample-nearest2d cpu-groupnorm 2)] 1))
+        slice-values (mapv double (range 1 17))
+        exp-slice (arr/->vec
+                   (t/slice-axis (arr/from-vec cpu-b slice-values [2 4 1 2])
+                                 1 1 3))
+        pad-values (mapv double (range 1 9))
+        exp-pad (arr/->vec
+                 (t/pad-right-bottom-nchw
+                  (arr/from-vec cpu-b pad-values [1 2 2 2])))
         adam-options {:learning-rate 0.003 :beta1 0.9 :beta2 0.999
                       :eps 1.0e-8 :weight-decay 0.02}
         adam-gradient-values [0.2 -0.1 0.05 -0.4]
@@ -166,6 +174,10 @@
                  unet-chain-out (t/upsample-nearest2d (nm/silu groupnorm-out) [2 2])
                  cat-out (t/cat [unet-chain-out
                                  (t/upsample-nearest2d groupnorm-out 2)] 1)
+                 slice-out (t/slice-axis
+                            (arr/from-vec gpu slice-values [2 4 1 2]) 1 1 3)
+                 pad-out (t/pad-right-bottom-nchw
+                          (arr/from-vec gpu pad-values [1 2 2 2]))
                  bias-add-out (t/add (arr/from-vec gpu bias-input-values [2 3])
                                      (arr/from-vec gpu bias-values [3]))
                  mha-out (t/multi-head-attention
@@ -226,7 +238,12 @@
                                             (fn [g] (contract/approx-vec? g exp-groupnorm-no-affine))]
                   ["groupnorm-silu-upsample-chain" (->p (arr/->vec unet-chain-out))
                                                     (fn [g] (contract/approx-vec? g exp-unet-chain))]
-                  ["unet-skip-cat" (->p (arr/->vec cat-out))                  (fn [g] (contract/approx-vec? g exp-cat))]]]
+                  ["unet-skip-cat" (->p (arr/->vec cat-out))
+                   (fn [g] (contract/approx-vec? g exp-cat))]
+                  ["slice-axis" (->p (arr/->vec slice-out))
+                   (fn [g] (contract/approx-vec? g exp-slice))]
+                  ["pad-right-bottom-nchw" (->p (arr/->vec pad-out))
+                   (fn [g] (contract/approx-vec? g exp-pad))]]]
              (-> (js/Promise.all
                   (into-array
                    (map (fn [[label prom okfn]]
