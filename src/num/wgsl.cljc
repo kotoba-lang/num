@@ -2044,6 +2044,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[i] = select(pair.x, pair.y, (i & 1u) == 1u);
 }")
 
+(def bf16-to-f32-wgsl
+  "Expand packed bfloat16 storage into one f32 per output element."
+  "
+struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.count) { return; }
+  let word = input[i / 2u];
+  let bits = select((word & 0xffffu) << 16u, word & 0xffff0000u,
+                    (i & 1u) == 1u);
+  output[i] = bitcast<f32>(bits);
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -2072,6 +2088,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :rgb-image-to-nchw rgb-image-to-nchw-wgsl
    :nchw-to-rgb-image nchw-to-rgb-image-wgsl
    :f16-to-f32 f16-to-f32-wgsl
+   :bf16-to-f32 bf16-to-f32-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl

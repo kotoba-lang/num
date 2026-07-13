@@ -805,6 +805,23 @@
          (arr/release! packed)
          output))
 
+     (defn upload-bf16-as-f32-byte-view
+       "Upload encoded bf16 bytes and expand them to f32 entirely on the GPU."
+       [backend bytes shape]
+       ;; Raw bf16 and f16 have the same packed-u16 physical storage. The
+       ;; dedicated shader, rather than the temporary's logical tag, determines
+       ;; how those words are decoded.
+       (let [packed (upload-byte-view backend bytes shape :f16)
+             count (arr/nelems shape)
+             dev (.-dev backend)
+             output (w/-create-buffer dev count :storage)]
+         (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :bf16-to-f32)
+                      [(:handle packed) output
+                       (wb/uni dev (wb/u32-tag [count 0 0 0]))]
+                      [(wb/ceil-div count 64) 1 1])
+         (arr/release! packed)
+         (assoc (arr/->NDArray backend output (vec shape)) :dtype :f32)))
+
      (defn gpu-backend
        "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.
        Mirrors num.cpu/cpu-backend's explicit-construction pattern (num has no
@@ -824,4 +841,5 @@
      (defn upload-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-byte-view requires a cljs/Deno host." {})))
      (defn cast-f16-to-f32 [& _] (throw (ex-info "num.deno-gpu/cast-f16-to-f32 requires a cljs/Deno host." {})))
      (defn upload-f16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-f16-as-f32-byte-view requires a cljs/Deno host." {})))
+     (defn upload-bf16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-bf16-as-f32-byte-view requires a cljs/Deno host." {})))
      (defn gpu-backend [] (throw (ex-info "num.deno-gpu/gpu-backend requires a cljs/Deno host." {})))))

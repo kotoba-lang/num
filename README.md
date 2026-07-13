@@ -363,7 +363,8 @@ or f16 (padding only an odd f16 tail to WebGPU's four-byte write alignment).
 `upload-f16-as-f32-byte-view` follows that upload with a packed-half expansion
 kernel (`unpack2x16float`) and retires the temporary f16 buffer, allowing an f32
 inference graph to consume half-precision checkpoint files without allocating a
-host-side vector of decoded numbers.
+host-side vector of decoded numbers. `upload-bf16-as-f32-byte-view` provides the
+same path for packed bfloat16 by reconstructing each IEEE f32 bit pattern on GPU.
 The live raw-upload gate covers both physical formats and exact buffer cleanup:
 
 ```bash
