@@ -932,6 +932,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = sum;
 }")
 
+(def conv2d-nchw-oc4-wgsl
+  "Groups=1 fast path computing four output channels per invocation so each
+  input element and coordinate calculation is reused across four FMAs."
+  "
+struct Params {
+  n: u32, cin: u32, h: u32, w: u32,
+  cout: u32, cin_group: u32, kh: u32, kw: u32,
+  oh: u32, ow: u32, sh: u32, sw: u32,
+  ph: u32, pw: u32, dh: u32, dw: u32,
+  groups: u32, pad0: u32, pad1: u32, pad2: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  let spatial = p.oh * p.ow;
+  let cout4 = p.cout / 4u;
+  let total = p.n * cout4 * spatial;
+  if (index >= total) { return; }
+  let position = index % spatial;
+  let oj = position % p.ow;
+  let oi = position / p.ow;
+  let oc_block = (index / spatial) % cout4;
+  let batch = index / (spatial * cout4);
+  let oc = oc_block * 4u;
+  var sum = vec4<f32>(bias[oc], bias[oc + 1u], bias[oc + 2u], bias[oc + 3u]);
+  let kernel_size = p.cin * p.kh * p.kw;
+  for (var ic: u32 = 0u; ic < p.cin; ic = ic + 1u) {
+    for (var ki: u32 = 0u; ki < p.kh; ki = ki + 1u) {
+      let ih = i32(oi * p.sh + ki * p.dh) - i32(p.ph);
+      if (ih < 0 || ih >= i32(p.h)) { continue; }
+      for (var kj: u32 = 0u; kj < p.kw; kj = kj + 1u) {
+        let iw = i32(oj * p.sw + kj * p.dw) - i32(p.pw);
+        if (iw < 0 || iw >= i32(p.w)) { continue; }
+        let kernel_index = (ic * p.kh + ki) * p.kw + kj;
+        let x_index = ((batch * p.cin + ic) * p.h + u32(ih)) * p.w + u32(iw);
+        let x = input[x_index];
+        let weights = vec4<f32>(weight[oc * kernel_size + kernel_index],
+                                weight[(oc + 1u) * kernel_size + kernel_index],
+                                weight[(oc + 2u) * kernel_size + kernel_index],
+                                weight[(oc + 3u) * kernel_size + kernel_index]);
+        sum = sum + vec4<f32>(x) * weights;
+      }
+    }
+  }
+  output[(batch * p.cout + oc) * spatial + position] = sum.x;
+  output[(batch * p.cout + oc + 1u) * spatial + position] = sum.y;
+  output[(batch * p.cout + oc + 2u) * spatial + position] = sum.z;
+  output[(batch * p.cout + oc + 3u) * spatial + position] = sum.w;
+}")
+
 (def group-norm-nchw-wgsl
   "Parallel GroupNorm: one 256-thread workgroup reduces and normalizes one
   `[channels/group,H,W]` slice. Variance uses the biased PyTorch definition."
@@ -1277,6 +1332,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl
    :conv2d-nchw conv2d-nchw-wgsl
+   :conv2d-nchw-oc4 conv2d-nchw-oc4-wgsl
    :group-norm-nchw group-norm-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl

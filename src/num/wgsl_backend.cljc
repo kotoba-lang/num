@@ -132,9 +132,12 @@
           bias (or bias-h (w/-create-buffer dev cout :storage))
           params [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw
                   groups 0 0 0]]
-      (w/-dispatch dev (get-pipeline dev pipes :conv2d-nchw)
-                   [input-h weight-h bias output (uni dev (u32-tag params))]
-                   [(ceil-div total 64) 1 1])
+      (let [oc4? (and (= groups 1) (zero? (mod cout 4)))
+            invocations (if oc4? (quot total 4) total)]
+        (w/-dispatch dev (get-pipeline dev pipes
+                                      (if oc4? :conv2d-nchw-oc4 :conv2d-nchw))
+                     [input-h weight-h bias output (uni dev (u32-tag params))]
+                     [(ceil-div invocations 64) 1 1]))
       output))
   (-group-norm-nchw [_ input-h weight-h bias-h
                      {:keys [n c h width groups channels-group group-size eps]}]

@@ -90,6 +90,15 @@
                         (arr/from-vec cpu-b depth-input-values [1 2 4 4])
                         (arr/from-vec cpu-b depth-weight-values [2 1 2 2]) nil
                         {:dilation 2 :groups 2}))
+        oc4-input-values (mapv #(- (* 0.03 %) 0.2) (range 75))
+        oc4-weight-values (mapv #(- (* 0.01 (mod % 11)) 0.05)
+                                 (range (* 8 3 3 3)))
+        oc4-bias-values (mapv #(* 0.02 %) (range 8))
+        exp-oc4 (arr/->vec
+                 (t/conv2d-nchw
+                  (arr/from-vec cpu-b oc4-input-values [1 3 5 5])
+                  (arr/from-vec cpu-b oc4-weight-values [8 3 3 3])
+                  (arr/from-vec cpu-b oc4-bias-values [8]) {:padding 1}))
         norm-input-values (mapv #(- (* 0.011 (mod % 97)) 0.5)
                                 (range (* 2 32 16 16)))
         norm-weight-values (mapv #(+ 0.7 (* 0.01 %)) (range 32))
@@ -168,6 +177,10 @@
                                 (arr/from-vec gpu depth-input-values [1 2 4 4])
                                 (arr/from-vec gpu depth-weight-values [2 1 2 2]) nil
                                 {:dilation 2 :groups 2})
+                 oc4-out (t/conv2d-nchw
+                          (arr/from-vec gpu oc4-input-values [1 3 5 5])
+                          (arr/from-vec gpu oc4-weight-values [8 3 3 3])
+                          (arr/from-vec gpu oc4-bias-values [8]) {:padding 1})
                  groupnorm-out (t/group-norm-nchw
                                 (arr/from-vec gpu norm-input-values [2 32 16 16]) 4
                                 (arr/from-vec gpu norm-weight-values [32])
@@ -238,6 +251,8 @@
                   ["silu"   (->p (arr/->vec (nm/silu cg)))                    (fn [g] (contract/approx-vec? g exp-silu))]
                   ["conv2d-nchw" (->p (arr/->vec conv-out))                    (fn [g] (contract/approx-vec? g exp-conv))]
                   ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]
+                  ["conv2d-output-channel-4" (->p (arr/->vec oc4-out))
+                   (fn [g] (contract/approx-vec? g exp-oc4))]
                   ["groupnorm-nchw" (->p (arr/->vec groupnorm-out))            (fn [g] (contract/approx-vec? g exp-groupnorm))]
                   ["groupnorm-no-affine" (->p (arr/->vec groupnorm-no-affine-out))
                                             (fn [g] (contract/approx-vec? g exp-groupnorm-no-affine))]

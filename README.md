@@ -166,7 +166,10 @@ element-by-element against central finite differences. This removes the
 single-image/single-channel convolution fence for real UNet graphs. WGSL
 backends now implement it device-native through the optional `ITensorBackend`
 protocol; the same kernel covers batches, bias, groups/depthwise, stride,
-padding, and dilation. A 2×4×16×16 grouped fixture plus a depthwise+dilated
+padding, and dilation. For ungrouped convolution with output channels divisible
+by four, a specialized kernel reuses each input load and coordinate calculation
+across four output-channel accumulators; all other shapes retain the general
+kernel. A 2×4×16×16 grouped fixture plus a depthwise+dilated
 fixture pass against the CPU oracle on Apple M4 Metal. Other backends retain
 the portable host implementation.
 
@@ -316,6 +319,7 @@ deno run --allow-all target/deno-gpu-benchmark.cjs
 
 # Full Stable-Diffusion-width 320→320 convolution at latent 64×64
 deno run --allow-all target/deno-gpu-benchmark.cjs full
+deno run --allow-all target/deno-gpu-benchmark.cjs full-f16
 ```
 
 Measured on Apple M4 with input `[1,32,64,64]`, weights `[64,32,3,3]`, and a
@@ -329,8 +333,12 @@ full `NCHW conv(pad=1) → GroupNorm(8) → SiLU` chain:
 
 Warm speedup is **38.02×**, with maximum absolute error `2.38e-6` against the
 CPU oracle. The full-width mode separately measures a real latent-resolution
-`[1,320,64,64] × [320,320,3,3]` convolution: 213.03 ms cold and 184.51 ms warm,
-with its interior constant-input result within `4.51e-7` of the analytic value.
+`[1,320,64,64] × [320,320,3,3]` convolution. The four-output-channel kernel
+reduced it from 184.51 ms to 107.95 ms warm (41.5% lower), with its interior
+constant-input result within `4.51e-7` of the analytic value. Packed physical
+f16 currently takes 714.76 ms on the same case: Deno's Naga rejects native WGSL
+`enable f16` despite the adapter advertising `shader-f16`, so f16 remains a
+correctness/storage path rather than a performance claim.
 These are concrete completed-work measurements, not a claim of PyTorch/MPS-wide
 parity: end-to-end model memory pressure, mixed precision, fusion, and complete
 UNet throughput still require separate benchmarks.
