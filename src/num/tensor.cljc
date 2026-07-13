@@ -438,3 +438,43 @@
         scaled (nm/scal! (/ 1.0 (Math/sqrt d)) scores)
         weights (softmax scaled)]
     (matmul weights V)))
+
+;; --- multi-head attention (2026-07-13 "raise the maturity" loop) ---------------
+
+(defn multi-head-attention
+  "Multi-head scaled dot-product attention — `attention` generalized the way
+  a real transformer/UNet attention block actually needs it (single-head was
+  ADR-2607131500 Phase 1's honest-minimal simplification). `Q` is
+  `[seqQ d_model]`, `K`/`V` are `[seqK d_model]` (cross-attention: seqQ may
+  differ from seqK) — UNLIKE `attention`, `V`'s last dim MUST equal Q/K's
+  `d_model` here (the standard transformer convention: V gets split into
+  heads the same way Q/K do, so heads can concatenate back to `d_model`;
+  `attention` never splits into heads so it tolerates a different `d_v`).
+  `num-heads` must evenly divide `d_model`; `num-heads=1`
+  reduces to EXACTLY `attention`'s own result (see
+  `test/num/tensor_test.cljc`, verified against `attention` directly, not
+  just internally consistent). No batching (a single Q/K/V triple, not a
+  batch of them) and no causal/padding mask — still deferred, same as
+  `attention`'s own scope fence.
+
+  Built from already-real, already-verified primitives only — no new WGSL
+  kernel, no new host-round-trip primitive: `reshape`/`transpose` split
+  `[seq d_model]` into `[num-heads seq d_head]` and merge back, `matmul`
+  handles the per-head matmuls directly (already batched, see its own
+  docstring — no new op needed), `softmax` handles the per-head-per-row
+  normalization (last axis, already correct for a 3-D `[h seqQ seqK]`
+  scores tensor)."
+  [Q K V num-heads]
+  (let [[seqQ d-model] (:shape Q) [seqK _] (:shape K) h (long num-heads)]
+    (when-not (zero? (mod (long d-model) h))
+      (throw (ex-info "num.tensor/multi-head-attention: num-heads must evenly divide d_model"
+                       {:d-model d-model :num-heads h})))
+    (let [d-head (/ (long d-model) h)
+          split-heads (fn [x seq-len] (transpose (reshape x [seq-len h d-head]) [1 0 2]))
+          Qh (split-heads Q seqQ) Kh (split-heads K seqK) Vh (split-heads V seqK)
+          scores (matmul Qh (transpose Kh [0 2 1]))
+          scaled (nm/scal! (/ 1.0 (Math/sqrt d-head)) scores)
+          weights (softmax scaled)
+          heads-out (matmul weights Vh)
+          merged (transpose heads-out [1 0 2])]
+      (reshape merged [seqQ d-model]))))
