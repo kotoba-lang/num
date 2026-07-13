@@ -54,7 +54,7 @@
         blocks (/ cols block-elements) source (decode-base64 (aget command "data"))
         padded (js/Uint8Array. (* 4 (Math/ceil (/ (.-byteLength source) 4))))
         _ (.set padded source)
-        storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
+        storage (bit-or (.-STORAGE usage) (.-COPY_DST usage) (.-COPY_SRC usage))
         qbuf (gpu-buffer device (js/Uint32Array. (.-buffer padded)) storage)
         sbuf (gpu-buffer device (js/Float32Array. #js [0]) storage)
         params (gpu-buffer device (js/Uint32Array. #js [rows cols blocks 0])
@@ -147,12 +147,28 @@
   (let [id (aget command "id") layers (aget command "layers")
         context (aget command "context") kv-heads (aget command "kvHeads")
         head-dim (aget command "headDim") bytes (* layers context kv-heads head-dim 4)
-        storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
+        storage (bit-or (.-STORAGE usage) (.-COPY_DST usage) (.-COPY_SRC usage))
         keys (.createBuffer device #js {:size bytes :usage storage})
         values (.createBuffer device #js {:size bytes :usage storage})]
-    (swap! kv-registry assoc id #js {:keys keys :values values :layers layers
+    (swap! kv-registry assoc id #js {:keys keys :values values :bytes bytes :layers layers
                                      :context context :kvHeads kv-heads :headDim head-dim})
     (reply {:ok true :id id :gpu-bytes (* bytes 2)})))
+
+(defn- clone-kv! [device command]
+  (let [source-id (aget command "source") id (aget command "id")
+        source (get @kv-registry source-id)]
+    (when-not source (throw (js/Error. (str "unknown KV handle: " source-id))))
+    (let [storage (bit-or (.-STORAGE usage) (.-COPY_DST usage) (.-COPY_SRC usage))
+          keys (.createBuffer device #js {:size (.-bytes source) :usage storage})
+          values (.createBuffer device #js {:size (.-bytes source) :usage storage})
+          encoder (.createCommandEncoder device)]
+      (.copyBufferToBuffer encoder (.-keys source) 0 keys 0 (.-bytes source))
+      (.copyBufferToBuffer encoder (.-values source) 0 values 0 (.-bytes source))
+      (.submit (.-queue device) #js [(.finish encoder)])
+      (swap! kv-registry assoc id #js {:keys keys :values values :bytes (.-bytes source)
+                                       :layers (.-layers source) :context (.-context source)
+                                       :kvHeads (.-kvHeads source) :headDim (.-headDim source)})
+      (reply {:ok true :id id :gpu-bytes (* 2 (.-bytes source))}))))
 
 (defn- attention! [device cache-pipeline attention-pipeline command]
   (let [id (aget command "id") entry (get @kv-registry id)]
@@ -253,6 +269,7 @@
                  "gemv-many" (.catch (gemv-many! device command)
                                       #(reply {:ok false :error (.-message %)}))
                  "create-kv" (create-kv! device command)
+                 "clone-kv" (clone-kv! device command)
                  "attention" (.catch (attention! device cache-pipeline attention-pipeline command)
                                       #(reply {:ok false :error (.-message %)}))
                  "release-kv" (release-kv! command)
