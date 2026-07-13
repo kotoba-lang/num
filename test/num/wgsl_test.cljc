@@ -32,6 +32,13 @@
     (is (re-find #"grad_value" shader))
     (is (re-find #"grad_expectation" shader))))
 
+(deftest attention-shaders-cover-batches-and-masks
+  (doseq [shader [(:multi-head-attention w/shaders)
+                  (:multi-head-attention-backward w/shaders)]]
+    (is (re-find #"key_padding_mask" shader))
+    (is (re-find #"p\.causal" shader))
+    (is (re-find #"batch \* p\.seq" shader))))
+
 (deftest backend-namespaces-load
   (testing "the WgslBackend constructor and IGpuDevice port compile on the JVM"
     (is (fn? wb/wgsl-backend))

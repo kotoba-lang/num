@@ -29,6 +29,22 @@
   [0.3 -0.2 0.5 0.1
    -0.4 0.6 -0.1 0.2])
 
+(def batched-query-values
+  [0.2 -0.1, 0.3 0.4,
+   -0.2 0.1, 0.5 -0.3])
+
+(def batched-key-values
+  [0.1 0.3, -0.2 0.4,
+   0.5 -0.1, 0.2 0.0])
+
+(def batched-value-values
+  [0.4 -0.2, 0.1 0.3,
+   -0.1 0.5, 0.2 -0.4])
+
+(def batched-grad-values
+  [0.3 -0.2, 0.5 0.1,
+   -0.4 0.6, -0.1 0.2])
+
 (def projection-values
   {:qw [0.2 -0.1 0.0 0.3, 0.1 0.4 -0.2 0.0,
         -0.3 0.2 0.5 0.1, 0.0 -0.2 0.1 0.4]
@@ -56,6 +72,23 @@
      :query @(:grad (:q graph))
      :key @(:grad (:k graph))
      :value @(:grad (:v graph))}))
+
+(defn- run-batched-masked-graph [backend]
+  (let [padding (arr/from-vec backend [0 1, 0 0] [2 2])
+        opts {:causal? true :key-padding-mask padding}
+        [graph tape]
+        (ag/with-tape
+          (let [q (ag/value (arr/from-vec backend batched-query-values [2 2 2]))
+                k (ag/value (arr/from-vec backend batched-key-values [2 2 2]))
+                v (ag/value (arr/from-vec backend batched-value-values [2 2 2]))]
+            {:q q :k k :v v
+             :out (ag/multi-head-attention* q k v 1 opts)}))]
+    (ag/backward! (:out graph)
+                  (arr/from-vec backend batched-grad-values [2 2 2]) tape)
+    {:batched-masked-out (:data (:out graph))
+     :batched-masked-query @(:grad (:q graph))
+     :batched-masked-key @(:grad (:k graph))
+     :batched-masked-value @(:grad (:v graph))}))
 
 (defn- run-projected-graph [backend]
   (let [[graph tape]
@@ -110,6 +143,7 @@
 (defn -main [& _]
   (let [cpu-backend (cpu/cpu-backend)
         cpu-result (merge (run-graph cpu-backend)
+                          (run-batched-masked-graph cpu-backend)
                           (run-projected-graph cpu-backend))
         expected (into {} (map (fn [[k a]] [k (arr/->vec a)]) cpu-result))]
     (-> (dg/request-device)
@@ -117,7 +151,9 @@
          (fn [request]
            (println "Fused attention backward on" (dg/adapter-description request))
            (let [gpu (dg/backend request)
-                 result (merge (run-graph gpu) (run-projected-graph gpu))
+                 result (merge (run-graph gpu)
+                               (run-batched-masked-graph gpu)
+                               (run-projected-graph gpu))
                  pass (atom 0)
                  fail (atom 0)]
              (-> (js/Promise.all

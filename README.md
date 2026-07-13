@@ -187,10 +187,12 @@ training graph; a branched upsample+channel-concat+SiLU loss matches central
 finite differences for both source tensors.
 
 Transformer forward execution now has two further device-native operations:
-rank-1 last-axis bias broadcasting and fused rank-2 multi-head attention. The
-attention kernel accepts different query/key sequence lengths, performs stable
-per-head softmax, and emits concatenated heads without materializing transpose,
-batched-matmul, or probability tensors on the host. Both kernels match the CPU
+rank-1 last-axis bias broadcasting and fused rank-2/rank-3 multi-head attention.
+The attention kernel accepts batches and different query/key sequence lengths,
+performs stable per-head softmax, and emits concatenated heads without materializing
+transpose, batched-matmul, or probability tensors on the host. `:causal?` and a
+PyTorch-semantics `[batch,seqK]` key-padding mask apply in both forward and backward.
+Both kernels match the CPU
 oracle on Apple M4 Metal and allow learned Q/K/V/output projection attention to
 remain GPU-resident through its complete forward pass. Its fused backward kernel
 recomputes the stable softmax on-device and returns gradients for Q, K, and V;
@@ -202,7 +204,8 @@ all four biases, exercising device-native GEMM, 2-D transpose, row reduction, fu
 attention backward, shared-input gradient accumulation, and a device-resident MSE
 loss reduction/VJP. Immutable SGD updates allocate new GPU buffers while leaving
 the source parameters unchanged. Together, loss, output, all gradients, and all
-eight updated projection tensors pass 23/23 checks without intermediate host
+eight updated projection tensors plus batched causal+padding output/Q/K/V gradients
+pass 27/27 checks without intermediate host
 readback. Only final verification values are downloaded.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**

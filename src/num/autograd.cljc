@@ -299,56 +299,103 @@
         weights (softmax* scaled)]
     (matmul* weights V)))
 
+(defn- add-constant* [x constant]
+  (node (t/add (:data x) constant)
+        [x]
+        (fn [self]
+          (when-let [g @(:grad self)] (accumulate! x g)))))
+
+(defn- attention-mask-nd
+  [backend batch seq-q seq-k causal? key-padding-mask]
+  (when (or causal? key-padding-mask)
+    (let [padding (when key-padding-mask (vec (arr/->vec key-padding-mask)))]
+      (arr/from-vec
+       backend
+       (mapv (fn [index]
+               (let [k (mod index seq-k)
+                     q (mod (quot index seq-k) seq-q)
+                     b (quot index (* seq-q seq-k))]
+                 (if (or (and causal? (> k q))
+                         (and padding
+                              (not (zero? (nth padding (+ (* b seq-k) k))))))
+                   -1.0e30 0.0)))
+             (range (* batch seq-q seq-k)))
+       [batch 1 seq-q seq-k]))))
+
 (defn multi-head-attention*
-  "Differentiable multi-head scaled dot-product attention matching
-  `num.tensor/multi-head-attention`. Q is `[seqQ d-model]`, K/V are
-  `[seqK d-model]`; `num-heads` evenly divides d-model."
-  [Q K V num-heads]
-  (let [[seq-q d-model] (:shape (:data Q))
-        [seq-k k-d-model] (:shape (:data K))
-        [_ v-d-model] (:shape (:data V))
-        heads (long num-heads)]
-    (when-not (and (pos? heads)
-                   (= d-model k-d-model v-d-model)
-                   (zero? (mod (long d-model) heads)))
-      (throw (ex-info "num.autograd/multi-head-attention*: incompatible dimensions"
-                      {:q-shape (:shape (:data Q))
-                       :k-shape (:shape (:data K))
-                       :v-shape (:shape (:data V))
-                       :num-heads heads})))
-    (let [d-head (quot (long d-model) heads)
-          q-data (:data Q) k-data (:data K) v-data (:data V)
-          backend (:backend q-data)
-          fused? (and (= backend (:backend k-data) (:backend v-data))
-                      (= :f32 (:dtype q-data :f32)
-                         (:dtype k-data :f32) (:dtype v-data :f32))
-                      (satisfies? p/ITensorBackend backend))]
-      (if fused?
-        (node
-         (t/multi-head-attention q-data k-data v-data heads)
-         [Q K V]
-         (fn [self]
-           (when-let [g @(:grad self)]
-             (let [params {:seq-q seq-q :seq-k seq-k :d-model d-model
-                           :heads heads :head-dim d-head}
-                   gradients (p/-multi-head-attention-backward
-                              backend (:handle q-data) (:handle k-data)
-                              (:handle v-data) (:handle g) params)
-                   ndarray (fn [handle shape]
-                             (assoc (arr/->NDArray backend handle shape)
-                                    :dtype :f32))]
-               (accumulate! Q (ndarray (:query gradients) [seq-q d-model]))
-               (accumulate! K (ndarray (:key gradients) [seq-k d-model]))
-               (accumulate! V (ndarray (:value gradients) [seq-k d-model]))))))
-        (let [split-heads (fn [x seq-len]
-                            (transpose* (reshape* x [seq-len heads d-head]) [1 0 2]))
-              qh (split-heads Q seq-q)
-              kh (split-heads K seq-k)
-              vh (split-heads V seq-k)
-              scores (matmul* qh (transpose* kh [0 2 1]))
-              weights (softmax* (scale* (/ 1.0 (Math/sqrt d-head)) scores))
-              heads-out (matmul* weights vh)]
-          (reshape* (transpose* heads-out [1 0 2]) [seq-q d-model]))))))
+  "Differentiable rank-2/rank-3 multi-head attention, including causal and
+  key-padding masks. Options match `num.tensor/multi-head-attention`."
+  ([Q K V num-heads] (multi-head-attention* Q K V num-heads {}))
+  ([Q K V num-heads {:keys [causal? key-padding-mask] :as opts
+                      :or {causal? false}}]
+   (let [q-data (:data Q) k-data (:data K) v-data (:data V)
+         q-shape (:shape q-data) k-shape (:shape k-data)
+         v-shape (:shape v-data) rank (count q-shape)
+         [batch seq-q d-model] (if (= rank 2) (into [1] q-shape) q-shape)
+         [k-batch seq-k k-d-model] (if (= rank 2) (into [1] k-shape) k-shape)
+         expected-mask (if (= rank 2) [seq-k] [batch seq-k])
+         heads (long num-heads)]
+     (when-not (and (#{2 3} rank) (= rank (count k-shape) (count v-shape))
+                    (= k-shape v-shape) (= batch k-batch)
+                    (= d-model k-d-model) (pos? heads)
+                    (zero? (mod (long d-model) heads))
+                    (or (nil? key-padding-mask)
+                        (= (:shape key-padding-mask) expected-mask)
+                        (and (= rank 2)
+                             (= (:shape key-padding-mask) [1 seq-k]))))
+       (throw (ex-info "num.autograd/multi-head-attention*: incompatible dimensions or mask"
+                       {:query q-shape :key k-shape :value v-shape
+                        :key-padding-mask (:shape key-padding-mask)
+                        :num-heads heads})))
+     (let [d-head (quot (long d-model) heads)
+           backend (:backend q-data)
+           output-shape (if (= rank 2) [seq-q d-model] [batch seq-q d-model])
+           fused? (and (= backend (:backend k-data) (:backend v-data))
+                       (or (nil? key-padding-mask)
+                           (= backend (:backend key-padding-mask)))
+                       (= :f32 (:dtype q-data :f32)
+                          (:dtype k-data :f32) (:dtype v-data :f32))
+                       (satisfies? p/ITensorBackend backend))]
+       (if fused?
+         (node
+          (t/multi-head-attention q-data k-data v-data heads opts)
+          [Q K V]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [params {:batch batch :seq-q seq-q :seq-k seq-k
+                            :d-model d-model :heads heads :head-dim d-head
+                            :causal? causal?
+                            :has-key-padding-mask? (boolean key-padding-mask)}
+                    gradients (p/-multi-head-attention-backward
+                               backend (:handle q-data) (:handle k-data)
+                               (:handle v-data)
+                               (when key-padding-mask (:handle key-padding-mask))
+                               (:handle g) params)
+                    ndarray (fn [handle shape]
+                              (assoc (arr/->NDArray backend handle shape)
+                                     :dtype :f32))]
+                (accumulate! Q (ndarray (:query gradients) q-shape))
+                (accumulate! K (ndarray (:key gradients) k-shape))
+                (accumulate! V (ndarray (:value gradients) (:shape v-data)))))))
+         (let [q3 (if (= rank 2) (reshape* Q [1 seq-q d-model]) Q)
+               k3 (if (= rank 2) (reshape* K [1 seq-k d-model]) K)
+               v3 (if (= rank 2) (reshape* V [1 seq-k d-model]) V)
+               split-heads (fn [x seq-len]
+                             (transpose* (reshape* x [batch seq-len heads d-head])
+                                         [0 2 1 3]))
+               qh (split-heads q3 seq-q)
+               kh (split-heads k3 seq-k)
+               vh (split-heads v3 seq-k)
+               scores (scale* (/ 1.0 (Math/sqrt d-head))
+                              (matmul* qh (transpose* kh [0 1 3 2])))
+               mask (attention-mask-nd backend batch seq-q seq-k
+                                       causal? key-padding-mask)
+               masked (if mask (add-constant* scores mask) scores)
+               weights (softmax* masked)
+               heads-out (matmul* weights vh)
+               merged (reshape* (transpose* heads-out [0 2 1 3])
+                                [batch seq-q d-model])]
+           (if (= rank 2) (reshape* merged output-shape) merged)))))))
 (defn- pair-option [value]
   (mapv long (if (sequential? value) value [value value])))
 

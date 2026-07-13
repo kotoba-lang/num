@@ -90,7 +90,8 @@
     "MSE vector-Jacobian product as a device-resident tensor handle.")
   (-sgd-step [b parameter-h gradient-h params]
     "Out-of-place immutable SGD update as a new device tensor handle.")
-  (-multi-head-attention [b query-h key-h value-h params]
-    "Fused unmasked scaled dot-product attention over rank-2 Q/K/V.")
-  (-multi-head-attention-backward [b query-h key-h value-h grad-output-h params]
+  (-multi-head-attention [b query-h key-h value-h key-padding-mask-h params]
+    "Fused batched scaled dot-product attention with causal/padding masks.")
+  (-multi-head-attention-backward [b query-h key-h value-h key-padding-mask-h
+                                   grad-output-h params]
     "Fused attention backward; returns {:query :key :value} gradient handles."))

@@ -580,16 +580,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 (def multi-head-attention-wgsl
   "Fused rank-2 Q/K/V multi-head attention with stable online softmax passes."
   "
-struct Params { seq_q: u32, seq_k: u32, model: u32, heads: u32,
-                head_dim: u32, total: u32, pad0: u32, pad1: u32 }
+struct Params { batch: u32, seq_q: u32, seq_k: u32, model: u32, heads: u32,
+                head_dim: u32, total: u32, causal: u32, has_mask: u32,
+                pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> key: array<f32>;
 @group(0) @binding(2) var<storage, read> value: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> p: Params;
-fn score(row: u32, head: u32, token: u32) -> f32 {
-  let qbase = row * p.model + head * p.head_dim;
-  let kbase = token * p.model + head * p.head_dim;
+@group(0) @binding(3) var<storage, read> key_padding_mask: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> p: Params;
+fn allowed(batch: u32, row: u32, token: u32) -> bool {
+  return !((p.causal != 0u && token > row) ||
+           (p.has_mask != 0u && key_padding_mask[batch * p.seq_k + token] != 0.0));
+}
+fn score(batch: u32, row: u32, head: u32, token: u32) -> f32 {
+  let qbase = (batch * p.seq_q + row) * p.model + head * p.head_dim;
+  let kbase = (batch * p.seq_k + token) * p.model + head * p.head_dim;
   var sum: f32 = 0.0;
   for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
     sum = sum + query[qbase + d] * key[kbase + d];
@@ -599,76 +605,92 @@ fn score(row: u32, head: u32, token: u32) -> f32 {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x; if (i >= p.total) { return; }
-  let row = i / p.model; let component = i % p.model;
+  let flat_row = i / p.model; let batch = flat_row / p.seq_q;
+  let row = flat_row % p.seq_q; let component = i % p.model;
   let head = component / p.head_dim;
   var maximum: f32 = -3.402823e38;
   for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
-    maximum = max(maximum, score(row, head, token));
+    if (allowed(batch, row, token)) {
+      maximum = max(maximum, score(batch, row, head, token));
+    }
   }
   var denominator: f32 = 0.0; var result: f32 = 0.0;
   for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
-    let weight = exp(score(row, head, token) - maximum);
-    denominator = denominator + weight;
-    result = result + weight * value[token * p.model + component];
+    if (allowed(batch, row, token)) {
+      let weight = exp(score(batch, row, head, token) - maximum);
+      denominator = denominator + weight;
+      result = result + weight * value[(batch * p.seq_k + token) * p.model + component];
+    }
   }
-  output[i] = result / denominator;
+  output[i] = select(0.0, result / denominator, denominator > 0.0);
 }")
 
 (def multi-head-attention-backward-wgsl
   "Recompute stable softmax and produce Q/K/V gradients without host tensors."
   "
-struct Params { seq_q: u32, seq_k: u32, model: u32, heads: u32,
-                head_dim: u32, total_q: u32, total_k: u32, total: u32 }
+struct Params { batch: u32, seq_q: u32, seq_k: u32, model: u32, heads: u32,
+                head_dim: u32, total_q: u32, total_k: u32, total: u32,
+                causal: u32, has_mask: u32, pad0: u32 }
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> key: array<f32>;
 @group(0) @binding(2) var<storage, read> value: array<f32>;
-@group(0) @binding(3) var<storage, read> grad_output: array<f32>;
-@group(0) @binding(4) var<storage, read_write> grad_query: array<f32>;
-@group(0) @binding(5) var<storage, read_write> grad_key: array<f32>;
-@group(0) @binding(6) var<storage, read_write> grad_value: array<f32>;
-@group(0) @binding(7) var<uniform> p: Params;
-fn score(row: u32, head: u32, token: u32) -> f32 {
-  let qb = row * p.model + head * p.head_dim;
-  let kb = token * p.model + head * p.head_dim;
+@group(0) @binding(3) var<storage, read> key_padding_mask: array<f32>;
+@group(0) @binding(4) var<storage, read> grad_output: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_query: array<f32>;
+@group(0) @binding(6) var<storage, read_write> grad_key: array<f32>;
+@group(0) @binding(7) var<storage, read_write> grad_value: array<f32>;
+@group(0) @binding(8) var<uniform> p: Params;
+fn allowed(batch: u32, row: u32, token: u32) -> bool {
+  return !((p.causal != 0u && token > row) ||
+           (p.has_mask != 0u && key_padding_mask[batch * p.seq_k + token] != 0.0));
+}
+fn score(batch: u32, row: u32, head: u32, token: u32) -> f32 {
+  let qb = (batch * p.seq_q + row) * p.model + head * p.head_dim;
+  let kb = (batch * p.seq_k + token) * p.model + head * p.head_dim;
   var sum: f32 = 0.0;
   for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
     sum = sum + query[qb + d] * key[kb + d];
   }
   return sum * inverseSqrt(f32(p.head_dim));
 }
-fn softmax_max(row: u32, head: u32) -> f32 {
+fn softmax_max(batch: u32, row: u32, head: u32) -> f32 {
   var maximum: f32 = -3.402823e38;
   for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
-    maximum = max(maximum, score(row, head, k));
+    if (allowed(batch, row, k)) {
+      maximum = max(maximum, score(batch, row, head, k));
+    }
   }
   return maximum;
 }
-fn softmax_denominator(row: u32, head: u32, maximum: f32) -> f32 {
+fn softmax_denominator(batch: u32, row: u32, head: u32, maximum: f32) -> f32 {
   var denominator: f32 = 0.0;
   for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
-    denominator = denominator + exp(score(row, head, k) - maximum);
+    if (allowed(batch, row, k)) {
+      denominator = denominator + exp(score(batch, row, head, k) - maximum);
+    }
   }
   return denominator;
 }
-fn probability(row: u32, head: u32, token: u32,
+fn probability(batch: u32, row: u32, head: u32, token: u32,
                maximum: f32, denominator: f32) -> f32 {
-  return exp(score(row, head, token) - maximum) / denominator;
+  if (!allowed(batch, row, token) || denominator == 0.0) { return 0.0; }
+  return exp(score(batch, row, head, token) - maximum) / denominator;
 }
-fn grad_probability(row: u32, head: u32, token: u32) -> f32 {
-  let ob = row * p.model + head * p.head_dim;
-  let vb = token * p.model + head * p.head_dim;
+fn grad_probability(batch: u32, row: u32, head: u32, token: u32) -> f32 {
+  let ob = (batch * p.seq_q + row) * p.model + head * p.head_dim;
+  let vb = (batch * p.seq_k + token) * p.model + head * p.head_dim;
   var sum: f32 = 0.0;
   for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
     sum = sum + grad_output[ob + d] * value[vb + d];
   }
   return sum;
 }
-fn grad_expectation(row: u32, head: u32,
+fn grad_expectation(batch: u32, row: u32, head: u32,
                     maximum: f32, denominator: f32) -> f32 {
   var expected: f32 = 0.0;
   for (var k: u32 = 0u; k < p.seq_k; k = k + 1u) {
-    expected = expected + probability(row, head, k, maximum, denominator) *
-                          grad_probability(row, head, k);
+    expected = expected + probability(batch, row, head, k, maximum, denominator) *
+                          grad_probability(batch, row, head, k);
   }
   return expected;
 }
@@ -676,30 +698,32 @@ fn grad_expectation(row: u32, head: u32,
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x; let scale = inverseSqrt(f32(p.head_dim));
   if (i < p.total_q) {
-    let row = i / p.model; let component = i % p.model;
+    let flat_row = i / p.model; let batch = flat_row / p.seq_q;
+    let row = flat_row % p.seq_q; let component = i % p.model;
     let head = component / p.head_dim;
-    let maximum = softmax_max(row, head);
-    let denominator = softmax_denominator(row, head, maximum);
-    let expected = grad_expectation(row, head, maximum, denominator);
+    let maximum = softmax_max(batch, row, head);
+    let denominator = softmax_denominator(batch, row, head, maximum);
+    let expected = grad_expectation(batch, row, head, maximum, denominator);
     var dq: f32 = 0.0;
     for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
-      let prob = probability(row, head, token, maximum, denominator);
-      let ds = prob * (grad_probability(row, head, token) - expected);
-      dq = dq + ds * key[token * p.model + component] * scale;
+      let prob = probability(batch, row, head, token, maximum, denominator);
+      let ds = prob * (grad_probability(batch, row, head, token) - expected);
+      dq = dq + ds * key[(batch * p.seq_k + token) * p.model + component] * scale;
     }
     grad_query[i] = dq;
   }
   if (i < p.total_k) {
-    let token = i / p.model; let component = i % p.model;
+    let flat_token = i / p.model; let batch = flat_token / p.seq_k;
+    let token = flat_token % p.seq_k; let component = i % p.model;
     let head = component / p.head_dim; var dk: f32 = 0.0; var dv: f32 = 0.0;
     for (var row: u32 = 0u; row < p.seq_q; row = row + 1u) {
-      let maximum = softmax_max(row, head);
-      let denominator = softmax_denominator(row, head, maximum);
-      let prob = probability(row, head, token, maximum, denominator);
-      let expected = grad_expectation(row, head, maximum, denominator);
-      let ds = prob * (grad_probability(row, head, token) - expected);
-      dk = dk + ds * query[row * p.model + component] * scale;
-      dv = dv + prob * grad_output[row * p.model + component];
+      let maximum = softmax_max(batch, row, head);
+      let denominator = softmax_denominator(batch, row, head, maximum);
+      let prob = probability(batch, row, head, token, maximum, denominator);
+      let expected = grad_expectation(batch, row, head, maximum, denominator);
+      let ds = prob * (grad_probability(batch, row, head, token) - expected);
+      dk = dk + ds * query[(batch * p.seq_q + row) * p.model + component] * scale;
+      dv = dv + prob * grad_output[(batch * p.seq_q + row) * p.model + component];
     }
     grad_key[i] = dk; grad_value[i] = dv;
   }
