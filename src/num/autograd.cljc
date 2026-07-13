@@ -111,6 +111,26 @@
           (when-let [g @(:grad self)]
             (accumulate! x (nm/mul g (relu-grad (:data x))))))))
 
+(defn sigmoid*
+  "Differentiable sigmoid. Its derivative is evaluated from the saved output,
+  so both the forward and backward remain backend-native."
+  [x]
+  (let [y (nm/sigmoid (:data x))]
+    (node y [x]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (accumulate! x (nm/mul g (nm/sigmoid-gradient y))))))))
+
+(defn tanh*
+  "Differentiable hyperbolic tangent with a backend-native `1 - y^2`
+  derivative evaluated from the saved output."
+  [x]
+  (let [y (nm/tanh (:data x))]
+    (node y [x]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (accumulate! x (nm/mul g (nm/tanh-gradient y))))))))
+
 (defn softmax*
   "y = softmax(x) along the last axis. Standard softmax-Jacobian-vector
   product: dL/dx_i = y_i * (dL/dy_i - sum_j(dL/dy_j * y_j)) (per row)."

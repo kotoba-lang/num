@@ -355,8 +355,9 @@ UNet throughput still require separate benchmarks.
 This cross-checks the live GPU backend against `num.cpu`'s reference oracle (dispatched
 through `num.core`/`num.array`, i.e. through `IBackend`, the same seam any real caller
 uses) — **verified passing on real Apple M4 Metal hardware while building this**:
-`Deno WgslBackendAsync ≡ CPU oracle: 26 passed, 0 failed` (BLAS, reductions,
-sparse matvec, unary exp/relu/neg/SiLU, full NCHW/depthwise convolution, and
+`Deno WgslBackendAsync ≡ CPU oracle: 41 passed, 0 failed` (BLAS, reductions,
+sparse matvec, unary exp/relu/neg/SiLU/sigmoid/tanh and activation derivatives,
+full NCHW/depthwise convolution, and
 affine/non-affine GroupNorm, upsampling, skip concatenation, bias broadcasting,
 and fused multi-head attention).
 
@@ -390,7 +391,7 @@ types, the full op contract) compiles to JS via ClojureScript and runs green on 
 **Apple M4/M1 Metal** three separate ways now: the standalone harness
 (`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
 (`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
-`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 32/32 against the CPU
+`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 41/41 against the CPU
 oracle). So num-clj
 genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
 longer only exercised by a script outside the Clojure dispatch seam.

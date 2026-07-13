@@ -65,7 +65,11 @@
               :exp #(Math/exp %)
               :relu #(max % 0.0)
               :neg -
-              :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v))))))]
+              :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v)))))
+              :sigmoid (fn [v] (/ 1.0 (+ 1.0 (Math/exp (- v)))))
+              :tanh #(Math/tanh %)
+              :sigmoid-gradient (fn [y] (* y (- 1.0 y)))
+              :tanh-gradient (fn [y] (- 1.0 (* y y))))]
       (dotimes [i n] (aset z i (double (f (aget x i)))))
       z))
 
@@ -140,7 +144,11 @@
               :exp #(Math/exp %)
               :relu #(max % 0.0)
               :neg -
-              :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v))))))]
+              :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v)))))
+              :sigmoid (fn [v] (/ 1.0 (+ 1.0 (Math/exp (- v)))))
+              :tanh #(Math/tanh %)
+              :sigmoid-gradient (fn [y] (* y (- 1.0 y)))
+              :tanh-gradient (fn [y] (- 1.0 (* y y))))]
       (typed-handle dtype* (mapv f (take n (typed-values xh))))))
   (-gemm-dtype [_ Ah m k Bh n dtype*]
     (let [A (typed-values Ah) B (typed-values Bh)]

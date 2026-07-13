@@ -52,6 +52,29 @@
            (range n))
      shape)))
 
+(deftest sigmoid-and-tanh-gradients-match-finite-differences
+  (testing "smooth activation gradients match independent central differences"
+    (let [xd (arr/from-vec backend [-2.0 -0.4 0.0 0.7 2.0] [5])
+          target (arr/from-vec backend [0.1 -0.2 0.3 0.4 -0.1] [5])]
+      (doseq [[label activation]
+              [["sigmoid" ag/sigmoid*] ["tanh" ag/tanh*]]]
+        (let [loss-of (fn [input]
+                        (let [[loss _]
+                              (ag/with-tape
+                                (ag/mse-loss* (activation (ag/value input)) target))]
+                          (arr/->scalar (:data loss))))
+              [result tape]
+              (ag/with-tape
+                (let [x (ag/value xd)
+                      loss (ag/mse-loss* (activation x) target)]
+                  {:x x :loss loss}))
+              _ (ag/backward! (:loss result)
+                              (arr/from-vec backend [1.0] []) tape)
+              numeric (numerical-grad loss-of xd 1.0e-5)]
+          (is (approx-vec-tol? (arr/->vec @(:grad (:x result)))
+                               (arr/->vec numeric) 1.0e-4)
+              label))))))
+
 (deftest linear-relu-linear-softmax-mse-gradients-match-finite-differences
   (testing "every weight/bias array's analytic gradient matches a central-
             difference numerical estimate to ~1e-3 (finite-difference's own

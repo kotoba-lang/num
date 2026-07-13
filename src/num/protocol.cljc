@@ -32,7 +32,7 @@
 
   ;; elementwise + reduction -------------------------------------------------
   (-ewise [b op xh yh n] "op ∈ #{:add :sub :mul :div}; returns a NEW handle z=op(x,y).")
-  (-ewise1 [b op xh n] "UNARY elementwise; op ∈ #{:exp :relu :neg :silu}; returns a NEW handle z=op(x).")
+  (-ewise1 [b op xh n] "UNARY elementwise activation/derivative; returns a NEW handle z=op(x).")
   (-reduce [b op xh n] "op ∈ #{:sum :max :min}; → host scalar.")
 
   ;; level-2 / level-3 BLAS (dense, row-major) -------------------------------

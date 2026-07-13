@@ -76,6 +76,14 @@
 (defn relu [x] (ewise1 :relu x))
 (defn neg [x] (ewise1 :neg x))
 (defn silu [x] (ewise1 :silu x))
+(defn sigmoid [x] (ewise1 :sigmoid x))
+(defn tanh [x] (ewise1 :tanh x))
+(defn sigmoid-gradient
+  "Elementwise sigmoid derivative from an already-computed sigmoid output."
+  [y] (ewise1 :sigmoid-gradient y))
+(defn tanh-gradient
+  "Elementwise tanh derivative from an already-computed tanh output."
+  [y] (ewise1 :tanh-gradient y))
 
 (defn sum [x] (p/-reduce (be x) :sum (:handle x) (n1 x)))
 (defn amax [x] (p/-reduce (be x) :max (:handle x) (n1 x)))

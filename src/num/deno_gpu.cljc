@@ -212,7 +212,11 @@
        (-ewise1 [_ op xh n]
          (let [z (w/-create-buffer dev n :storage)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1)
-                        [xh z (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)]))]
+                        [xh z (wb/uni
+                               dev (wb/u32-tag
+                                    [({:exp 0 :relu 1 :neg 2 :silu 3
+                                       :sigmoid 4 :tanh 5
+                                       :sigmoid-gradient 6 :tanh-gradient 7} op)]))]
                         [(wb/ceil-div n 64) 1 1])
            z))
 
@@ -278,7 +282,9 @@
          (let [output (w/-create-buffer-dtype dev n :storage :f16)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1-f16)
                         [xh output
-                         (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)
+                         (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3
+                                                   :sigmoid 4 :tanh 5
+                                                   :sigmoid-gradient 6 :tanh-gradient 7} op)
                                                   n 0 0]))]
                         [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
            output))
