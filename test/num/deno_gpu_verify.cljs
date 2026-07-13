@@ -118,7 +118,19 @@
                        (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5)
         exp-cat (arr/->vec
                  (t/cat [(t/upsample-nearest2d (nm/silu cpu-groupnorm) 2)
-                         (t/upsample-nearest2d cpu-groupnorm 2)] 1))]
+                         (t/upsample-nearest2d cpu-groupnorm 2)] 1))
+        adam-options {:learning-rate 0.003 :beta1 0.9 :beta2 0.999
+                      :eps 1.0e-8 :weight-decay 0.02}
+        adam-gradient-values [0.2 -0.1 0.05 -0.4]
+        cpu-adam-1 (t/adamw-step
+                    (arr/from-vec cpu-b [1.0 -2.0 0.5 3.0] [4])
+                    (arr/from-vec cpu-b adam-gradient-values [4])
+                    nil nil 1 adam-options)
+        cpu-adam-2 (t/adamw-step
+                    (:parameter cpu-adam-1)
+                    (arr/from-vec cpu-b adam-gradient-values [4])
+                    (:moment cpu-adam-1) (:variance cpu-adam-1)
+                    2 adam-options)]
     (-> (dg/request-device)
         (.then
          (fn [r]
@@ -160,6 +172,15 @@
                           (arr/from-vec gpu query-values [2 4])
                           (arr/from-vec gpu key-values [3 4])
                           (arr/from-vec gpu value-values [3 4]) 2)
+                 gpu-adam-1 (t/adamw-step
+                             (arr/from-vec gpu [1.0 -2.0 0.5 3.0] [4])
+                             (arr/from-vec gpu adam-gradient-values [4])
+                             nil nil 1 adam-options)
+                 gpu-adam-2 (t/adamw-step
+                             (:parameter gpu-adam-1)
+                             (arr/from-vec gpu adam-gradient-values [4])
+                             (:moment gpu-adam-1) (:variance gpu-adam-1)
+                             2 adam-options)
                  checks
                  [["dot"    (->p (nm/dot xg yg))                              (fn [g] (contract/approx? g exp-dot))]
                   ["nrm2"   (->p (nm/nrm2 (arr/from-vec gpu [3 4] [2])))      (fn [g] (contract/approx? g exp-nrm2))]
@@ -177,6 +198,12 @@
                   ["matmul" (->p (arr/->vec (nm/matmul Ag Bg)))               (fn [g] (contract/approx-vec? g exp-matmul))]
                   ["bias-add" (->p (arr/->vec bias-add-out))                  (fn [g] (contract/approx-vec? g exp-bias-add))]
                   ["multi-head-attention" (->p (arr/->vec mha-out))           (fn [g] (contract/approx-vec? g exp-mha))]
+                  ["adamw-parameter-step2" (->p (arr/->vec (:parameter gpu-adam-2)))
+                   (fn [g] (contract/approx-vec? g (arr/->vec (:parameter cpu-adam-2))))]
+                  ["adamw-moment-step2" (->p (arr/->vec (:moment gpu-adam-2)))
+                   (fn [g] (contract/approx-vec? g (arr/->vec (:moment cpu-adam-2))))]
+                  ["adamw-variance-step2" (->p (arr/->vec (:variance gpu-adam-2)))
+                   (fn [g] (contract/approx-vec? g (arr/->vec (:variance cpu-adam-2))))]
                   ["spmv"   (->p (arr/->vec (nm/spmv gpu csr xsg)))           (fn [g] (contract/approx-vec? g exp-spmv))]
                   ["exp"    (->p (arr/->vec (nm/exp cg)))                     (fn [g] (contract/approx-vec? g exp-exp))]
                   ["relu"   (->p (arr/->vec (nm/relu cg)))                    (fn [g] (contract/approx-vec? g exp-relu))]

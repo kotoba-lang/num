@@ -839,6 +839,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[i] = parameter[i] - learning_rate * gradient[i];
 }")
 
+(def adamw-step-wgsl
+  "Fused out-of-place AdamW parameter and optimizer-slot update."
+  "
+@group(0) @binding(0) var<storage, read> parameter: array<f32>;
+@group(0) @binding(1) var<storage, read> gradient: array<f32>;
+@group(0) @binding(2) var<storage, read> moment: array<f32>;
+@group(0) @binding(3) var<storage, read> variance: array<f32>;
+@group(0) @binding(4) var<storage, read_write> next_parameter: array<f32>;
+@group(0) @binding(5) var<storage, read_write> next_moment: array<f32>;
+@group(0) @binding(6) var<storage, read_write> next_variance: array<f32>;
+struct Hyper {
+  learning_rate: f32, beta1: f32, beta2: f32, eps: f32,
+  weight_decay: f32, correction1: f32, correction2: f32, pad0: f32,
+}
+@group(0) @binding(7) var<uniform> h: Hyper;
+@group(0) @binding(8) var<uniform> count: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= count) { return; }
+  let m = h.beta1 * moment[i] + (1.0 - h.beta1) * gradient[i];
+  let v = h.beta2 * variance[i] + (1.0 - h.beta2) * gradient[i] * gradient[i];
+  let adaptive = (m / h.correction1) /
+                 (sqrt(v / h.correction2) + h.eps);
+  next_moment[i] = m;
+  next_variance[i] = v;
+  next_parameter[i] = parameter[i] - h.learning_rate *
+                      (adaptive + h.weight_decay * parameter[i]);
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."
@@ -1200,6 +1229,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :mse-loss mse-loss-wgsl
    :mse-gradient mse-gradient-wgsl
    :sgd-step sgd-step-wgsl
+   :adamw-step adamw-step-wgsl
    :multi-head-attention multi-head-attention-wgsl
    :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl

@@ -90,6 +90,8 @@
     "MSE vector-Jacobian product as a device-resident tensor handle.")
   (-sgd-step [b parameter-h gradient-h params]
     "Out-of-place immutable SGD update as a new device tensor handle.")
+  (-adamw-step [b parameter-h gradient-h moment-h variance-h params]
+    "Fused immutable AdamW update; returns {:parameter :moment :variance} handles.")
   (-multi-head-attention [b query-h key-h value-h key-padding-mask-h params]
     "Fused batched scaled dot-product attention with causal/padding masks.")
   (-multi-head-attention-backward [b query-h key-h value-h key-padding-mask-h

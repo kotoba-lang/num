@@ -502,6 +502,26 @@
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (t/sgd-step parameter (arr/from-vec backend [1.0] [1]) 0.1)))))
 
+(deftest immutable-adamw-step-preserves-inputs-and-slots
+  (let [parameter (arr/from-vec backend [1.0 -2.0] [2])
+        gradient (arr/from-vec backend [0.5 -0.25] [2])
+        options {:learning-rate 0.01 :beta1 0.9 :beta2 0.999
+                 :eps 1.0e-8 :weight-decay 0.1}
+        first (t/adamw-step parameter gradient nil nil 1 options)
+        second (t/adamw-step (:parameter first) gradient
+                             (:moment first) (:variance first) 2 options)]
+    (is (= [1.0 -2.0] (arr/->vec parameter)))
+    (is (every? #(< (Math/abs %) 1.0e-12)
+                (map - [0.05 -0.025] (arr/->vec (:moment first)))))
+    (is (every? #(< (Math/abs %) 1.0e-12)
+                (map - [0.00025 0.0000625]
+                     (arr/->vec (:variance first)))))
+    (is (every? #(< (Math/abs %) 1.0e-7)
+                (map - [0.989 -1.988]
+                     (arr/->vec (:parameter first)))))
+    (is (not= (arr/->vec (:parameter first))
+              (arr/->vec (:parameter second))))))
+
 (deftest batched-causal-padding-multi-head-attention
   (let [query (arr/from-vec backend (repeat 12 0.0) [2 3 2])
         key (arr/from-vec backend (repeat 12 0.0) [2 3 2])

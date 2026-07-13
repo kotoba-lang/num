@@ -220,6 +220,61 @@
                           (arr/->vec parameter) (arr/->vec gradient))
                     (:shape parameter) (array-dtype parameter)))))
 
+(defn adamw-step
+  "Immutable fused AdamW update of parameter, first moment, and variance.
+
+  `moment` and `variance` may be nil on the first step. Device backends allocate
+  zero slots without host transfer; the portable oracle has identical math."
+  [parameter gradient moment variance step
+   {:keys [learning-rate beta1 beta2 eps weight-decay]}]
+  (let [shape (:shape parameter)
+        backend (:backend parameter)
+        dtype (array-dtype parameter)
+        inputs (remove nil? [parameter gradient moment variance])]
+    (when-not (and (pos-int? step)
+                   (every? #(= shape (:shape %)) inputs)
+                   (every? #(= backend (:backend %)) inputs)
+                   (every? #(= dtype (array-dtype %)) inputs))
+      (throw (ex-info "num.tensor/adamw-step: incompatible tensors or step"
+                      {:shape shape :step step})))
+    (when-not (and (pos? learning-rate) (< 0.0 beta1 1.0)
+                   (< 0.0 beta2 1.0) (pos? eps)
+                   (not (neg? weight-decay)))
+      (throw (ex-info "num.tensor/adamw-step: invalid options"
+                      {:options {:learning-rate learning-rate :beta1 beta1
+                                 :beta2 beta2 :eps eps
+                                 :weight-decay weight-decay}})))
+    (let [count (arr/nelems shape)
+          correction1 (- 1.0 (Math/pow beta1 step))
+          correction2 (- 1.0 (Math/pow beta2 step))]
+      (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+        (let [{:keys [parameter moment variance]}
+              (p/-adamw-step backend (:handle parameter) (:handle gradient)
+                             (:handle moment) (:handle variance)
+                             {:count count :learning-rate learning-rate
+                              :beta1 beta1 :beta2 beta2 :eps eps
+                              :weight-decay weight-decay
+                              :correction1 correction1
+                              :correction2 correction2})
+              array #(assoc (arr/->NDArray backend % shape) :dtype :f32)]
+          {:parameter (array parameter) :moment (array moment)
+           :variance (array variance)})
+        (let [ps (arr/->vec parameter) gs (arr/->vec gradient)
+              ms (if moment (arr/->vec moment) (repeat count 0.0))
+              vs (if variance (arr/->vec variance) (repeat count 0.0))
+              next-m (mapv #(+ (* beta1 %1) (* (- 1.0 beta1) %2)) ms gs)
+              next-v (mapv #(+ (* beta2 %1) (* (- 1.0 beta2) %2 %2)) vs gs)
+              next-p (mapv (fn [p m v]
+                             (let [m-hat (/ m correction1)
+                                   v-hat (/ v correction2)]
+                               (- p (* learning-rate
+                                       (+ (/ m-hat (+ (Math/sqrt v-hat) eps))
+                                          (* weight-decay p))))))
+                           ps next-m next-v)]
+          {:parameter (arr/from-vec backend next-p shape dtype)
+           :moment (arr/from-vec backend next-m shape dtype)
+           :variance (arr/from-vec backend next-v shape dtype)})))))
+
 ;; --- reshape / transpose / squeeze / unsqueeze --------------------------------
 
 (defn reshape

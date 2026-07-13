@@ -205,6 +205,24 @@
                     (uni dev (u32-tag [count]))]
                    [(ceil-div count 64) 1 1])
       output))
+  (-adamw-step [_ parameter-h gradient-h moment-h variance-h
+                {:keys [count learning-rate beta1 beta2 eps weight-decay
+                        correction1 correction2]}]
+    (let [moment (or moment-h (w/-create-buffer dev count :storage))
+          variance (or variance-h (w/-create-buffer dev count :storage))
+          next-parameter (w/-create-buffer dev count :storage)
+          next-moment (w/-create-buffer dev count :storage)
+          next-variance (w/-create-buffer dev count :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :adamw-step)
+                   [parameter-h gradient-h moment variance
+                    next-parameter next-moment next-variance
+                    (uni dev (mapv double
+                                   [learning-rate beta1 beta2 eps weight-decay
+                                    correction1 correction2 0.0]))
+                    (uni dev (u32-tag [count]))]
+                   [(ceil-div count 64) 1 1])
+      {:parameter next-parameter :moment next-moment
+       :variance next-variance}))
   (-multi-head-attention [_ query-h key-h value-h key-padding-mask-h
                           {:keys [batch seq-q seq-k d-model heads head-dim total
                                   causal? has-key-padding-mask?]}]

@@ -202,8 +202,11 @@ forward plus all three gradients against the independently decomposed CPU autogr
 graph on real Apple M4 Metal. A second graph adds learned Q/K/V/output matrices and
 all four biases, exercising device-native GEMM, 2-D transpose, row reduction, fused
 attention backward, shared-input gradient accumulation, and a device-resident MSE
-loss reduction/VJP. Immutable SGD updates allocate new GPU buffers while leaving
-the source parameters unchanged. Together, loss, output, all gradients, and all
+loss reduction/VJP. Immutable SGD and fused AdamW updates allocate new GPU buffers
+while leaving source parameters and optimizer slots unchanged. AdamW updates the
+parameter, first moment, and variance in one dispatch with bias correction and
+decoupled weight decay; nil first-step slots are zero-allocated on-device. Together,
+loss, output, all gradients, and all
 eight updated projection tensors plus batched causal+padding output/Q/K/V gradients
 pass 27/27 checks without intermediate host
 readback. Only final verification values are downloaded.
@@ -358,7 +361,7 @@ types, the full op contract) compiles to JS via ClojureScript and runs green on 
 **Apple M4/M1 Metal** three separate ways now: the standalone harness
 (`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
 (`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
-`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 26/26 against the CPU
+`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 29/29 against the CPU
 oracle). So num-clj
 genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
 longer only exercised by a script outside the Clojure dispatch seam.
