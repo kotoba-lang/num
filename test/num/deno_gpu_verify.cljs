@@ -57,6 +57,19 @@
         B (arr/from-vec cpu-b [5 6 7 8] [2 2])
         exp-matvec (arr/->vec (nm/matvec A xv))
         exp-matmul (arr/->vec (nm/matmul A B))
+        bias-input-values [0.1 0.2 0.3, -0.1 -0.2 -0.3]
+        bias-values [1.0 -0.5 0.25]
+        exp-bias-add (arr/->vec
+                      (t/add (arr/from-vec cpu-b bias-input-values [2 3])
+                             (arr/from-vec cpu-b bias-values [3])))
+        query-values [0.2 -0.1 0.3 0.4, -0.2 0.1 0.5 -0.3]
+        key-values [0.1 0.3 -0.2 0.4, 0.5 -0.1 0.2 0.0, -0.3 0.2 0.1 0.6]
+        value-values [0.4 -0.2 0.1 0.3, -0.1 0.5 0.2 -0.4, 0.3 0.1 -0.2 0.6]
+        exp-mha (arr/->vec
+                 (t/multi-head-attention
+                  (arr/from-vec cpu-b query-values [2 4])
+                  (arr/from-vec cpu-b key-values [3 4])
+                  (arr/from-vec cpu-b value-values [3 4]) 2))
         csr (sp/dense->csr 2 3 [1 0 2 0 3 0])
         xs (arr/from-vec cpu-b [1 1 1] [3])
         exp-spmv (arr/->vec (nm/spmv cpu-b csr xs))
@@ -141,6 +154,12 @@
                  unet-chain-out (t/upsample-nearest2d (nm/silu groupnorm-out) [2 2])
                  cat-out (t/cat [unet-chain-out
                                  (t/upsample-nearest2d groupnorm-out 2)] 1)
+                 bias-add-out (t/add (arr/from-vec gpu bias-input-values [2 3])
+                                     (arr/from-vec gpu bias-values [3]))
+                 mha-out (t/multi-head-attention
+                          (arr/from-vec gpu query-values [2 4])
+                          (arr/from-vec gpu key-values [3 4])
+                          (arr/from-vec gpu value-values [3 4]) 2)
                  checks
                  [["dot"    (->p (nm/dot xg yg))                              (fn [g] (contract/approx? g exp-dot))]
                   ["nrm2"   (->p (nm/nrm2 (arr/from-vec gpu [3 4] [2])))      (fn [g] (contract/approx? g exp-nrm2))]
@@ -156,6 +175,8 @@
                   ["amin"   (->p (nm/amin ag))                                (fn [g] (contract/approx? g exp-amin))]
                   ["matvec" (->p (arr/->vec (nm/matvec Ag xvg)))              (fn [g] (contract/approx-vec? g exp-matvec))]
                   ["matmul" (->p (arr/->vec (nm/matmul Ag Bg)))               (fn [g] (contract/approx-vec? g exp-matmul))]
+                  ["bias-add" (->p (arr/->vec bias-add-out))                  (fn [g] (contract/approx-vec? g exp-bias-add))]
+                  ["multi-head-attention" (->p (arr/->vec mha-out))           (fn [g] (contract/approx-vec? g exp-mha))]
                   ["spmv"   (->p (arr/->vec (nm/spmv gpu csr xsg)))           (fn [g] (contract/approx-vec? g exp-spmv))]
                   ["exp"    (->p (arr/->vec (nm/exp cg)))                     (fn [g] (contract/approx-vec? g exp-exp))]
                   ["relu"   (->p (arr/->vec (nm/relu cg)))                    (fn [g] (contract/approx-vec? g exp-relu))]

@@ -230,6 +230,457 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   y[i] = s;
 }")
 
+(def q8-0-gemv-wgsl
+  "GGML Q8_0 GEMV without an intermediate dequantized matrix. Quants are
+  packed four signed bytes per u32; scales are one f32 per 32-value block."
+  "
+@group(0) @binding(0) var<storage, read>       q: array<u32>;
+@group(0) @binding(1) var<storage, read>       scales: array<f32>;
+@group(0) @binding(2) var<storage, read>       x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform>             d: vec3<u32>; // rows, cols, blocks/row
+
+fn signed_byte(byte_index: u32) -> f32 {
+  let word = q[byte_index / 4u];
+  let raw = (word >> ((byte_index % 4u) * 8u)) & 255u;
+  return f32(select(i32(raw), i32(raw) - 256, raw >= 128u));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= d.x) { return; }
+  var sum: f32 = 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let scale = scales[row * d.z + block];
+    let qbase = (row * d.z + block) * 32u;
+    let xbase = block * 32u;
+    for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+      sum = sum + scale * signed_byte(qbase + i) * x[xbase + i];
+    }
+  }
+  y[row] = sum;
+}")
+
+(def q4-0-gemv-wgsl
+  "GGML Q4_0 GEMV without dense dequantization. Each 32-value block stores
+  sixteen bytes; low nibbles are columns 0..15 and high nibbles 16..31."
+  "
+@group(0) @binding(0) var<storage, read>       q: array<u32>;
+@group(0) @binding(1) var<storage, read>       scales: array<f32>;
+@group(0) @binding(2) var<storage, read>       x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform>             d: vec3<u32>; // rows, cols, blocks/row
+
+fn packed_byte(byte_index: u32) -> u32 {
+  let word = q[byte_index / 4u];
+  return (word >> ((byte_index % 4u) * 8u)) & 255u;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= d.x) { return; }
+  var sum: f32 = 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let scale = scales[row * d.z + block];
+    let qbase = (row * d.z + block) * 16u;
+    let xbase = block * 32u;
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+      let packed = packed_byte(qbase + i);
+      sum = sum + scale * (f32(packed & 15u) - 8.0) * x[xbase + i];
+      sum = sum + scale * (f32(packed >> 4u) - 8.0) * x[xbase + i + 16u];
+    }
+  }
+  y[row] = sum;
+}")
+
+(def q4-k-gemv-wgsl
+  "GGML Q4_K GEMV directly over its 256-value, 144-byte superblocks."
+  "
+@group(0) @binding(0) var<storage, read>       raw: array<u32>;
+@group(0) @binding(1) var<storage, read>       dummy: array<f32>;
+@group(0) @binding(2) var<storage, read>       x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform>             d: vec3<u32>; // rows, cols, blocks/row
+
+fn byte_at(index: u32) -> u32 {
+  return (raw[index / 4u] >> ((index % 4u) * 8u)) & 255u;
+}
+fn group_scale(base: u32, group: u32) -> u32 {
+  if (group < 4u) { return byte_at(base + 4u + group) & 63u; }
+  return (byte_at(base + 8u + group) & 15u) |
+         (((byte_at(base + group) >> 6u) & 3u) << 4u);
+}
+fn group_min(base: u32, group: u32) -> u32 {
+  if (group < 4u) { return byte_at(base + 8u + group) & 63u; }
+  return ((byte_at(base + 8u + group) >> 4u) & 15u) |
+         (((byte_at(base + 4u + group) >> 6u) & 3u) << 4u);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= d.x) { return; }
+  var sum: f32 = dummy[0] * 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let base = (row * d.z + block) * 144u;
+    let dm = unpack2x16float(raw[base / 4u]);
+    for (var group: u32 = 0u; group < 8u; group = group + 1u) {
+      let scale = f32(group_scale(base, group));
+      let minimum = f32(group_min(base, group));
+      let qbase = base + 16u + (group / 2u) * 32u;
+      let xbase = block * 256u + group * 32u;
+      for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+        let packed = byte_at(qbase + i);
+        let q = select(packed & 15u, packed >> 4u, group % 2u == 1u);
+        sum = sum + (dm.x * scale * f32(q) - dm.y * minimum) * x[xbase + i];
+      }
+    }
+  }
+  y[row] = sum;
+}")
+
+(def q5-0-gemv-wgsl
+  "GGML Q5_0 GEMV over 32-value, 22-byte blocks."
+  "
+@group(0) @binding(0) var<storage, read>       raw: array<u32>;
+@group(0) @binding(1) var<storage, read>       dummy: array<f32>;
+@group(0) @binding(2) var<storage, read>       x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform>             d: vec3<u32>;
+fn byte_at(index: u32) -> u32 {
+  return (raw[index / 4u] >> ((index % 4u) * 8u)) & 255u;
+}
+fn high_bit(base: u32, index: u32) -> u32 {
+  return ((byte_at(base + 2u + index / 8u) >> (index % 8u)) & 1u) << 4u;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= d.x) { return; }
+  var sum: f32 = dummy[0] * 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let base = (row * d.z + block) * 22u;
+    let pair = unpack2x16float(raw[base / 4u]);
+    let scale = select(pair.x, pair.y, base % 4u == 2u);
+    let xbase = block * 32u;
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+      let packed = byte_at(base + 6u + i);
+      let lo = (packed & 15u) | high_bit(base, i);
+      let hi = (packed >> 4u) | high_bit(base, i + 16u);
+      sum = sum + scale * (f32(lo) - 16.0) * x[xbase + i];
+      sum = sum + scale * (f32(hi) - 16.0) * x[xbase + i + 16u];
+    }
+  }
+  y[row] = sum;
+}")
+
+(def q5-1-gemv-wgsl
+  "GGML Q5_1 GEMV over 32-value, 24-byte blocks."
+  "
+@group(0) @binding(0) var<storage, read>       raw: array<u32>;
+@group(0) @binding(1) var<storage, read>       dummy: array<f32>;
+@group(0) @binding(2) var<storage, read>       x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform>             d: vec3<u32>;
+fn byte_at(index: u32) -> u32 {
+  return (raw[index / 4u] >> ((index % 4u) * 8u)) & 255u;
+}
+fn high_bit(base: u32, index: u32) -> u32 {
+  return ((byte_at(base + 4u + index / 8u) >> (index % 8u)) & 1u) << 4u;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= d.x) { return; }
+  var sum: f32 = dummy[0] * 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let base = (row * d.z + block) * 24u;
+    let dm = unpack2x16float(raw[base / 4u]);
+    let xbase = block * 32u;
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+      let packed = byte_at(base + 8u + i);
+      let lo = (packed & 15u) | high_bit(base, i);
+      let hi = (packed >> 4u) | high_bit(base, i + 16u);
+      sum = sum + (dm.x * f32(lo) + dm.y) * x[xbase + i];
+      sum = sum + (dm.x * f32(hi) + dm.y) * x[xbase + i + 16u];
+    }
+  }
+  y[row] = sum;
+}")
+
+(def q5-k-gemv-wgsl
+  "GGML Q5_K GEMV directly over 176-byte superblocks."
+  "
+@group(0) @binding(0) var<storage, read> raw: array<u32>;
+@group(0) @binding(1) var<storage, read> dummy: array<f32>;
+@group(0) @binding(2) var<storage, read> x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform> d: vec3<u32>;
+fn byte_at(i: u32) -> u32 { return (raw[i / 4u] >> ((i % 4u) * 8u)) & 255u; }
+fn gs(b: u32, g: u32) -> u32 {
+  if (g < 4u) { return byte_at(b + 4u + g) & 63u; }
+  return (byte_at(b + 8u + g) & 15u) | (((byte_at(b + g) >> 6u) & 3u) << 4u);
+}
+fn gm(b: u32, g: u32) -> u32 {
+  if (g < 4u) { return byte_at(b + 8u + g) & 63u; }
+  return ((byte_at(b + 8u + g) >> 4u) & 15u) |
+         (((byte_at(b + 4u + g) >> 6u) & 3u) << 4u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x; if (row >= d.x) { return; }
+  var sum: f32 = dummy[0] * 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let b = (row * d.z + block) * 176u;
+    let dm = unpack2x16float(raw[b / 4u]);
+    for (var g: u32 = 0u; g < 8u; g = g + 1u) {
+      for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+        let packed = byte_at(b + 48u + (g / 2u) * 32u + i);
+        let low = select(packed & 15u, packed >> 4u, g % 2u == 1u);
+        let high = ((byte_at(b + 16u + i) >> g) & 1u) << 4u;
+        let q = low | high;
+        sum = sum + (dm.x * f32(gs(b, g)) * f32(q) - dm.y * f32(gm(b, g))) *
+                    x[block * 256u + g * 32u + i];
+      }
+    }
+  }
+  y[row] = sum;
+}")
+
+(def q6-k-gemv-wgsl
+  "GGML Q6_K GEMV directly over signed 6-bit, 210-byte superblocks."
+  "
+@group(0) @binding(0) var<storage, read> raw: array<u32>;
+@group(0) @binding(1) var<storage, read> dummy: array<f32>;
+@group(0) @binding(2) var<storage, read> x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform> d: vec3<u32>;
+fn byte_at(i: u32) -> u32 { return (raw[i / 4u] >> ((i % 4u) * 8u)) & 255u; }
+fn signed_byte(i: u32) -> i32 {
+  let v = byte_at(i); return select(i32(v), i32(v) - 256, v >= 128u);
+}
+fn half_at(i: u32) -> f32 {
+  let p = unpack2x16float(raw[i / 4u]); return select(p.x, p.y, i % 4u == 2u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x; if (row >= d.x) { return; }
+  var sum: f32 = dummy[0] * 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let b = (row * d.z + block) * 210u; let scale = half_at(b + 208u);
+    for (var hb: u32 = 0u; hb < 2u; hb = hb + 1u) {
+      for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+        let la = byte_at(b + hb * 64u + i);
+        let lb = byte_at(b + hb * 64u + 32u + i);
+        let hi = byte_at(b + 128u + hb * 32u + i);
+        let qs = array<i32, 4>(i32((la & 15u) | ((hi & 3u) << 4u)) - 32,
+          i32((lb & 15u) | (((hi >> 2u) & 3u) << 4u)) - 32,
+          i32((la >> 4u) | (((hi >> 4u) & 3u) << 4u)) - 32,
+          i32((lb >> 4u) | (((hi >> 6u) & 3u) << 4u)) - 32);
+        for (var seg: u32 = 0u; seg < 4u; seg = seg + 1u) {
+          let si = hb * 8u + seg * 2u + i / 16u;
+          let weight = scale * f32(signed_byte(b + 192u + si)) * f32(qs[seg]);
+          sum = sum + weight * x[block * 256u + hb * 128u + seg * 32u + i];
+        }
+      }
+    }
+  }
+  y[row] = sum;
+}")
+
+(def kv-cache-write-wgsl
+  "Write the current token's RoPE-transformed K/V vectors into a persistent,
+  layer-major KV cache."
+  "
+struct Params { heads: u32, kv_heads: u32, head_dim: u32, position: u32,
+                context: u32, layer: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> k: array<f32>;
+@group(0) @binding(1) var<storage, read> v: array<f32>;
+@group(0) @binding(2) var<storage, read_write> keys: array<f32>;
+@group(0) @binding(3) var<storage, read_write> values: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; let width = p.kv_heads * p.head_dim;
+  if (i >= width) { return; }
+  let base = (p.layer * p.context + p.position) * width;
+  keys[base + i] = k[i]; values[base + i] = v[i];
+}")
+
+(def causal-gqa-attention-wgsl
+  "Causal grouped-query attention over a persistent KV cache. Each invocation
+  computes one output component using stable online softmax passes."
+  "
+struct Params { heads: u32, kv_heads: u32, head_dim: u32, position: u32,
+                context: u32, layer: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> keys: array<f32>;
+@group(0) @binding(2) var<storage, read> values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn score(head: u32, kv_head: u32, past: u32) -> f32 {
+  let width = p.kv_heads * p.head_dim;
+  let kb = (p.layer * p.context + past) * width + kv_head * p.head_dim;
+  let qb = head * p.head_dim; var sum: f32 = 0.0;
+  for (var i: u32 = 0u; i < p.head_dim; i = i + 1u) {
+    sum = sum + q[qb + i] * keys[kb + i];
+  }
+  return sum * inverseSqrt(f32(p.head_dim));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.heads * p.head_dim) { return; }
+  let head = index / p.head_dim; let component = index % p.head_dim;
+  let grouped = p.heads / p.kv_heads; let kv_head = head / grouped;
+  var maximum: f32 = -3.402823e38;
+  for (var past: u32 = 0u; past <= p.position; past = past + 1u) {
+    maximum = max(maximum, score(head, kv_head, past));
+  }
+  var denominator: f32 = 0.0; var result: f32 = 0.0;
+  let width = p.kv_heads * p.head_dim;
+  for (var past: u32 = 0u; past <= p.position; past = past + 1u) {
+    let weight = exp(score(head, kv_head, past) - maximum);
+    let vb = (p.layer * p.context + past) * width + kv_head * p.head_dim;
+    denominator = denominator + weight;
+    result = result + weight * values[vb + component];
+  }
+  output[index] = result / denominator;
+}")
+
+(def transpose-2d-wgsl
+  "Out-of-place row-major matrix transpose used by GPU backpropagation."
+  "
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec2<u32>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let col = gid.x; let row = gid.y;
+  if (row < dims.x && col < dims.y) {
+    output[col * dims.x + row] = input[row * dims.y + col];
+  }
+}")
+
+(def add-last-axis-bias-wgsl
+  "Broadcast a rank-1 bias over contiguous rows."
+  "
+struct Params { total: u32, width: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.total) { return; }
+  output[i] = input[i] + bias[i % p.width];
+}")
+
+(def multi-head-attention-wgsl
+  "Fused rank-2 Q/K/V multi-head attention with stable online softmax passes."
+  "
+struct Params { seq_q: u32, seq_k: u32, model: u32, heads: u32,
+                head_dim: u32, total: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key: array<f32>;
+@group(0) @binding(2) var<storage, read> value: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn score(row: u32, head: u32, token: u32) -> f32 {
+  let qbase = row * p.model + head * p.head_dim;
+  let kbase = token * p.model + head * p.head_dim;
+  var sum: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    sum = sum + query[qbase + d] * key[kbase + d];
+  }
+  return sum * inverseSqrt(f32(p.head_dim));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.total) { return; }
+  let row = i / p.model; let component = i % p.model;
+  let head = component / p.head_dim;
+  var maximum: f32 = -3.402823e38;
+  for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
+    maximum = max(maximum, score(row, head, token));
+  }
+  var denominator: f32 = 0.0; var result: f32 = 0.0;
+  for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
+    let weight = exp(score(row, head, token) - maximum);
+    denominator = denominator + weight;
+    result = result + weight * value[token * p.model + component];
+  }
+  output[i] = result / denominator;
+}")
+
+(def add-bias-rows-wgsl
+  "Add one shared bias vector to every matrix row."
+  "
+@group(0) @binding(0) var<storage, read_write> matrix: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec2<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= dims.x * dims.y) { return; }
+  matrix[i] = matrix[i] + bias[i % dims.y];
+}")
+
+(def mse-gradient-wgsl
+  "Elementwise derivative 2*(prediction-target)/N for mean squared error."
+  "
+@group(0) @binding(0) var<storage, read> prediction: array<f32>;
+@group(0) @binding(1) var<storage, read> expected: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gradient: array<f32>;
+@group(0) @binding(3) var<uniform> count: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= count) { return; }
+  gradient[i] = 2.0 * (prediction[i] - expected[i]) / f32(count);
+}")
+
+(def relu-backward-wgsl
+  "ReLU vector-Jacobian product using saved pre-activation values."
+  "
+@group(0) @binding(0) var<storage, read> upstream: array<f32>;
+@group(0) @binding(1) var<storage, read> preactivation: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gradient: array<f32>;
+@group(0) @binding(3) var<uniform> count: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= count) { return; }
+  gradient[i] = select(0.0, upstream[i], preactivation[i] > 0.0);
+}")
+
+(def bias-gradient-wgsl
+  "Sum a matrix gradient over rows into its shared bias gradient."
+  "
+@group(0) @binding(0) var<storage, read> gradient: array<f32>;
+@group(0) @binding(1) var<storage, read_write> bias_gradient: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec2<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let col = gid.x; if (col >= dims.y) { return; }
+  var sum: f32 = 0.0;
+  for (var row: u32 = 0u; row < dims.x; row = row + 1u) {
+    sum = sum + gradient[row * dims.y + col];
+  }
+  bias_gradient[col] = sum;
+}")
+
+(def sgd-update-wgsl
+  "In-place SGD parameter update."
+  "
+@group(0) @binding(0) var<storage, read_write> parameter: array<f32>;
+@group(0) @binding(1) var<storage, read> gradient: array<f32>;
+struct Params { learning_rate: f32, count: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.count) { return; }
+  parameter[i] = parameter[i] - p.learning_rate * gradient[i];
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."
@@ -585,6 +1036,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :group-norm-nchw group-norm-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
+   :add-last-axis-bias add-last-axis-bias-wgsl
+   :multi-head-attention multi-head-attention-wgsl
    :ewise-f16 ewise-f16-wgsl
    :ewise1-f16 ewise1-f16-wgsl
    :gemm-f16 gemm-f16-wgsl
