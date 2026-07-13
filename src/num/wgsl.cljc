@@ -490,6 +490,65 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   y[row] = sum;
 }")
 
+(def kv-cache-write-wgsl
+  "Write the current token's RoPE-transformed K/V vectors into a persistent,
+  layer-major KV cache."
+  "
+struct Params { heads: u32, kv_heads: u32, head_dim: u32, position: u32,
+                context: u32, layer: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> k: array<f32>;
+@group(0) @binding(1) var<storage, read> v: array<f32>;
+@group(0) @binding(2) var<storage, read_write> keys: array<f32>;
+@group(0) @binding(3) var<storage, read_write> values: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; let width = p.kv_heads * p.head_dim;
+  if (i >= width) { return; }
+  let base = (p.layer * p.context + p.position) * width;
+  keys[base + i] = k[i]; values[base + i] = v[i];
+}")
+
+(def causal-gqa-attention-wgsl
+  "Causal grouped-query attention over a persistent KV cache. Each invocation
+  computes one output component using stable online softmax passes."
+  "
+struct Params { heads: u32, kv_heads: u32, head_dim: u32, position: u32,
+                context: u32, layer: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> keys: array<f32>;
+@group(0) @binding(2) var<storage, read> values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn score(head: u32, kv_head: u32, past: u32) -> f32 {
+  let width = p.kv_heads * p.head_dim;
+  let kb = (p.layer * p.context + past) * width + kv_head * p.head_dim;
+  let qb = head * p.head_dim; var sum: f32 = 0.0;
+  for (var i: u32 = 0u; i < p.head_dim; i = i + 1u) {
+    sum = sum + q[qb + i] * keys[kb + i];
+  }
+  return sum * inverseSqrt(f32(p.head_dim));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.heads * p.head_dim) { return; }
+  let head = index / p.head_dim; let component = index % p.head_dim;
+  let grouped = p.heads / p.kv_heads; let kv_head = head / grouped;
+  var maximum: f32 = -3.402823e38;
+  for (var past: u32 = 0u; past <= p.position; past = past + 1u) {
+    maximum = max(maximum, score(head, kv_head, past));
+  }
+  var denominator: f32 = 0.0; var result: f32 = 0.0;
+  let width = p.kv_heads * p.head_dim;
+  for (var past: u32 = 0u; past <= p.position; past = past + 1u) {
+    let weight = exp(score(head, kv_head, past) - maximum);
+    let vb = (p.layer * p.context + past) * width + kv_head * p.head_dim;
+    denominator = denominator + weight;
+    result = result + weight * values[vb + component];
+  }
+  output[index] = result / denominator;
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."

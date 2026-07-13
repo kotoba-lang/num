@@ -6,6 +6,7 @@
 (def map-mode (.-GPUMapMode js/globalThis))
 (def readline (js/require "node:readline"))
 (def registry (atom {}))
+(def kv-registry (atom {}))
 (def metrics (atom {:gemv 0 :gemv-many 0 :submissions 0}))
 
 (defn- gpu-buffer [device typed-array flags]
@@ -142,6 +143,76 @@
         (.then (fn [results]
                  (reply {:ok true :results (js->clj results :keywordize-keys true)}))))))
 
+(defn- create-kv! [device command]
+  (let [id (aget command "id") layers (aget command "layers")
+        context (aget command "context") kv-heads (aget command "kvHeads")
+        head-dim (aget command "headDim") bytes (* layers context kv-heads head-dim 4)
+        storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
+        keys (.createBuffer device #js {:size bytes :usage storage})
+        values (.createBuffer device #js {:size bytes :usage storage})]
+    (swap! kv-registry assoc id #js {:keys keys :values values :layers layers
+                                     :context context :kvHeads kv-heads :headDim head-dim})
+    (reply {:ok true :id id :gpu-bytes (* bytes 2)})))
+
+(defn- attention! [device cache-pipeline attention-pipeline command]
+  (let [id (aget command "id") entry (get @kv-registry id)]
+    (when-not entry (throw (js/Error. (str "unknown KV handle: " id))))
+    (let [heads (aget command "heads") kv-heads (.-kvHeads entry)
+          head-dim (.-headDim entry) position (aget command "position")
+          layer (aget command "layer") context (.-context entry)
+          q (js/Float32Array. (aget command "q"))
+          k (js/Float32Array. (aget command "k")) v (js/Float32Array. (aget command "v"))
+          _ (when-not (and (= (.-length q) (* heads head-dim))
+                           (= (.-length k) (* kv-heads head-dim))
+                           (= (.-length v) (* kv-heads head-dim))
+                           (< position context) (< layer (.-layers entry)))
+              (throw (js/Error. "attention shape or cache position mismatch")))
+          storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
+          qbuf (gpu-buffer device q storage) kbuf (gpu-buffer device k storage)
+          vbuf (gpu-buffer device v storage)
+          out (.createBuffer device #js {:size (* heads head-dim 4)
+                                          :usage (bit-or (.-STORAGE usage) (.-COPY_SRC usage))})
+          read (.createBuffer device #js {:size (* heads head-dim 4)
+                                           :usage (bit-or (.-COPY_DST usage) (.-MAP_READ usage))})
+          params (gpu-buffer device
+                             (js/Uint32Array. #js [heads kv-heads head-dim position
+                                                   context layer 0 0])
+                             (bit-or (.-UNIFORM usage) (.-COPY_DST usage)))
+          cache-bind (.createBindGroup device
+                                       #js {:layout (.getBindGroupLayout cache-pipeline 0)
+                                            :entries #js [#js {:binding 0 :resource #js {:buffer kbuf}}
+                                                          #js {:binding 1 :resource #js {:buffer vbuf}}
+                                                          #js {:binding 2 :resource #js {:buffer (.-keys entry)}}
+                                                          #js {:binding 3 :resource #js {:buffer (.-values entry)}}
+                                                          #js {:binding 4 :resource #js {:buffer params}}]})
+          attention-bind (.createBindGroup device
+                                           #js {:layout (.getBindGroupLayout attention-pipeline 0)
+                                                :entries #js [#js {:binding 0 :resource #js {:buffer qbuf}}
+                                                              #js {:binding 1 :resource #js {:buffer (.-keys entry)}}
+                                                              #js {:binding 2 :resource #js {:buffer (.-values entry)}}
+                                                              #js {:binding 3 :resource #js {:buffer out}}
+                                                              #js {:binding 4 :resource #js {:buffer params}}]})
+          encoder (.createCommandEncoder device) cache-pass (.beginComputePass encoder)]
+      (.setPipeline cache-pass cache-pipeline) (.setBindGroup cache-pass 0 cache-bind)
+      (.dispatchWorkgroups cache-pass (Math/ceil (/ (* kv-heads head-dim) 64)))
+      (.end cache-pass)
+      (let [pass (.beginComputePass encoder)]
+        (.setPipeline pass attention-pipeline) (.setBindGroup pass 0 attention-bind)
+        (.dispatchWorkgroups pass (Math/ceil (/ (* heads head-dim) 64))) (.end pass))
+      (.copyBufferToBuffer encoder out 0 read 0 (* heads head-dim 4))
+      (.submit (.-queue device) #js [(.finish encoder)])
+      (-> (.mapAsync read (.-READ map-mode))
+          (.then (fn []
+                   (reply {:ok true :id id
+                           :output (vec (js/Float32Array. (.getMappedRange read)))})
+                   (doseq [buffer [qbuf kbuf vbuf out read params]] (.destroy buffer))))))))
+
+(defn- release-kv! [command]
+  (let [id (aget command "id") entry (get @kv-registry id)]
+    (when entry (.destroy (.-keys entry)) (.destroy (.-values entry))
+          (swap! kv-registry dissoc id))
+    (reply {:ok true :id id})))
+
 (defn- release! [command]
   (let [id (aget command "id") entry (get @registry id)]
     (when entry
@@ -162,6 +233,8 @@
         q5-1-pipeline (pipeline wgsl/q5-1-gemv-wgsl)
         q5k-pipeline (pipeline wgsl/q5-k-gemv-wgsl)
         q6k-pipeline (pipeline wgsl/q6-k-gemv-wgsl)
+        cache-pipeline (pipeline wgsl/kv-cache-write-wgsl)
+        attention-pipeline (pipeline wgsl/causal-gqa-attention-wgsl)
         lines (.createInterface readline #js {:input (.-stdin js/process)})]
     (.on lines "line"
          (fn [line]
@@ -179,8 +252,13 @@
                                  #(reply {:ok false :error (.-message %)}))
                  "gemv-many" (.catch (gemv-many! device command)
                                       #(reply {:ok false :error (.-message %)}))
+                 "create-kv" (create-kv! device command)
+                 "attention" (.catch (attention! device cache-pipeline attention-pipeline command)
+                                      #(reply {:ok false :error (.-message %)}))
+                 "release-kv" (release-kv! command)
                  "release" (release! command)
-                 "stats" (reply (merge {:ok true :handles (count @registry)} @metrics))
+                 "stats" (reply (merge {:ok true :handles (count @registry)
+                                         :kv-handles (count @kv-registry)} @metrics))
                  (reply {:ok false :error (str "unknown op: " op)})))
              (catch :default error
                (reply {:ok false :error (.-message error)})))))))

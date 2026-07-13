@@ -53,3 +53,9 @@
   (is (re-find #"let high" w/q5-k-gemv-wgsl))
   (is (re-find #"210u" w/q6-k-gemv-wgsl))
   (is (re-find #"signed_byte" w/q6-k-gemv-wgsl)))
+
+(deftest persistent-kv-cache-and-causal-gqa-attention-shaders
+  (is (re-find #"p.layer \* p.context" w/kv-cache-write-wgsl))
+  (is (re-find #"inverseSqrt" w/causal-gqa-attention-wgsl))
+  (is (re-find #"maximum" w/causal-gqa-attention-wgsl))
+  (is (re-find #"kv_head" w/causal-gqa-attention-wgsl)))
