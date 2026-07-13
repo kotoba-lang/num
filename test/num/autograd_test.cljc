@@ -176,3 +176,34 @@
                           data 1.0e-4))]
             (is (approx-vec-tol? analytic numeric 1.0e-3)
                 (str label " analytic=" analytic " numeric=" numeric))))))))
+
+(deftest attention-self-attention-gradient-matches-finite-differences
+  (testing "attention*'s transpose*/scale* backward (matmul*/softmax* are
+            already verified elsewhere), checked in the SELF-attention
+            configuration torch.num-backend's :attention layer actually
+            uses — Q=K=V=the SAME Value. This specifically exercises that
+            with-tape/backward!'s gradient accumulation correctly SUMS the
+            three separate contributions (from x's role as Q, as K via
+            transpose*, and as V) into one shared :grad atom, not just that
+            each formula is right in isolation."
+    (let [seq 3 d 2
+          xd (arr/from-vec backend [0.2 -0.1 0.3 0.4 -0.2 0.1] [seq d])
+          targetd (arr/from-vec backend (repeat (* seq d) 0.0) [seq d])
+
+          loss-of (fn [xd']
+                    (let [[result _tape]
+                          (ag/with-tape
+                            (let [x (ag/value xd')]
+                              (ag/mse-loss* (ag/attention* x x x) targetd)))]
+                      (arr/->scalar (:data result))))
+
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd)
+                  loss (ag/mse-loss* (ag/attention* x x x) targetd)]
+              {:loss loss :x x}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (let [analytic (arr/->vec @(:grad (:x result)))
+            numeric (arr/->vec (numerical-grad loss-of xd 1.0e-4))]
+        (is (approx-vec-tol? analytic numeric 1.0e-3)
+            (str "x analytic=" analytic " numeric=" numeric))))))

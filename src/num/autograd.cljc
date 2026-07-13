@@ -212,3 +212,46 @@
         kflat (reshape* kernel [(* kh kw) 1])
         out-flat (matmul* P kflat)]
     (reshape* out-flat [oh ow])))
+
+;; --- attention (2026-07-13 "raise the maturity" loop) -----------------------
+
+(defn transpose*
+  "z = transpose(x) (2-D full reversal, like num.tensor/transpose with no
+  perm). dL/dx = transpose(dL/dz) — a full-reversal transpose is its own
+  adjoint (transposing twice is the identity)."
+  [x]
+  (node (t/transpose (:data x))
+        [x]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x (t/transpose g))))))
+
+(defn- copy-nd [a] (arr/from-vec (:backend a) (arr/->vec a) (:shape a)))
+
+(defn scale*
+  "z = alpha * x (alpha a host scalar constant, not a Value — nothing needs
+  its gradient). dL/dx = alpha * dL/dz. Copies before calling num.core/scal!
+  (BLAS in-place convention) since `x` — e.g. self-attention's Q=K=V=the
+  SAME Value — may still be needed unscaled elsewhere in the graph."
+  [alpha x]
+  (node (nm/scal! alpha (copy-nd (:data x)))
+        [x]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x (nm/scal! alpha (copy-nd g)))))))
+
+(defn attention*
+  "Single-head scaled dot-product attention with real gradients — same shape
+  convention as `num.tensor/attention` (`Q`: `[seqQ d]`, `K`/`V`:
+  `[seqK d]`; self-attention passes the SAME Value as all three, which
+  `with-tape`/`backward!`'s gradient-accumulation already handles correctly
+  — each of Q/K/V's usage sites contributes additively to the one shared
+  `:grad` atom). Built from `transpose*`/`scale*` (new) + the already-real
+  `matmul*`/`softmax*` — no formula here is independently re-derived, this
+  is the identical composition `num.tensor/attention` itself uses."
+  [Q K V]
+  (let [d (long (last (:shape (:data Q))))
+        scores (matmul* Q (transpose* K))
+        scaled (scale* (/ 1.0 (Math/sqrt d)) scores)
+        weights (softmax* scaled)]
+    (matmul* weights V)))
