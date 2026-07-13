@@ -35,8 +35,47 @@
 (defn- force-output [output]
   (arr/->vec output))
 
-(defn -main [& _]
-  (let [cpu-tensors (tensors (cpu/cpu-backend))
+(defn- full-channel-benchmark [device]
+  (let [gpu (dg/backend device)
+        input-shape [1 320 64 64]
+        weight-shape [320 320 3 3]
+        input (arr/from-vec gpu (repeat (arr/nelems input-shape) 0.01) input-shape)
+        weight (arr/from-vec gpu (repeat (arr/nelems weight-shape) 0.001) weight-shape)
+        bias (arr/from-vec gpu (repeat 320 0.0) [320])
+        run (fn [] (force-output
+                    (t/conv2d-nchw input weight bias {:padding 1})))
+        cold-start (now)]
+    (-> (run)
+        (.then
+         (fn [cold-values]
+           (let [cold-ms (- (now) cold-start)
+                 warm-start (now)]
+             (-> (run)
+                 (.then
+                  (fn [warm-values]
+                    (let [warm-ms (- (now) warm-start)
+                          center (+ (* 160 64 64) (* 32 64) 32)
+                          expected (* 320 9 0.01 0.001)]
+                      (println "GPU:" (dg/adapter-description device))
+                      (println "full channel conv:" input-shape "x" weight-shape
+                               "->" [1 320 64 64])
+                      (println "GPU cold ms:" (.toFixed cold-ms 2))
+                      (println "GPU warm ms:" (.toFixed warm-ms 2))
+                      (println "center value:" (nth warm-values center)
+                               "expected:" expected)
+                      (when (or (not= (count cold-values) (* 320 64 64))
+                                (> (Math/abs (- (nth warm-values center) expected))
+                                   1.0e-4))
+                        (throw (js/Error. "full-channel convolution check failed")))))))))))))
+
+(defn -main [& args]
+  (if (= "full" (first args))
+    (-> (dg/request-device)
+        (.then full-channel-benchmark)
+        (.catch (fn [error]
+                  (println "ERROR:" (or (.-stack error) error))
+                  (js/Deno.exit 1))))
+    (let [cpu-tensors (tensors (cpu/cpu-backend))
         cpu-start (now)
         cpu-output (force-output (chain cpu-tensors))
         cpu-ms (- (now) cpu-start)]
@@ -72,6 +111,6 @@
                                      (throw (js/Error. "GPU benchmark output differs from CPU oracle"))))))))))))
         (.catch (fn [error]
                   (println "ERROR:" (or (.-stack error) error))
-                  (js/Deno.exit 1))))))
+                  (js/Deno.exit 1)))))))
 
 (set! *main-cli-fn* -main)

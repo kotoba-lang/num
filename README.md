@@ -313,6 +313,9 @@ than near-zero queue submission latency:
 ```bash
 clojure -M:deno-benchmark
 deno run --allow-all target/deno-gpu-benchmark.cjs
+
+# Full Stable-Diffusion-width 320→320 convolution at latent 64×64
+deno run --allow-all target/deno-gpu-benchmark.cjs full
 ```
 
 Measured on Apple M4 with input `[1,32,64,64]`, weights `[64,32,3,3]`, and a
@@ -320,14 +323,17 @@ full `NCHW conv(pad=1) → GroupNorm(8) → SiLU` chain:
 
 | path | elapsed |
 |---|---:|
-| ClojureScript CPU oracle | 934.46 ms |
-| Metal cold (pipeline compile included) | 41.14 ms |
-| Metal warm | 36.68 ms |
+| ClojureScript CPU oracle | 1008.30 ms |
+| Metal cold (pipeline compile included) | 41.87 ms |
+| Metal warm | 26.52 ms |
 
-Warm speedup is **25.48×**, with maximum absolute error `2.38e-6` against the
-CPU oracle. This is a concrete kernel-chain measurement, not a claim of
-PyTorch/MPS-wide parity: larger 320-channel blocks, memory pressure, mixed
-precision, fusion, and full-model throughput still require separate benchmarks.
+Warm speedup is **38.02×**, with maximum absolute error `2.38e-6` against the
+CPU oracle. The full-width mode separately measures a real latent-resolution
+`[1,320,64,64] × [320,320,3,3]` convolution: 213.03 ms cold and 184.51 ms warm,
+with its interior constant-input result within `4.51e-7` of the analytic value.
+These are concrete completed-work measurements, not a claim of PyTorch/MPS-wide
+parity: end-to-end model memory pressure, mixed precision, fusion, and complete
+UNet throughput still require separate benchmarks.
 
 This cross-checks the live GPU backend against `num.cpu`'s reference oracle (dispatched
 through `num.core`/`num.array`, i.e. through `IBackend`, the same seam any real caller
