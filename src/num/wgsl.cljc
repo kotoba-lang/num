@@ -270,6 +270,60 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = sum;
 }")
 
+(def group-norm-nchw-wgsl
+  "Parallel GroupNorm: one 256-thread workgroup reduces and normalizes one
+  `[channels/group,H,W]` slice. Variance uses the biased PyTorch definition."
+  "
+struct Dims {
+  n: u32, c: u32, h: u32, w: u32,
+  groups: u32, channels_group: u32, group_size: u32, spatial: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+@group(0) @binding(5) var<uniform> epsilon: f32;
+var<workgroup> sums: array<f32, 256>;
+var<workgroup> squares: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid3: vec3<u32>,
+        @builtin(workgroup_id) wid3: vec3<u32>) {
+  let lid = lid3.x;
+  let slice = wid3.x;
+  if (slice >= d.n * d.groups) { return; }
+  let batch = slice / d.groups;
+  let group = slice % d.groups;
+  let base = batch * d.c * d.h * d.w + group * d.group_size;
+  var sum = 0.0;
+  var sum_square = 0.0;
+  for (var i = lid; i < d.group_size; i = i + 256u) {
+    let value = input[base + i];
+    sum = sum + value;
+    sum_square = sum_square + value * value;
+  }
+  sums[lid] = sum;
+  squares[lid] = sum_square;
+  workgroupBarrier();
+  var offset = 128u;
+  loop {
+    if (offset == 0u) { break; }
+    if (lid < offset) {
+      sums[lid] = sums[lid] + sums[lid + offset];
+      squares[lid] = squares[lid] + squares[lid + offset];
+    }
+    workgroupBarrier();
+    offset = offset / 2u;
+  }
+  let mean = sums[0] / f32(d.group_size);
+  let variance = max(squares[0] / f32(d.group_size) - mean * mean, 0.0);
+  let inv_std = inverseSqrt(variance + epsilon);
+  for (var i = lid; i < d.group_size; i = i + 256u) {
+    let channel = group * d.channels_group + i / d.spatial;
+    output[base + i] = (input[base + i] - mean) * inv_std * weight[channel] + bias[channel];
+  }
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -283,6 +337,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl
    :conv2d-nchw conv2d-nchw-wgsl
+   :group-norm-nchw group-norm-nchw-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------

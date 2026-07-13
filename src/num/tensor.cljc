@@ -46,8 +46,8 @@
   throws (`[object Promise] is not ISeqable`), confirmed by direct test.
   Most generic operations in this namespace still require that synchronous
   readback. Device-native exceptions now include metadata-only reshapes, SiLU,
-  and full NCHW convolution through `ITensorBackend`; the latter two are
-  directly verified on Apple M4 Metal (`num.deno-gpu-verify`, 20/20).
+  full NCHW convolution, and GroupNorm through `ITensorBackend`; they are
+  directly verified on Apple M4 Metal (`num.deno-gpu-verify`, 22/22).
 
   PARTIALLY CLOSED (same day): `num.tensor-async` (cljs-only) adds async
   twins of exactly `conv2d`/`attention`'s underlying ops (2-D transpose, 2-D
@@ -597,7 +597,8 @@
 (defn group-norm-nchw
   "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
   (`unbiased=false`), as in `torch.nn.GroupNorm`. Optional affine `weight` and
-  `bias` have shape `[C]`."
+  `bias` have shape `[C]`. ITensorBackend implementations run device-native;
+  the portable fallback is the CPU oracle below."
   ([input num-groups] (group-norm-nchw input num-groups nil nil 1.0e-5))
   ([input num-groups weight bias eps]
    (let [[N C H W :as shape] (:shape input)
@@ -613,33 +614,43 @@
      (let [N (long N) C (long C) H (long H) W (long W)
            channels-per-group (quot C groups)
            group-size (* channels-per-group H W)
-           xs (double-array (arr/->vec input))
-           ws (when weight (double-array (arr/->vec weight)))
-           bs (when bias (double-array (arr/->vec bias)))
-           out (double-array (* N C H W))]
-       (dotimes [n N]
-         (dotimes [group groups]
-           (let [base (+ (* n C H W) (* group group-size))
-                 mean (/ (loop [i 0 sum 0.0]
-                           (if (< i group-size)
-                             (recur (inc i) (+ sum (aget xs (+ base i))))
-                             sum))
-                         group-size)
-                 variance (/ (loop [i 0 sum 0.0]
+           backend (:backend input)
+           params {:n N :c C :h H :width W :groups groups
+                   :channels-group channels-per-group :group-size group-size
+                   :eps eps}]
+       (if (satisfies? p/ITensorBackend backend)
+         (arr/->NDArray backend
+                        (p/-group-norm-nchw backend (:handle input)
+                                            (when weight (:handle weight))
+                                            (when bias (:handle bias)) params)
+                        [N C H W])
+         (let [xs (double-array (arr/->vec input))
+               ws (when weight (double-array (arr/->vec weight)))
+               bs (when bias (double-array (arr/->vec bias)))
+               out (double-array (* N C H W))]
+           (dotimes [n N]
+             (dotimes [group groups]
+               (let [base (+ (* n C H W) (* group group-size))
+                     mean (/ (loop [i 0 sum 0.0]
                                (if (< i group-size)
-                                 (let [d (- (aget xs (+ base i)) mean)]
-                                   (recur (inc i) (+ sum (* d d))))
+                                 (recur (inc i) (+ sum (aget xs (+ base i))))
                                  sum))
                              group-size)
-                 inv-std (/ 1.0 (Math/sqrt (+ variance eps)))]
-             (dotimes [i group-size]
-               (let [channel (+ (* group channels-per-group)
-                                (quot i (* H W)))
-                     normalized (* (- (aget xs (+ base i)) mean) inv-std)
-                     value (+ (* normalized (if ws (aget ws channel) 1.0))
-                              (if bs (aget bs channel) 0.0))]
-                 (aset out (+ base i) value))))))
-       (arr/from-vec (:backend input) (vec out) [N C H W])))))
+                     variance (/ (loop [i 0 sum 0.0]
+                                   (if (< i group-size)
+                                     (let [d (- (aget xs (+ base i)) mean)]
+                                       (recur (inc i) (+ sum (* d d))))
+                                     sum))
+                                 group-size)
+                     inv-std (/ 1.0 (Math/sqrt (+ variance eps)))]
+                 (dotimes [i group-size]
+                   (let [channel (+ (* group channels-per-group)
+                                    (quot i (* H W)))
+                         normalized (* (- (aget xs (+ base i)) mean) inv-std)
+                         value (+ (* normalized (if ws (aget ws channel) 1.0))
+                                  (if bs (aget bs channel) 0.0))]
+                     (aset out (+ base i) value))))))
+           (arr/from-vec backend (vec out) [N C H W])))))))
 
 (defn upsample-nearest2d
   "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`."

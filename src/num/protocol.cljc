@@ -52,4 +52,6 @@
   protocol continue to use num.tensor's portable host oracle."
   (-conv2d-nchw [b input-h weight-h bias-h params]
     "NCHW cross-correlation. `params` contains validated dimensions/options;
-    returns a newly allocated output handle."))
+    returns a newly allocated output handle.")
+  (-group-norm-nchw [b input-h weight-h bias-h params]
+    "NCHW GroupNorm with optional affine parameters; returns a new handle."))

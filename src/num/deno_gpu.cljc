@@ -223,6 +223,20 @@
            (w/-dispatch dev (wb/get-pipeline dev pipes :conv2d-nchw)
                         [input-h weight-h bias output (wb/uni dev (wb/u32-tag params))]
                         [(wb/ceil-div total 64) 1 1])
+           output))
+       (-group-norm-nchw [_ input-h weight-h bias-h
+                          {:keys [n c h width groups channels-group group-size eps]}]
+         (let [total (* n c h width)
+               output (w/-create-buffer dev total :storage)
+               weight (or weight-h
+                          (let [buffer (w/-create-buffer dev c :storage)]
+                            (w/-write-buffer dev buffer (repeat c 1.0)) buffer))
+               bias (or bias-h (w/-create-buffer dev c :storage))
+               dims [n c h width groups channels-group group-size (* h width)]]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :group-norm-nchw)
+                        [input-h weight bias output (wb/uni dev (wb/u32-tag dims))
+                         (wb/uni dev [(double eps)])]
+                        [(* n groups) 1 1])
            output)))
 
      (defn backend
