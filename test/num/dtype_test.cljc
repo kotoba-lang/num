@@ -3,7 +3,8 @@
             [num.array :as arr]
             [num.cpu :as cpu]
             [num.core :as num]
-            [num.dtype :as dtype]))
+            [num.dtype :as dtype]
+            [num.tensor :as tensor]))
 
 (def backend (cpu/cpu-backend))
 
@@ -52,3 +53,24 @@
       (is (= [1.5 1.0 5.0 4.25] (arr/->vec sum)))
       (is (< (Math/abs (- 4.5 (first (arr/->vec product)))) 0.02))
       (is (< (Math/abs (- -0.5 (second (arr/->vec product)))) 0.02)))))
+
+(deftest typed-unet-building-blocks-preserve-storage
+  (doseq [dtype* [:f16 :bf16]]
+    (let [input (arr/from-vec backend (mapv #(* 0.1 (inc %)) (range 16))
+                              [1 1 4 4] dtype*)
+          kernel (arr/from-vec backend [0.25 -0.5 0.75 0.125] [1 1 2 2] dtype*)
+          bias (arr/from-vec backend [0.1] [1] dtype*)
+          conv (tensor/conv2d-nchw input kernel bias)
+          norm (tensor/group-norm-nchw conv 1
+                                       (arr/from-vec backend [1.0] [1] dtype*)
+                                       (arr/from-vec backend [0.0] [1] dtype*)
+                                       1.0e-5)
+          up (tensor/upsample-nearest2d (num/silu norm) 2)
+          joined (tensor/cat [up up] 1)]
+      (is (= [1 1 3 3] (:shape conv)))
+      (is (= [1 2 6 6] (:shape joined)))
+      (is (every? #(= dtype* (:dtype %)) [conv norm up joined]))
+      (is (every? (fn [x]
+                    #?(:clj (Double/isFinite (double x))
+                       :cljs (js/isFinite x)))
+                  (arr/->vec joined))))))

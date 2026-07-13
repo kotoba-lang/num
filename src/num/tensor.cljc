@@ -69,6 +69,14 @@
 
 ;; --- shape / stride helpers ---------------------------------------------------
 
+(defn- array-dtype [a] (or (:dtype a) :f32))
+
+(defn- require-same-dtype! [operation arrays]
+  (let [dtypes (set (map array-dtype (remove nil? arrays)))]
+    (when-not (= 1 (count dtypes))
+      (throw (ex-info (str operation " requires matching dtypes")
+                      {:dtypes dtypes})))))
+
 (defn row-major-strides
   "Row-major (C-order) strides for `shape`: stride[i] = product of shape[i+1..]."
   [shape]
@@ -453,6 +461,7 @@
   ([input weight bias] (conv2d-nchw input weight bias {}))
   ([input weight bias {:keys [stride padding dilation groups]
                        :or {stride 1 padding 0 dilation 1 groups 1}}]
+   (require-same-dtype! "num.tensor/conv2d-nchw" [input weight bias])
    (let [input-shape (:shape input)
          weight-shape (:shape weight)]
      (when-not (= 4 (count input-shape))
@@ -495,11 +504,12 @@
              params {:n N :cin Cin :h H :width W :cout Cout
                      :cin-group Cin-per-group :kh kh :kw kw :oh oh :ow ow
                      :sh sh :sw sw :ph ph :pw pw :dh dh :dw dw :groups groups}]
-         (if (satisfies? p/ITensorBackend backend)
-           (arr/->NDArray backend
+         (if (and (= :f32 (array-dtype input))
+                  (satisfies? p/ITensorBackend backend))
+           (assoc (arr/->NDArray backend
                           (p/-conv2d-nchw backend (:handle input) (:handle weight)
                                           (when bias (:handle bias)) params)
-                          [N Cout oh ow])
+                          [N Cout oh ow]) :dtype :f32)
            (let [xs (double-array (arr/->vec input))
                  ws (double-array (arr/->vec weight))
                  bs (when bias (double-array (arr/->vec bias)))
@@ -542,7 +552,8 @@
                                  sum))]
                          (aset out (+ (* n Cout oh ow) (* oc oh ow) (* oi ow) oj)
                                sum)))))))
-             (arr/from-vec backend (vec out) [N Cout oh ow]))))))))
+             (arr/from-vec backend (vec out) [N Cout oh ow]
+                           (array-dtype input)))))))))
 
 ;; --- UNet tensor building blocks -----------------------------------------------
 
@@ -563,6 +574,7 @@
     (let [first-shape (:shape (first tensors))
           rank (count first-shape)
           axis (long (if (neg? axis) (+ rank axis) axis))]
+      (require-same-dtype! "num.tensor/cat" tensors)
       (when-not (< -1 axis rank)
         (throw (ex-info "num.tensor/cat axis out of range"
                         {:axis axis :rank rank})))
@@ -581,7 +593,8 @@
             inner (long (arr/nelems (subvec first-shape (inc axis))))
             axis-sizes (mapv #(long (nth (:shape %) axis)) tensors)
             backend (:backend (first tensors))]
-        (if (and (satisfies? p/ITensorBackend backend)
+        (if (and (= :f32 (array-dtype (first tensors)))
+                 (satisfies? p/ITensorBackend backend)
                  (every? #(= backend (:backend %)) tensors))
           (let [offsets (butlast (reductions + 0 axis-sizes))
                 inputs (mapv (fn [tensor axis-size axis-offset]
@@ -592,9 +605,9 @@
                 params {:total-output (arr/nelems out-shape)
                         :output-block (* (nth out-shape axis) inner)
                         :inputs inputs}]
-            (arr/->NDArray backend
+            (assoc (arr/->NDArray backend
                            (p/-cat backend (mapv :handle tensors) params)
-                           out-shape))
+                           out-shape) :dtype :f32))
           (let [out (double-array (arr/nelems out-shape))
                 sources (mapv #(double-array (arr/->vec %)) tensors)]
             (dotimes [outer-index outer]
@@ -609,7 +622,8 @@
                     (dotimes [i count]
                       (aset out (+ output-base i) (aget source (+ source-base i))))
                     (recur (inc tensor-index) (+ axis-offset axis-size))))))
-            (arr/from-vec backend (vec out) out-shape)))))))
+            (arr/from-vec backend (vec out) out-shape
+                          (array-dtype (first tensors)))))))))
 
 (defn group-norm-nchw
   "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
@@ -618,6 +632,7 @@
   the portable fallback is the CPU oracle below."
   ([input num-groups] (group-norm-nchw input num-groups nil nil 1.0e-5))
   ([input num-groups weight bias eps]
+   (require-same-dtype! "num.tensor/group-norm-nchw" [input weight bias])
    (let [[N C H W :as shape] (:shape input)
          groups (long num-groups)]
      (when-not (and (= 4 (count shape)) (pos? groups) (zero? (mod (long C) groups))
@@ -635,12 +650,13 @@
            params {:n N :c C :h H :width W :groups groups
                    :channels-group channels-per-group :group-size group-size
                    :eps eps}]
-       (if (satisfies? p/ITensorBackend backend)
-         (arr/->NDArray backend
+       (if (and (= :f32 (array-dtype input))
+                (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray backend
                         (p/-group-norm-nchw backend (:handle input)
                                             (when weight (:handle weight))
                                             (when bias (:handle bias)) params)
-                        [N C H W])
+                        [N C H W]) :dtype :f32)
          (let [xs (double-array (arr/->vec input))
                ws (when weight (double-array (arr/->vec weight)))
                bs (when bias (double-array (arr/->vec bias)))
@@ -667,7 +683,8 @@
                          value (+ (* normalized (if ws (aget ws channel) 1.0))
                                   (if bs (aget bs channel) 0.0))]
                      (aset out (+ base i) value))))))
-           (arr/from-vec backend (vec out) [N C H W])))))))
+           (arr/from-vec backend (vec out) [N C H W]
+                         (array-dtype input))))))))
 
 (defn upsample-nearest2d
   "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.
@@ -683,10 +700,11 @@
           backend (:backend input)
           params {:n N :c C :h H :width W :oh oh :ow ow
                   :scale-h scale-h :scale-w scale-w}]
-      (if (satisfies? p/ITensorBackend backend)
-        (arr/->NDArray backend
+      (if (and (= :f32 (array-dtype input))
+               (satisfies? p/ITensorBackend backend))
+        (assoc (arr/->NDArray backend
                        (p/-upsample-nearest2d backend (:handle input) params)
-                       [N C oh ow])
+                       [N C oh ow]) :dtype :f32)
         (let [xs (double-array (arr/->vec input))
               out (double-array (* N C oh ow))]
           (dotimes [n N]
@@ -696,7 +714,8 @@
                   (aset out (+ (* n C oh ow) (* c oh ow) (* oi ow) oj)
                         (aget xs (+ (* n C H W) (* c H W)
                                     (* (quot oi scale-h) W) (quot oj scale-w))))))))
-          (arr/from-vec backend (vec out) [N C oh ow]))))))
+          (arr/from-vec backend (vec out) [N C oh ow]
+                        (array-dtype input)))))))
 
 ;; --- attention (ADR-2607131500 Phase 1) -----------------------------------------
 
