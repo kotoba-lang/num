@@ -45,12 +45,22 @@
   `softmax`/`conv2d`/`attention` this phase adds) against a Deno GPU backend
   throws (`[object Promise] is not ISeqable`), confirmed by direct test.
   So: every op in this namespace is verified real on the CPU oracle backend
-  (below and `test/num/tensor_test.cljc`); NONE of them are yet verified
-  live on Metal the way the raw IBackend ops are (`num.deno-gpu-verify`,
-  17/17 on real Apple M4). Making this namespace async-aware (Promise-
-  chaining through every op) or building the JVM-blocking wgpu-native device
-  ADR-2607051400 §Phase 2 already flagged as \"Remaining\" would both close
-  this gap; neither is attempted in this pass."
+  (below and `test/num/tensor_test.cljc`); NONE of them are directly runnable
+  on Metal the way the raw IBackend ops are (`num.deno-gpu-verify`, 17/17 on
+  real Apple M4).
+
+  PARTIALLY CLOSED (same day): `num.tensor-async` (cljs-only) adds async
+  twins of exactly `conv2d`/`attention`'s underlying ops (2-D transpose, 2-D
+  last-axis softmax) — verified live on real Metal AND cross-checked against
+  this namespace's own CPU-sync `attention` for the same inputs
+  (`num.tensor-async-verify`, 4/4). `num.core/matmul` needed no async
+  variant at all: `-gemm`/`-alloc` are fully synchronous even on
+  WgslBackendAsync (only `-reduce`/`-dot`/`-nrm2`/`-copy-to-host` are async),
+  confirmed by the pre-existing `num.deno-gpu-verify` 14/14. The general N-D
+  layer here (broadcast-to/reduce-axes/batched matmul, and `sum`/`amax`/
+  `amin`/`mean`) remains sync-only/CPU-verified-only — `num.tensor-async`
+  deliberately targets only what `comfyui.nodes.toy-diffusion` needs, not a
+  full async generalization of this namespace; see that ns's own docstring."
   (:require [num.array :as arr]
             [num.core :as nm]
             [num.protocol :as p]))
