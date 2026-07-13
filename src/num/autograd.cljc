@@ -470,3 +470,69 @@
                  (when bias
                    (accumulate! bias (arr/from-vec (:backend bias-data) (vec dbias)
                                                    (:shape bias-data)))))))))))
+
+(defn cat*
+  "Differentiable `num.tensor/cat`. Backward slices the upstream gradient
+  along the concatenation axis and accumulates one contiguous gradient per
+  input Value."
+  [values axis]
+  (let [values (vec values)
+        data (mapv :data values)
+        output (t/cat data axis)
+        rank (count (:shape output))
+        axis (long (if (neg? axis) (+ rank axis) axis))
+        first-shape (:shape (first data))
+        inner (long (arr/nelems (subvec first-shape (inc axis))))
+        outer (long (arr/nelems (subvec first-shape 0 axis)))
+        output-axis (long (nth (:shape output) axis))
+        axis-sizes (mapv #(long (nth (:shape %) axis)) data)]
+    (node output values
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [gs (double-array (arr/->vec g))]
+                (loop [value-index 0 axis-offset 0]
+                  (when (< value-index (count values))
+                    (let [value (nth values value-index)
+                          shape (:shape (:data value))
+                          axis-size (nth axis-sizes value-index)
+                          block (* axis-size inner)
+                          sliced (double-array (arr/nelems shape))]
+                      (dotimes [outer-index outer]
+                        (let [source-base (+ (* outer-index output-axis inner)
+                                             (* axis-offset inner))
+                              destination-base (* outer-index block)]
+                          (dotimes [i block]
+                            (aset sliced (+ destination-base i)
+                                  (aget gs (+ source-base i))))))
+                      (accumulate! value
+                                   (arr/from-vec (:backend (:data value))
+                                                 (vec sliced) shape))
+                      (recur (inc value-index) (+ axis-offset axis-size)))))))))))
+
+(defn upsample-nearest2d*
+  "Differentiable nearest-neighbor NCHW upsampling. Backward sums every
+  repeated output cell into its source input cell."
+  [x scale-factor]
+  (let [input-data (:data x)
+        [N C H W] (mapv long (:shape input-data))
+        [scale-h scale-w] (pair-option scale-factor)
+        output (t/upsample-nearest2d input-data scale-factor)
+        [_ _ oh ow] (mapv long (:shape output))]
+    (node output [x]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [gs (double-array (arr/->vec g))
+                    dx (double-array (* N C H W))]
+                (dotimes [n N]
+                  (dotimes [c C]
+                    (dotimes [oi oh]
+                      (dotimes [oj ow]
+                        (let [input-index (+ (* n C H W) (* c H W)
+                                             (* (quot oi scale-h) W)
+                                             (quot oj scale-w))
+                              output-index (+ (* n C oh ow) (* c oh ow)
+                                              (* oi ow) oj)]
+                          (aset dx input-index
+                                (+ (aget dx input-index) (aget gs output-index))))))))
+                (accumulate! x (arr/from-vec (:backend input-data) (vec dx)
+                                             (:shape input-data)))))))))

@@ -150,8 +150,9 @@ on Apple M4 Metal, alongside affine and non-affine normalization cases.
 `silu*` and `group-norm-nchw*` provide the
 corresponding training path; GroupNorm propagates input plus affine weight/bias
 gradients and the composed GroupNorm→SiLU chain is checked against central
-finite differences. Device-native kernels and gradients for `cat`/upsampling
-remain open.
+finite differences. `cat*` and `upsample-nearest2d*` complete the skip-path
+training graph; a branched upsample+channel-concat+SiLU loss matches central
+finite differences for both source tensors.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque

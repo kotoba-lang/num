@@ -315,3 +315,41 @@
           (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
               (str label " analytic=" (arr/->vec analytic)
                    " numeric=" (arr/->vec numeric))))))))
+
+(deftest upsample-cat-skip-gradients-match-finite-differences
+  (testing "a branched UNet-style upsample + channel skip concatenation graph
+            propagates gradients into both source tensors"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1] [1 1 2 2])
+          skipd (arr/from-vec backend [-0.3 0.8 1.4 -0.9 0.1 0.5 -0.2 0.6]
+                              [1 2 2 2])
+          target (arr/from-vec backend (repeat 48 0.15) [1 3 4 4])
+          loss-of
+          (fn [xd' skipd']
+            (let [[loss _]
+                  (ag/with-tape
+                    (let [x (ag/value xd') skip (ag/value skipd')]
+                      (ag/mse-loss*
+                       (ag/silu*
+                        (ag/cat* [(ag/upsample-nearest2d* x 2)
+                                  (ag/upsample-nearest2d* skip 2)] 1))
+                       target)))]
+              (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) skip (ag/value skipd)
+                  merged (ag/cat* [(ag/upsample-nearest2d* x 2)
+                                   (ag/upsample-nearest2d* skip 2)] 1)
+                  loss (ag/mse-loss* (ag/silu* merged) target)]
+              {:loss loss :x x :skip skip}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["skip" :skip skipd]]]
+        (let [numeric (numerical-grad
+                       (fn [perturbed]
+                         (loss-of (if (= key :x) perturbed xd)
+                                  (if (= key :skip) perturbed skipd)))
+                       data 1.0e-5)
+              analytic @(:grad (get result key))]
+          (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+              (str label " analytic=" (arr/->vec analytic)
+                   " numeric=" (arr/->vec numeric))))))))
