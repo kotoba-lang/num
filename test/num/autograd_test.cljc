@@ -400,6 +400,29 @@
                                (arr/->vec numeric) 1.0e-4)
               label))))))
 
+(deftest embedding-weight-gradient-matches-finite-differences
+  (testing "embedding scatter-add accumulates repeated token rows"
+    (let [indices (arr/from-vec backend [2 0 2 1] [4])
+          wd (arr/from-vec backend
+                           [0.1 0.2 0.3, -0.2 0.4 0.5,
+                            0.7 -0.1 0.6, 0.0 0.2 -0.3] [4 3])
+          target (arr/from-vec backend (repeat 12 0.15) [4 3])
+          loss-of (fn [weight]
+                    (let [[loss _]
+                          (ag/with-tape
+                            (ag/mse-loss* (ag/embedding* indices (ag/value weight))
+                                          target))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [weight (ag/value wd)
+                  loss (ag/mse-loss* (ag/embedding* indices weight) target)]
+              {:loss loss :weight weight}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (let [numeric (numerical-grad loss-of wd 1.0e-5)]
+        (is (approx-vec-tol? (arr/->vec @(:grad (:weight result)))
+                             (arr/->vec numeric) 1.0e-4))))))
+
 (deftest upsample-cat-skip-gradients-match-finite-differences
   (testing "a branched UNet-style upsample + channel skip concatenation graph
             propagates gradients into both source tensors"

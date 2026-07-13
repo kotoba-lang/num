@@ -1367,6 +1367,55 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[gid.x] = pack2x16float(vec2<f32>(normalize(base), second));
 }")
 
+(def embedding-wgsl
+  "Embedding row gather. Token IDs are exactly represented non-negative f32
+  integers; validation is performed by the portable CPU oracle/caller."
+  "
+struct Params { tokens: u32, rows: u32, dim: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> indices: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.tokens * p.dim) { return; }
+  let token = i / p.dim;
+  let feature = i % p.dim;
+  let row = u32(indices[token]);
+  if (row >= p.rows) { output[i] = 0.0; return; }
+  output[i] = weight[row * p.dim + feature];
+}")
+
+(def embedding-f16-wgsl
+  "Packed f16 embedding row gather with f32 token indices."
+  "
+struct Params { tokens: u32, rows: u32, dim: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> indices: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+@group(0) @binding(3) var<uniform> p: Params;
+fn load_f16(i: u32) -> f32 {
+  let pair = unpack2x16float(weight[i / 2u]);
+  return select(pair.x, pair.y, i % 2u == 1u);
+}
+fn gather(i: u32) -> f32 {
+  let token = i / p.dim;
+  let feature = i % p.dim;
+  let row = u32(indices[token]);
+  if (row >= p.rows) { return 0.0; }
+  return load_f16(row * p.dim + feature);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x;
+  let base = word * 2u;
+  let n = p.tokens * p.dim;
+  if (base >= n) { return; }
+  let second = select(gather(base + 1u), 0.0, base + 1u >= n);
+  output[word] = pack2x16float(vec2<f32>(gather(base), second));
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -1382,6 +1431,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :conv2d-nchw conv2d-nchw-wgsl
    :conv2d-nchw-oc4 conv2d-nchw-oc4-wgsl
    :group-norm-nchw group-norm-nchw-wgsl
+   :embedding embedding-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
@@ -1402,6 +1452,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :gemm-f16 gemm-f16-wgsl
    :conv2d-nchw-f16 conv2d-nchw-f16-wgsl
    :group-norm-nchw-f16 group-norm-nchw-f16-wgsl
+   :embedding-f16 embedding-f16-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------

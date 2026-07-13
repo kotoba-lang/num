@@ -985,6 +985,53 @@
            (group-norm-nchw 1 weight bias eps)
            (reshape shape))))))
 
+(defn embedding
+  "Gather rows from `[num-embeddings embedding-dim]` `weight` using a tensor
+  of integer-valued token IDs. The output shape is `indices-shape + [dim]`.
+  Device backends execute a gather kernel; the portable oracle validates every
+  token and throws for fractional or out-of-range IDs."
+  [indices weight]
+  (let [[rows dim :as weight-shape] (:shape weight)
+        index-shape (vec (:shape indices))
+        backend (:backend weight)
+        tokens (arr/nelems index-shape)
+        dtype (array-dtype weight)
+        params {:tokens tokens :rows rows :dim dim}]
+    (when-not (and (= 2 (count weight-shape)) (pos? rows) (pos? dim))
+      (throw (ex-info "embedding weight must have shape [rows dim]"
+                      {:shape weight-shape})))
+    (when-not (and (= :f32 (array-dtype indices))
+                   (= backend (:backend indices)))
+      (throw (ex-info "embedding indices must be f32 on the weight backend"
+                      {:indices-dtype (array-dtype indices)})))
+    (cond
+      (and (= dtype :f32) (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray backend
+                            (p/-embedding backend (:handle indices)
+                                          (:handle weight) params)
+                            (conj index-shape dim)) :dtype :f32)
+
+      (and (not= dtype :f32) (satisfies? p/IDTypeTensorOps backend))
+      (assoc (arr/->NDArray backend
+                            (p/-embedding-dtype backend (:handle indices)
+                                                (:handle weight) params dtype)
+                            (conj index-shape dim)) :dtype dtype)
+
+      :else
+      (let [ids (arr/->vec indices)
+            weights (vec (arr/->vec weight))]
+        (doseq [id ids]
+          (when-not (and (== (double id) (Math/floor (double id)))
+                         (<= 0 id) (< id rows))
+            (throw (ex-info "embedding token ID is out of range or fractional"
+                            {:token id :rows rows}))))
+        (arr/from-vec backend
+                      (mapcat (fn [id]
+                                (subvec weights (* (long id) dim)
+                                        (* (inc (long id)) dim)))
+                              ids)
+                      (conj index-shape dim) dtype)))))
+
 (defn upsample-nearest2d
   "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.
   ITensorBackend implementations execute it device-native."

@@ -335,6 +335,16 @@
                          (wb/uni dev [(double eps)])]
                         [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
            output))
+       (-embedding-dtype [_ indices-h weight-h {:keys [tokens rows dim]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU embedding supports f16 only" {:dtype dtype*})))
+         (let [total (* tokens dim)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding-f16)
+                        [indices-h weight-h output
+                         (wb/uni dev (wb/u32-tag [tokens rows dim 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
 
        p/ITensorBackend
        (-conv2d-nchw [_ input-h weight-h bias-h
@@ -370,6 +380,14 @@
                         [input-h weight bias output (wb/uni dev (wb/u32-tag dims))
                          (wb/uni dev [(double eps)])]
                         [(* n groups) 1 1])
+           output))
+       (-embedding [_ indices-h weight-h {:keys [tokens rows dim]}]
+         (let [total (* tokens dim)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding)
+                        [indices-h weight-h output
+                         (wb/uni dev (wb/u32-tag [tokens rows dim 0]))]
+                        [(wb/ceil-div total 64) 1 1])
            output))
        (-upsample-nearest2d [_ input-h
                              {:keys [n c h width oh ow scale-h scale-w]}]

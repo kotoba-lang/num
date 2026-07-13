@@ -63,6 +63,13 @@
                                           (arr/from-vec cpu-b [0.8 1.1 -0.7 1.3] [4])
                                           (arr/from-vec cpu-b [0.1 -0.2 0.05 0.3] [4])
                                           1.0e-5))
+        embedding-indices [2 0 2 1]
+        embedding-weights [0.1 0.2 0.3, -0.2 0.4 0.5,
+                           0.7 -0.1 0.6, 0.0 0.2 -0.3]
+        exp-embedding (arr/->vec
+                       (t/embedding
+                        (arr/from-vec cpu-b embedding-indices [4])
+                        (arr/from-vec cpu-b embedding-weights [4 3])))
         A (arr/from-vec cpu-b [1 2 3 4] [2 2])
         xv (arr/from-vec cpu-b [1 1] [2])
         B (arr/from-vec cpu-b [5 6 7 8] [2 2])
@@ -222,6 +229,9 @@
                                     (arr/from-vec gpu [0.8 1.1 -0.7 1.3] [4])
                                     (arr/from-vec gpu [0.1 -0.2 0.05 0.3] [4])
                                     1.0e-5)
+                 embedding-out
+                 (t/embedding (arr/from-vec gpu embedding-indices [4])
+                              (arr/from-vec gpu embedding-weights [4 3]))
                  bias-add-out (t/add (arr/from-vec gpu bias-input-values [2 3])
                                      (arr/from-vec gpu bias-values [3]))
                  mha-out (t/multi-head-attention
@@ -287,6 +297,8 @@
                    (fn [g] (contract/approx-vec? g exp-gelu-gradient))]
                   ["layernorm-last" (->p (arr/->vec layernorm-out))
                    (fn [g] (contract/approx-vec? g exp-layernorm))]
+                  ["embedding" (->p (arr/->vec embedding-out))
+                   (fn [g] (contract/approx-vec? g exp-embedding))]
                   ["conv2d-nchw" (->p (arr/->vec conv-out))                    (fn [g] (contract/approx-vec? g exp-conv))]
                   ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]
                   ["conv2d-output-channel-4" (->p (arr/->vec oc4-out))

@@ -64,7 +64,8 @@
 (defprotocol IDTypeTensorOps
   "Optional N-D compute operations over physical typed storage."
   (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])
-  (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype]))
+  (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype])
+  (-embedding-dtype [b indices-h weight-h params dtype]))
 
 (defprotocol ITensorBackend
   "Optional device-native N-D operations. Backends that do not implement this
@@ -74,6 +75,8 @@
     returns a newly allocated output handle.")
   (-group-norm-nchw [b input-h weight-h bias-h params]
     "NCHW GroupNorm with optional affine parameters; returns a new handle.")
+  (-embedding [b indices-h weight-h params]
+    "Gather embedding rows for contiguous f32 token indices.")
   (-upsample-nearest2d [b input-h params]
     "Integer nearest-neighbor NCHW upsampling; returns a new handle.")
   (-cat [b input-handles params]

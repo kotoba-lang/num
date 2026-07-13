@@ -163,6 +163,14 @@
                     (uni dev [(double eps)])]
                    [(* n groups) 1 1])
       output))
+  (-embedding [_ indices-h weight-h {:keys [tokens rows dim]}]
+    (let [total (* tokens dim)
+          output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :embedding)
+                   [indices-h weight-h output
+                    (uni dev (u32-tag [tokens rows dim 0]))]
+                   [(ceil-div total 64) 1 1])
+      output))
   (-upsample-nearest2d [_ input-h {:keys [n c h width oh ow scale-h scale-w]}]
     (let [total (* n c oh ow)
           output (w/-create-buffer dev total :storage)

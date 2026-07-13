@@ -616,6 +616,30 @@
                           1 weight bias eps)
         shape)))))
 
+(defn embedding*
+  "Differentiable embedding lookup. Token IDs are constants; gradients are
+  accumulated into weight rows, including repeated-token scatter-adds."
+  [indices weight]
+  (let [weight-data (:data weight)
+        output (t/embedding indices weight-data)
+        ids (delay (mapv long (arr/->vec indices)))
+        [rows dim] (:shape weight-data)]
+    (node output [weight]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [gs (vec (arr/->vec g))
+                    dw (double-array (* rows dim))]
+                (doseq [[token-pos row] (map-indexed vector @ids)
+                        feature (range dim)]
+                  (let [weight-index (+ (* row dim) feature)
+                        gradient-index (+ (* token-pos dim) feature)]
+                    (aset dw weight-index
+                          (+ (aget dw weight-index) (nth gs gradient-index)))))
+                (accumulate! weight
+                             (arr/from-vec (:backend weight-data) (vec dw)
+                                           (:shape weight-data)
+                                           (or (:dtype weight-data) :f32)))))))))
+
 (defn cat*
   "Differentiable `num.tensor/cat`. Backward slices the upstream gradient
   along the concatenation axis and accumulates one contiguous gradient per
