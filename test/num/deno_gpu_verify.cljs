@@ -89,7 +89,23 @@
         exp-groupnorm-no-affine (arr/->vec
                                  (t/group-norm-nchw
                                   (arr/from-vec cpu-b (take 32 norm-input-values)
-                                                [1 4 4 2]) 2))]
+                                                [1 4 4 2]) 2))
+        exp-unet-chain
+        (arr/->vec
+         (t/upsample-nearest2d
+          (nm/silu
+           (t/group-norm-nchw
+            (arr/from-vec cpu-b norm-input-values [2 32 16 16]) 4
+            (arr/from-vec cpu-b norm-weight-values [32])
+            (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5))
+          [2 2]))
+        cpu-groupnorm (t/group-norm-nchw
+                       (arr/from-vec cpu-b norm-input-values [2 32 16 16]) 4
+                       (arr/from-vec cpu-b norm-weight-values [32])
+                       (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5)
+        exp-cat (arr/->vec
+                 (t/cat [(t/upsample-nearest2d (nm/silu cpu-groupnorm) 2)
+                         (t/upsample-nearest2d cpu-groupnorm 2)] 1))]
     (-> (dg/request-device)
         (.then
          (fn [r]
@@ -122,6 +138,9 @@
                  groupnorm-no-affine-out
                  (t/group-norm-nchw
                   (arr/from-vec gpu (take 32 norm-input-values) [1 4 4 2]) 2)
+                 unet-chain-out (t/upsample-nearest2d (nm/silu groupnorm-out) [2 2])
+                 cat-out (t/cat [unet-chain-out
+                                 (t/upsample-nearest2d groupnorm-out 2)] 1)
                  checks
                  [["dot"    (->p (nm/dot xg yg))                              (fn [g] (contract/approx? g exp-dot))]
                   ["nrm2"   (->p (nm/nrm2 (arr/from-vec gpu [3 4] [2])))      (fn [g] (contract/approx? g exp-nrm2))]
@@ -146,7 +165,10 @@
                   ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]
                   ["groupnorm-nchw" (->p (arr/->vec groupnorm-out))            (fn [g] (contract/approx-vec? g exp-groupnorm))]
                   ["groupnorm-no-affine" (->p (arr/->vec groupnorm-no-affine-out))
-                                            (fn [g] (contract/approx-vec? g exp-groupnorm-no-affine))]]]
+                                            (fn [g] (contract/approx-vec? g exp-groupnorm-no-affine))]
+                  ["groupnorm-silu-upsample-chain" (->p (arr/->vec unet-chain-out))
+                                                    (fn [g] (contract/approx-vec? g exp-unet-chain))]
+                  ["unet-skip-cat" (->p (arr/->vec cat-out))                  (fn [g] (contract/approx-vec? g exp-cat))]]]
              (-> (js/Promise.all
                   (into-array
                    (map (fn [[label prom okfn]]

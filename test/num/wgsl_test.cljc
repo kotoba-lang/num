@@ -10,7 +10,7 @@
 (deftest shader-set-is-complete
   (testing "every accelerated IBackend op has a non-empty WGSL kernel"
     (doseq [op [:axpy :scal :ewise :ewise1 :reduce :gemv :gemm
-                :conv2d-nchw :group-norm-nchw :spmv]]
+                :conv2d-nchw :group-norm-nchw :upsample-nearest2d :cat-copy :spmv]]
       (is (string? (get w/shaders op)) (str "missing shader: " op))
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"

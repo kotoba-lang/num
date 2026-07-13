@@ -45,9 +45,10 @@
   `softmax`/`conv2d`/`attention` this phase adds) against a Deno GPU backend
   throws (`[object Promise] is not ISeqable`), confirmed by direct test.
   Most generic operations in this namespace still require that synchronous
-  readback. Device-native exceptions now include metadata-only reshapes, SiLU,
-  full NCHW convolution, and GroupNorm through `ITensorBackend`; they are
-  directly verified on Apple M4 Metal (`num.deno-gpu-verify`, 22/22).
+  readback. Device-native exceptions now include metadata-only reshapes and the
+  UNet path (SiLU, full NCHW convolution, GroupNorm, nearest upsampling, cat)
+  through `ITensorBackend`; they are directly verified on Apple M4 Metal
+  (`num.deno-gpu-verify`, 24/24).
 
   PARTIALLY CLOSED (same day): `num.tensor-async` (cljs-only) adds async
   twins of exactly `conv2d`/`attention`'s underlying ops (2-D transpose, 2-D
@@ -553,7 +554,8 @@
 
 (defn cat
   "Concatenate equal-rank tensors along `axis` (PyTorch `torch.cat` shape
-  semantics). All non-concatenated dimensions must match."
+  semantics). All non-concatenated dimensions must match. ITensorBackend
+  implementations dispatch device-to-device slice copies."
   [tensors axis]
   (let [tensors (vec tensors)]
     (when (empty? tensors)
@@ -577,22 +579,37 @@
                              (reduce + (map #(long (nth (:shape %) axis)) tensors)))
             outer (long (arr/nelems (subvec first-shape 0 axis)))
             inner (long (arr/nelems (subvec first-shape (inc axis))))
-            out (double-array (arr/nelems out-shape))
-            sources (mapv #(double-array (arr/->vec %)) tensors)
-            axis-sizes (mapv #(long (nth (:shape %) axis)) tensors)]
-        (dotimes [outer-index outer]
-          (loop [tensor-index 0 axis-offset 0]
-            (when (< tensor-index (count tensors))
-              (let [axis-size (nth axis-sizes tensor-index)
-                    ^doubles source (nth sources tensor-index)
-                    count (* axis-size inner)
-                    source-base (* outer-index count)
-                    output-base (+ (* outer-index (nth out-shape axis) inner)
-                                   (* axis-offset inner))]
-                (dotimes [i count]
-                  (aset out (+ output-base i) (aget source (+ source-base i))))
-                (recur (inc tensor-index) (+ axis-offset axis-size))))))
-        (arr/from-vec (:backend (first tensors)) (vec out) out-shape)))))
+            axis-sizes (mapv #(long (nth (:shape %) axis)) tensors)
+            backend (:backend (first tensors))]
+        (if (and (satisfies? p/ITensorBackend backend)
+                 (every? #(= backend (:backend %)) tensors))
+          (let [offsets (butlast (reductions + 0 axis-sizes))
+                inputs (mapv (fn [tensor axis-size axis-offset]
+                               {:total (arr/nelems (:shape tensor))
+                                :block (* axis-size inner)
+                                :axis-offset (* axis-offset inner)})
+                             tensors axis-sizes offsets)
+                params {:total-output (arr/nelems out-shape)
+                        :output-block (* (nth out-shape axis) inner)
+                        :inputs inputs}]
+            (arr/->NDArray backend
+                           (p/-cat backend (mapv :handle tensors) params)
+                           out-shape))
+          (let [out (double-array (arr/nelems out-shape))
+                sources (mapv #(double-array (arr/->vec %)) tensors)]
+            (dotimes [outer-index outer]
+              (loop [tensor-index 0 axis-offset 0]
+                (when (< tensor-index (count tensors))
+                  (let [axis-size (nth axis-sizes tensor-index)
+                        ^doubles source (nth sources tensor-index)
+                        count (* axis-size inner)
+                        source-base (* outer-index count)
+                        output-base (+ (* outer-index (nth out-shape axis) inner)
+                                       (* axis-offset inner))]
+                    (dotimes [i count]
+                      (aset out (+ output-base i) (aget source (+ source-base i))))
+                    (recur (inc tensor-index) (+ axis-offset axis-size))))))
+            (arr/from-vec backend (vec out) out-shape)))))))
 
 (defn group-norm-nchw
   "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
@@ -653,7 +670,8 @@
            (arr/from-vec backend (vec out) [N C H W])))))))
 
 (defn upsample-nearest2d
-  "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`."
+  "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.
+  ITensorBackend implementations execute it device-native."
   [input scale-factor]
   (let [[N C H W :as shape] (:shape input)
         [scale-h scale-w] (pair-option :scale-factor scale-factor)]
@@ -662,16 +680,23 @@
                       {:shape shape :scale-factor [scale-h scale-w]})))
     (let [N (long N) C (long C) H (long H) W (long W)
           oh (* H scale-h) ow (* W scale-w)
-          xs (double-array (arr/->vec input))
-          out (double-array (* N C oh ow))]
-      (dotimes [n N]
-        (dotimes [c C]
-          (dotimes [oi oh]
-            (dotimes [oj ow]
-              (aset out (+ (* n C oh ow) (* c oh ow) (* oi ow) oj)
-                    (aget xs (+ (* n C H W) (* c H W)
-                                (* (quot oi scale-h) W) (quot oj scale-w))))))))
-      (arr/from-vec (:backend input) (vec out) [N C oh ow]))))
+          backend (:backend input)
+          params {:n N :c C :h H :width W :oh oh :ow ow
+                  :scale-h scale-h :scale-w scale-w}]
+      (if (satisfies? p/ITensorBackend backend)
+        (arr/->NDArray backend
+                       (p/-upsample-nearest2d backend (:handle input) params)
+                       [N C oh ow])
+        (let [xs (double-array (arr/->vec input))
+              out (double-array (* N C oh ow))]
+          (dotimes [n N]
+            (dotimes [c C]
+              (dotimes [oi oh]
+                (dotimes [oj ow]
+                  (aset out (+ (* n C oh ow) (* c oh ow) (* oi ow) oj)
+                        (aget xs (+ (* n C H W) (* c H W)
+                                    (* (quot oi scale-h) W) (quot oj scale-w))))))))
+          (arr/from-vec backend (vec out) [N C oh ow]))))))
 
 ;; --- attention (ADR-2607131500 Phase 1) -----------------------------------------
 

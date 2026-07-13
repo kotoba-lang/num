@@ -324,6 +324,49 @@ fn main(@builtin(local_invocation_id) lid3: vec3<u32>,
   }
 }")
 
+(def upsample-nearest2d-wgsl
+  "Nearest-neighbor NCHW upsampling, one invocation per output element."
+  "
+struct Dims {
+  n: u32, c: u32, h: u32, w: u32,
+  oh: u32, ow: u32, scale_h: u32, scale_w: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> d: Dims;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  let total = d.n * d.c * d.oh * d.ow;
+  if (index >= total) { return; }
+  let oj = index % d.ow;
+  let oi = (index / d.ow) % d.oh;
+  let channel = (index / (d.ow * d.oh)) % d.c;
+  let batch = index / (d.ow * d.oh * d.c);
+  let input_index = ((batch * d.c + channel) * d.h + oi / d.scale_h) * d.w
+                    + oj / d.scale_w;
+  output[index] = input[input_index];
+}")
+
+(def cat-copy-wgsl
+  "Copy one contiguous tensor into its slice of a concatenated output. Repeated
+  queue-ordered dispatches fill one output buffer without host readback."
+  "
+struct Dims {
+  total: u32, block: u32, output_block: u32, axis_offset: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> d: Dims;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  if (index >= d.total) { return; }
+  let outer = index / d.block;
+  let within = index % d.block;
+  output[outer * d.output_block + d.axis_offset + within] = input[index];
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -338,6 +381,8 @@ fn main(@builtin(local_invocation_id) lid3: vec3<u32>,
    :gemm   gemm-tiled-wgsl
    :conv2d-nchw conv2d-nchw-wgsl
    :group-norm-nchw group-norm-nchw-wgsl
+   :upsample-nearest2d upsample-nearest2d-wgsl
+   :cat-copy cat-copy-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------

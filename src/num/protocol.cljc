@@ -54,4 +54,8 @@
     "NCHW cross-correlation. `params` contains validated dimensions/options;
     returns a newly allocated output handle.")
   (-group-norm-nchw [b input-h weight-h bias-h params]
-    "NCHW GroupNorm with optional affine parameters; returns a new handle."))
+    "NCHW GroupNorm with optional affine parameters; returns a new handle.")
+  (-upsample-nearest2d [b input-h params]
+    "Integer nearest-neighbor NCHW upsampling; returns a new handle.")
+  (-cat [b input-handles params]
+    "Concatenate contiguous tensors along an arbitrary axis; returns a new handle."))

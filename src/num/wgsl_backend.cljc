@@ -149,6 +149,22 @@
                    [input-h weight bias output (uni dev (u32-tag dims))
                     (uni dev [(double eps)])]
                    [(* n groups) 1 1])
+      output))
+  (-upsample-nearest2d [_ input-h {:keys [n c h width oh ow scale-h scale-w]}]
+    (let [total (* n c oh ow)
+          output (w/-create-buffer dev total :storage)
+          dims [n c h width oh ow scale-h scale-w]]
+      (w/-dispatch dev (get-pipeline dev pipes :upsample-nearest2d)
+                   [input-h output (uni dev (u32-tag dims))]
+                   [(ceil-div total 64) 1 1])
+      output))
+  (-cat [_ input-handles {:keys [total-output output-block inputs]}]
+    (let [output (w/-create-buffer dev total-output :storage)]
+      (doseq [[input-h {:keys [total block axis-offset]}]
+              (map vector input-handles inputs)]
+        (w/-dispatch dev (get-pipeline dev pipes :cat-copy)
+                     [input-h output (uni dev (u32-tag [total block output-block axis-offset]))]
+                     [(ceil-div total 64) 1 1]))
       output)))
 
 (defn wgsl-backend
