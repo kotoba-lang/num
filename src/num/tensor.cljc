@@ -61,6 +61,7 @@
   `amin`/`mean`) remains sync-only/CPU-verified-only — `num.tensor-async`
   deliberately targets only what `comfyui.nodes.toy-diffusion` needs, not a
   full async generalization of this namespace; see that ns's own docstring."
+  (:refer-clojure :exclude [cat])
   (:require [num.array :as arr]
             [num.core :as nm]
             [num.protocol :as p]))
@@ -424,6 +425,232 @@
               Kflat-T (transpose (reshape kernel [Cout patch-size]))  ; [patch-size Cout]
               out (matmul P Kflat-T)]                                ; [oh*ow Cout]
           (reshape (transpose out) [Cout oh ow]))))))
+
+(defn- pair-option [option-name value]
+  (let [pair (if (sequential? value) (vec value) [value value])]
+    (when-not (= 2 (count pair))
+      (throw (ex-info (str "num.tensor/conv2d-nchw: " (name option-name) " must be a scalar or pair")
+                      {:option option-name :value value})))
+    (mapv long pair)))
+
+(defn conv2d-nchw
+  "PyTorch-compatible NCHW cross-correlation.
+
+  `input` is `[N C_in H W]`, `weight` is
+  `[C_out C_in/groups kH kW]`, and optional `bias` is `[C_out]`.
+  Options: `:stride`, `:padding`, and `:dilation` are a scalar or `[h w]`;
+  `:groups` defaults to 1. Returns `[N C_out outH outW]` using PyTorch's
+  floor output-size rule. Despite the conventional name, this is
+  cross-correlation (kernel is not flipped), matching torch/ComfyUI weights.
+
+  This closes the shape/semantics boundary needed by real UNets: batching,
+  input/output channels, same-padding, downsampling stride, dilation, grouped
+  and depthwise convolution, and bias. Like the general N-D ops in this
+  namespace it is currently host-materialized; a device-native kernel remains
+  a performance task, not a correctness ambiguity."
+  ([input weight] (conv2d-nchw input weight nil {}))
+  ([input weight bias] (conv2d-nchw input weight bias {}))
+  ([input weight bias {:keys [stride padding dilation groups]
+                       :or {stride 1 padding 0 dilation 1 groups 1}}]
+   (let [input-shape (:shape input)
+         weight-shape (:shape weight)]
+     (when-not (= 4 (count input-shape))
+       (throw (ex-info "num.tensor/conv2d-nchw: input must have shape [N C H W]"
+                       {:shape input-shape})))
+     (when-not (= 4 (count weight-shape))
+       (throw (ex-info "num.tensor/conv2d-nchw: weight must have shape [Cout Cin/groups kH kW]"
+                       {:shape weight-shape})))
+     (let [[N Cin H W] (mapv long input-shape)
+           [Cout Cin-per-group kh kw] (mapv long weight-shape)
+           [sh sw] (pair-option :stride stride)
+           [ph pw] (pair-option :padding padding)
+           [dh dw] (pair-option :dilation dilation)
+           groups (long groups)]
+       (when-not (and (pos? sh) (pos? sw) (pos? dh) (pos? dw) (pos? groups))
+         (throw (ex-info "num.tensor/conv2d-nchw: stride, dilation, and groups must be positive"
+                         {:stride [sh sw] :dilation [dh dw] :groups groups})))
+       (when (or (neg? ph) (neg? pw))
+         (throw (ex-info "num.tensor/conv2d-nchw: padding must be non-negative"
+                         {:padding [ph pw]})))
+       (when-not (and (zero? (mod Cin groups))
+                      (zero? (mod Cout groups))
+                      (= Cin-per-group (quot Cin groups)))
+         (throw (ex-info "num.tensor/conv2d-nchw: channels are incompatible with groups"
+                         {:input-channels Cin :output-channels Cout
+                          :weight-input-channels Cin-per-group :groups groups})))
+       (when (and bias (not= [Cout] (:shape bias)))
+         (throw (ex-info "num.tensor/conv2d-nchw: bias must have shape [Cout]"
+                         {:expected [Cout] :actual (:shape bias)})))
+       (let [effective-kh (inc (* dh (dec kh)))
+             effective-kw (inc (* dw (dec kw)))
+             _ (when (or (< (+ H (* 2 ph)) effective-kh)
+                         (< (+ W (* 2 pw)) effective-kw))
+                 (throw (ex-info "num.tensor/conv2d-nchw: effective kernel larger than padded input"
+                                 {:input [H W] :kernel [kh kw] :padding [ph pw]
+                                  :dilation [dh dw]})))
+             oh (inc (quot (- (+ H (* 2 ph)) effective-kh) sh))
+             ow (inc (quot (- (+ W (* 2 pw)) effective-kw) sw))
+             xs (double-array (arr/->vec input))
+               ws (double-array (arr/->vec weight))
+               bs (when bias (double-array (arr/->vec bias)))
+               out (double-array (* N Cout oh ow))
+               outputs-per-group (quot Cout groups)]
+           (dotimes [n N]
+             (dotimes [oc Cout]
+               (let [group (quot oc outputs-per-group)
+                     input-channel-base (* group Cin-per-group)]
+                 (dotimes [oi oh]
+                   (dotimes [oj ow]
+                     (let [sum
+                           (loop [icg 0 sum (if bs (aget bs oc) 0.0)]
+                             (if (< icg Cin-per-group)
+                               (let [ic (+ input-channel-base icg)
+                                     sum
+                                     (loop [ki 0 sum sum]
+                                       (if (< ki kh)
+                                         (let [ih (+ (- (* oi sh) ph) (* ki dh))
+                                               sum
+                                               (if (or (neg? ih) (>= ih H))
+                                                 sum
+                                                 (loop [kj 0 sum sum]
+                                                   (if (< kj kw)
+                                                     (let [iw (+ (- (* oj sw) pw) (* kj dw))]
+                                                       (recur (inc kj)
+                                                              (if (or (neg? iw) (>= iw W))
+                                                                sum
+                                                                (+ sum
+                                                                   (* (aget xs (+ (* n Cin H W)
+                                                                                  (* ic H W)
+                                                                                  (* ih W) iw))
+                                                                      (aget ws (+ (* oc Cin-per-group kh kw)
+                                                                                  (* icg kh kw)
+                                                                                  (* ki kw) kj)))))))
+                                                     sum)))]
+                                           (recur (inc ki) sum))
+                                         sum))]
+                                 (recur (inc icg) sum))
+                               sum))]
+                       (aset out (+ (* n Cout oh ow) (* oc oh ow) (* oi ow) oj) sum)))))))
+         (arr/from-vec (:backend input) (vec out) [N Cout oh ow]))))))
+
+;; --- UNet tensor building blocks -----------------------------------------------
+
+(defn silu
+  "Elementwise SiLU/Swish: `x * sigmoid(x)`."
+  [input]
+  (let [one (arr/from-vec (:backend input) [1.0] [])]
+    (div input (add one (nm/exp (nm/neg input))))))
+
+(defn cat
+  "Concatenate equal-rank tensors along `axis` (PyTorch `torch.cat` shape
+  semantics). All non-concatenated dimensions must match."
+  [tensors axis]
+  (let [tensors (vec tensors)]
+    (when (empty? tensors)
+      (throw (ex-info "num.tensor/cat requires at least one tensor" {})))
+    (let [first-shape (:shape (first tensors))
+          rank (count first-shape)
+          axis (long (if (neg? axis) (+ rank axis) axis))]
+      (when-not (< -1 axis rank)
+        (throw (ex-info "num.tensor/cat axis out of range"
+                        {:axis axis :rank rank})))
+      (doseq [tensor tensors]
+        (when-not (and (= rank (count (:shape tensor)))
+                       (every? true?
+                               (map-indexed
+                                (fn [i size]
+                                  (or (= i axis) (= size (nth first-shape i))))
+                                (:shape tensor))))
+          (throw (ex-info "num.tensor/cat shapes differ outside axis"
+                          {:shapes (mapv :shape tensors) :axis axis}))))
+      (let [out-shape (assoc first-shape axis
+                             (reduce + (map #(long (nth (:shape %) axis)) tensors)))
+            outer (long (arr/nelems (subvec first-shape 0 axis)))
+            inner (long (arr/nelems (subvec first-shape (inc axis))))
+            out (double-array (arr/nelems out-shape))
+            sources (mapv #(double-array (arr/->vec %)) tensors)
+            axis-sizes (mapv #(long (nth (:shape %) axis)) tensors)]
+        (dotimes [outer-index outer]
+          (loop [tensor-index 0 axis-offset 0]
+            (when (< tensor-index (count tensors))
+              (let [axis-size (nth axis-sizes tensor-index)
+                    ^doubles source (nth sources tensor-index)
+                    count (* axis-size inner)
+                    source-base (* outer-index count)
+                    output-base (+ (* outer-index (nth out-shape axis) inner)
+                                   (* axis-offset inner))]
+                (dotimes [i count]
+                  (aset out (+ output-base i) (aget source (+ source-base i))))
+                (recur (inc tensor-index) (+ axis-offset axis-size))))))
+        (arr/from-vec (:backend (first tensors)) (vec out) out-shape)))))
+
+(defn group-norm-nchw
+  "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
+  (`unbiased=false`), as in `torch.nn.GroupNorm`. Optional affine `weight` and
+  `bias` have shape `[C]`."
+  ([input num-groups] (group-norm-nchw input num-groups nil nil 1.0e-5))
+  ([input num-groups weight bias eps]
+   (let [[N C H W :as shape] (:shape input)
+         groups (long num-groups)]
+     (when-not (and (= 4 (count shape)) (pos? groups) (zero? (mod (long C) groups))
+                    (<= 0.0 eps))
+       (throw (ex-info "num.tensor/group-norm-nchw requires [N C H W] and groups dividing C"
+                       {:shape shape :groups groups :eps eps})))
+     (when (and weight (not= [(long C)] (:shape weight)))
+       (throw (ex-info "group norm weight must have shape [C]" {:shape (:shape weight)})))
+     (when (and bias (not= [(long C)] (:shape bias)))
+       (throw (ex-info "group norm bias must have shape [C]" {:shape (:shape bias)})))
+     (let [N (long N) C (long C) H (long H) W (long W)
+           channels-per-group (quot C groups)
+           group-size (* channels-per-group H W)
+           xs (double-array (arr/->vec input))
+           ws (when weight (double-array (arr/->vec weight)))
+           bs (when bias (double-array (arr/->vec bias)))
+           out (double-array (* N C H W))]
+       (dotimes [n N]
+         (dotimes [group groups]
+           (let [base (+ (* n C H W) (* group group-size))
+                 mean (/ (loop [i 0 sum 0.0]
+                           (if (< i group-size)
+                             (recur (inc i) (+ sum (aget xs (+ base i))))
+                             sum))
+                         group-size)
+                 variance (/ (loop [i 0 sum 0.0]
+                               (if (< i group-size)
+                                 (let [d (- (aget xs (+ base i)) mean)]
+                                   (recur (inc i) (+ sum (* d d))))
+                                 sum))
+                             group-size)
+                 inv-std (/ 1.0 (Math/sqrt (+ variance eps)))]
+             (dotimes [i group-size]
+               (let [channel (+ (* group channels-per-group)
+                                (quot i (* H W)))
+                     normalized (* (- (aget xs (+ base i)) mean) inv-std)
+                     value (+ (* normalized (if ws (aget ws channel) 1.0))
+                              (if bs (aget bs channel) 0.0))]
+                 (aset out (+ base i) value))))))
+       (arr/from-vec (:backend input) (vec out) [N C H W])))))
+
+(defn upsample-nearest2d
+  "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`."
+  [input scale-factor]
+  (let [[N C H W :as shape] (:shape input)
+        [scale-h scale-w] (pair-option :scale-factor scale-factor)]
+    (when-not (and (= 4 (count shape)) (pos? scale-h) (pos? scale-w))
+      (throw (ex-info "num.tensor/upsample-nearest2d requires NCHW and positive scale"
+                      {:shape shape :scale-factor [scale-h scale-w]})))
+    (let [N (long N) C (long C) H (long H) W (long W)
+          oh (* H scale-h) ow (* W scale-w)
+          xs (double-array (arr/->vec input))
+          out (double-array (* N C oh ow))]
+      (dotimes [n N]
+        (dotimes [c C]
+          (dotimes [oi oh]
+            (dotimes [oj ow]
+              (aset out (+ (* n C oh ow) (* c oh ow) (* oi ow) oj)
+                    (aget xs (+ (* n C H W) (* c H W)
+                                (* (quot oi scale-h) W) (quot oj scale-w))))))))
+      (arr/from-vec (:backend input) (vec out) [N C oh ow]))))
 
 ;; --- attention (ADR-2607131500 Phase 1) -----------------------------------------
 
