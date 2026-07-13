@@ -555,6 +555,29 @@
                          (wb/uni dev (wb/u32-tag [rows cols]))]
                         [(wb/ceil-div cols 16) (wb/ceil-div rows 16) 1])
            output))
+       (-transpose-nd [_ input-h {:keys [rank total input-shape output-shape perm]}]
+         (let [pad4 #(vec (take 4 (concat % (repeat 0))))
+               params (concat [rank total 0 0] (pad4 input-shape)
+                              (pad4 output-shape) (pad4 perm))
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-nd)
+                        [input-h output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-batched-matmul [_ a-h b-h
+                         {:keys [batch-shape batch-a batch-b batch-rank
+                                 batches m k n total]}]
+         (let [align (fn [shape]
+                       (vec (concat (repeat (- batch-rank (count shape)) 1) shape
+                                    (repeat (- 4 batch-rank) 1))))
+               out-shape (vec (concat batch-shape (repeat (- 4 batch-rank) 1)))
+               params (concat [batch-rank batches m n] [k total 0 0]
+                              out-shape (align batch-a) (align batch-b))
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :batched-matmul)
+                        [a-h b-h output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
        (-sum-rows [_ input-h {:keys [rows cols]}]
          (let [output (w/-create-buffer dev cols :storage)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :bias-gradient)

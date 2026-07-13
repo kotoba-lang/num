@@ -114,6 +114,10 @@
     "Broadcast-add a rank-1 bias over every contiguous last-axis row.")
   (-transpose-2d [b input-h params]
     "Out-of-place transpose of a contiguous f32 matrix.")
+  (-transpose-nd [b input-h params]
+    "Out-of-place axis permutation for a contiguous rank-1 through rank-4 tensor.")
+  (-batched-matmul [b a-h b-h params]
+    "Batched f32 matrix multiplication with broadcast leading dimensions.")
   (-sum-rows [b input-h params]
     "Reduce a contiguous f32 matrix over its row axis.")
   (-mse-loss [b prediction-h target-h params]

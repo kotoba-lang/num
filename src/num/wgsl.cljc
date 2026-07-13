@@ -588,6 +588,79 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }")
 
+(def transpose-nd-wgsl
+  "Generic contiguous rank-1 through rank-4 axis permutation."
+  "
+struct Params {
+  info: vec4<u32>, input_shape: vec4<u32>, output_shape: vec4<u32>, perm: vec4<u32>
+}
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let output_index = gid.x;
+  let rank = p.info.x; if (output_index >= p.info.y) { return; }
+  var remaining = output_index; var output_coord = vec4<u32>(0u);
+  var axis = rank;
+  loop {
+    if (axis == 0u) { break; }
+    axis = axis - 1u;
+    output_coord[axis] = remaining % p.output_shape[axis];
+    remaining = remaining / p.output_shape[axis];
+  }
+  var input_coord = vec4<u32>(0u); var i = 0u;
+  loop {
+    if (i >= rank) { break; }
+    input_coord[p.perm[i]] = output_coord[i]; i = i + 1u;
+  }
+  var input_index = 0u; i = 0u;
+  loop {
+    if (i >= rank) { break; }
+    input_index = input_index * p.input_shape[i] + input_coord[i]; i = i + 1u;
+  }
+  output[output_index] = input[input_index];
+}")
+
+(def batched-matmul-wgsl
+  "Batched matmul with up to two NumPy-broadcast leading dimensions."
+  "
+struct Params {
+  info: vec4<u32>, dims: vec4<u32>, batch_out: vec4<u32>,
+  batch_a: vec4<u32>, batch_b: vec4<u32>
+}
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; let rank = p.info.x; let m = p.info.z; let n = p.info.w;
+  let k = p.dims.x; if (index >= p.dims.y) { return; }
+  let matrix_size = m * n; let batch = index / matrix_size;
+  let local = index % matrix_size; let row = local / n; let column = local % n;
+  var coords = vec4<u32>(0u); var remaining = batch; var axis = rank;
+  loop {
+    if (axis == 0u) { break; } axis = axis - 1u;
+    coords[axis] = remaining % p.batch_out[axis];
+    remaining = remaining / p.batch_out[axis];
+  }
+  var a_batch = 0u; var b_batch = 0u; var i = 0u;
+  loop {
+    if (i >= rank) { break; }
+    a_batch = a_batch * p.batch_a[i] + select(coords[i], 0u, p.batch_a[i] == 1u);
+    b_batch = b_batch * p.batch_b[i] + select(coords[i], 0u, p.batch_b[i] == 1u);
+    i = i + 1u;
+  }
+  var sum = 0.0; i = 0u;
+  loop {
+    if (i >= k) { break; }
+    sum = sum + a[(a_batch * m + row) * k + i] * b[(b_batch * k + i) * n + column];
+    i = i + 1u;
+  }
+  output[index] = sum;
+}")
+
 (def add-last-axis-bias-wgsl
   "Broadcast a rank-1 bias over contiguous rows."
   "
@@ -1921,6 +1994,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :pad-right-bottom-nchw pad-right-bottom-nchw-wgsl
    :add-last-axis-bias add-last-axis-bias-wgsl
    :transpose-2d transpose-2d-wgsl
+   :transpose-nd transpose-nd-wgsl
+   :batched-matmul batched-matmul-wgsl
    :bias-gradient bias-gradient-wgsl
    :mse-loss mse-loss-wgsl
    :mse-gradient mse-gradient-wgsl

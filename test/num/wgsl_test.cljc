@@ -19,6 +19,8 @@
                 :rgb-image-to-nchw :nchw-to-rgb-image
                 :add-last-axis-bias :multi-head-attention
                 :multi-head-attention-backward :transpose-2d :bias-gradient
+                :transpose-nd
+                :batched-matmul
                 :mse-loss :mse-gradient :sgd-step :adamw-step
                 :unscale-gradient :spmv
                 :q4-k-matmul :q6-k-matmul :q8-0-matmul

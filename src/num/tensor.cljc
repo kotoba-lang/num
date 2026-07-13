@@ -358,15 +358,21 @@
                         {:shape shape :perm perm})))
      (let [out-shape (mapv shape perm)
            backend (:backend a)]
-       (if (and (= r 2) (= perm [1 0]) (= :f32 (array-dtype a))
+       (if (and (<= 1 r 4) (= :f32 (array-dtype a))
                 (satisfies? p/ITensorBackend backend))
-         (assoc (arr/->NDArray
-                 backend
-                 (p/-transpose-2d backend (:handle a)
-                                  {:rows (long (first shape))
-                                   :cols (long (second shape))})
-                 out-shape)
-                :dtype :f32)
+         (assoc
+          (arr/->NDArray
+           backend
+           (if (and (= r 2) (= perm [1 0]))
+             (p/-transpose-2d backend (:handle a)
+                              {:rows (long (first shape))
+                               :cols (long (second shape))})
+             (p/-transpose-nd backend (:handle a)
+                              {:rank r :total (arr/nelems out-shape)
+                               :input-shape shape :output-shape out-shape
+                               :perm perm}))
+           out-shape)
+          :dtype :f32)
          (let [in-strides (row-major-strides shape)
                out-strides (row-major-strides out-shape)
                xs (double-array (arr/->vec a))
@@ -476,23 +482,36 @@
               batch-b (vec (drop-last 2 sb))
               batch-shape (broadcast-shapes batch-a batch-b)
               nb (long (arr/nelems batch-shape))
-              A' (broadcast-to A (into batch-shape [m ka]))
-              B' (broadcast-to B (into batch-shape [ka n]))
-              xa (double-array (arr/->vec A'))
-              xb (double-array (arr/->vec B'))
-              out (double-array (* nb m n))]
-          (dotimes [bi nb]
-            (let [a-off (* bi m ka) b-off (* bi ka n) c-off (* bi m n)]
-              (dotimes [i m]
-                (dotimes [j n]
-                  (let [s (loop [l 0 s 0.0]
-                            (if (< l ka)
-                              (recur (inc l)
-                                     (+ s (* (aget xa (+ a-off (* i ka) l))
-                                             (aget xb (+ b-off (* l n) j)))))
-                              s))]
-                    (aset out (+ c-off (* i n) j) s))))))
-          (arr/from-vec (:backend A) (vec out) (into batch-shape [m n])))))))
+              backend (:backend A)
+              out-shape (into batch-shape [m n])]
+          (if (and (= backend (:backend B)) (= :f32 (array-dtype A))
+                   (= :f32 (array-dtype B)) (<= (count batch-shape) 2)
+                   (satisfies? p/ITensorBackend backend))
+            (assoc (arr/->NDArray
+                    backend
+                    (p/-batched-matmul
+                     backend (:handle A) (:handle B)
+                     {:batch-shape batch-shape :batch-a batch-a :batch-b batch-b
+                      :batch-rank (count batch-shape) :batches nb
+                      :m m :k ka :n n :total (* nb m n)})
+                    out-shape) :dtype :f32)
+            (let [A' (broadcast-to A (into batch-shape [m ka]))
+                  B' (broadcast-to B (into batch-shape [ka n]))
+                  xa (double-array (arr/->vec A'))
+                  xb (double-array (arr/->vec B'))
+                  out (double-array (* nb m n))]
+              (dotimes [bi nb]
+                (let [a-off (* bi m ka) b-off (* bi ka n) c-off (* bi m n)]
+                  (dotimes [i m]
+                    (dotimes [j n]
+                      (let [s (loop [l 0 s 0.0]
+                                (if (< l ka)
+                                  (recur (inc l)
+                                         (+ s (* (aget xa (+ a-off (* i ka) l))
+                                                 (aget xb (+ b-off (* l n) j)))))
+                                  s))]
+                        (aset out (+ c-off (* i n) j) s))))))
+              (arr/from-vec backend (vec out) out-shape))))))))
 
 ;; --- softmax (ADR-2607131500 Phase 1) ------------------------------------------
 ;; Everything below reuses ONLY the primitives already real above (amax/sub/sum/
