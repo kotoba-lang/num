@@ -34,6 +34,19 @@
   [xs]
   (with-meta (vec xs) {:num.wgsl/dtype :u32}))
 
+(defn pack-bytes-u32
+  "Pack unsigned bytes into little-endian u32 words for storage shaders."
+  [bytes]
+  (u32-tag
+   (mapv (fn [offset]
+           (reduce (fn [word lane]
+                     (bit-or word
+                             (bit-shift-left
+                              (bit-and 0xff (nth bytes (+ offset lane) 0))
+                              (* lane 8))))
+                   0 (range 4)))
+         (range 0 (count bytes) 4))))
+
 (defn uni
   "Create + fill a uniform buffer from host seq `xs` (device pads to alignment).
   `xs` defaults to f32; pass it through `u32-tag` first for a u32 uniform (dims,
@@ -130,6 +143,23 @@
       (w/-write-buffer dev v (seq (:vals csr)))
       (w/-dispatch dev (get-pipeline dev pipes :spmv) [rp ci v xh y] [(ceil-div m 64) 1 1])
       y))
+
+  p/IQuantizedOps
+  (-quantized-from-host [_ bytes _params]
+    (let [words (pack-bytes-u32 bytes)
+          buffer (w/-create-buffer dev (count words) :storage)]
+      (w/-write-buffer dev buffer words)
+      buffer))
+  (-quantized-matmul [_ input-h weight-h
+                      {:keys [quant-type m k n blocks-per-row]}]
+    (when-not (= :q4-k quant-type)
+      (throw (ex-info "unsupported WGSL quantized matmul" {:quant-type quant-type})))
+    (let [output (w/-create-buffer dev (* m n) :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :q4-k-matmul)
+                   [input-h weight-h output
+                    (uni dev (u32-tag [m k n blocks-per-row]))]
+                   [(ceil-div (* m n) 64) 1 1])
+      output))
 
   p/IMutableBufferOps
   (-copy-into! [_ destination source offset n dtype*]

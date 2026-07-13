@@ -1593,6 +1593,51 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i < p.words) { destination[p.word_offset + i] = source[i]; }
 }")
 
+(def q4-k-matmul-wgsl
+  "Dense f32 activations times GGML Q4_K weights, decoded directly from packed
+  u32 storage. One invocation computes one output element with f32 accumulation."
+  "
+struct Params { m: u32, k: u32, n: u32, blocks_per_row: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+fn byte_at(offset: u32) -> u32 {
+  let word = weight[offset / 4u];
+  return (word >> ((offset % 4u) * 8u)) & 255u;
+}
+fn scale_min(block: u32, index: u32) -> vec2<u32> {
+  let base = block + 4u;
+  if (index < 4u) {
+    return vec2<u32>(byte_at(base + index) & 63u,
+                     byte_at(base + index + 4u) & 63u);
+  }
+  return vec2<u32>((byte_at(base + index + 4u) & 15u) |
+                   ((byte_at(base + index - 4u) >> 6u) << 4u),
+                   (byte_at(base + index + 4u) >> 4u) |
+                   ((byte_at(base + index) >> 6u) << 4u));
+}
+fn value_at(row: u32, column: u32) -> f32 {
+  let block_index = row * p.blocks_per_row + column / 256u;
+  let block = block_index * 144u;
+  let dm = unpack2x16float(weight[block / 4u]);
+  let local = column % 256u; let subblock = local / 32u;
+  let sm = scale_min(block, subblock);
+  let packed = byte_at(block + 16u + (subblock / 2u) * 32u + local % 32u);
+  let quant = select(packed & 15u, packed >> 4u, subblock % 2u == 1u);
+  return dm.x * f32(sm.x) * f32(quant) - dm.y * f32(sm.y);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.m * p.n) { return; }
+  let row = index / p.n; let column = index % p.n;
+  var sum: f32 = 0.0;
+  for (var inner: u32 = 0u; inner < p.k; inner = inner + 1u) {
+    sum = sum + input[row * p.k + inner] * value_at(column, inner);
+  }
+  output[index] = sum;
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -1612,6 +1657,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :rms-norm rms-norm-wgsl
    :rotary-embedding rotary-embedding-wgsl
    :copy-into copy-into-wgsl
+   :q4-k-matmul q4-k-matmul-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl

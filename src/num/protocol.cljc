@@ -66,6 +66,14 @@
   (-copy-into! [b destination-h source-h destination-offset n dtype]
     "Copy `n` contiguous elements into destination at an element offset."))
 
+(defprotocol IQuantizedOps
+  "Packed inference-weight storage and compute. Handles preserve the original
+  GGML bytes; outputs accumulate in f32 without materializing a dense weight."
+  (-quantized-from-host [b bytes params]
+    "Upload unsigned packed bytes and return an opaque quantized handle.")
+  (-quantized-matmul [b input-h weight-h params]
+    "Multiply f32 `[m,k]` input by a packed logical `[k,n]` weight."))
+
 (defprotocol IDTypeTensorOps
   "Optional N-D compute operations over physical typed storage."
   (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])

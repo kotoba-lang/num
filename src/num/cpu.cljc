@@ -48,6 +48,32 @@
   (+ (* 0.5 (+ 1.0 (erf-approx (/ x 1.4142135623730951))))
      (* x 0.3989422804014327 (Math/exp (* -0.5 x x)))))
 
+(defn- packed-u16 [bytes offset]
+  (bit-or (nth bytes offset) (bit-shift-left (nth bytes (inc offset)) 8)))
+
+(defn- q4-k-scale-min [bytes block-offset index]
+  (let [q #(+ block-offset 4 %)]
+    (if (< index 4)
+      [(bit-and (nth bytes (q index)) 0x3f)
+       (bit-and (nth bytes (q (+ index 4))) 0x3f)]
+      [(bit-or (bit-and (nth bytes (q (+ index 4))) 0x0f)
+               (bit-shift-left (bit-shift-right (nth bytes (q (- index 4))) 6) 4))
+       (bit-or (bit-shift-right (nth bytes (q (+ index 4))) 4)
+               (bit-shift-left (bit-shift-right (nth bytes (q index)) 6) 4))])))
+
+(defn- q4-k-value [bytes row cols column]
+  (let [block-index (+ (* row (quot cols 256)) (quot column 256))
+        block-offset (* block-index 144)
+        local (mod column 256) subblock (quot local 32)
+        [scale minimum] (q4-k-scale-min bytes block-offset subblock)
+        quant-byte (nth bytes (+ block-offset 16 (* (quot subblock 2) 32)
+                                 (mod local 32)))
+        quant (if (even? subblock) (bit-and quant-byte 0x0f)
+                  (bit-shift-right quant-byte 4))
+        d (dtype/f16-bits->f32 (packed-u16 bytes block-offset))
+        dmin (dtype/f16-bits->f32 (packed-u16 bytes (+ block-offset 2)))]
+    (- (* d scale quant) (* dmin minimum))))
+
 (deftype CpuBackend []
   p/IBackend
   (-backend-name [_] :cpu)
@@ -141,6 +167,24 @@
       #?(:clj (System/arraycopy source 0 destination offset n)
          :cljs (dotimes [i n] (aset destination (+ offset i) (aget source i))))
       destination))
+
+  p/IQuantizedOps
+  (-quantized-from-host [_ bytes params]
+    {:bytes (mapv #(bit-and 0xff %) bytes) :params params})
+  (-quantized-matmul [_ input weight {:keys [quant-type m k n]}]
+    (when-not (= :q4-k quant-type)
+      (throw (ex-info "unsupported CPU quantized matmul" {:quant-type quant-type})))
+    (let [^doubles input input bytes (:bytes weight) output (double-array (* m n))]
+      (dotimes [row m]
+        (dotimes [column n]
+          (aset output (+ (* row n) column)
+                (loop [inner 0 sum 0.0]
+                  (if (< inner k)
+                    (recur (inc inner)
+                           (+ sum (* (aget input (+ (* row k) inner))
+                                     (q4-k-value bytes column k inner))))
+                    sum)))))
+      output))
 
   p/IDTypeStorage
   (-alloc-dtype [_ n dtype*]
