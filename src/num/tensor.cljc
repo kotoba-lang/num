@@ -964,6 +964,27 @@
      (group-norm-nchw input num-groups weight bias eps true)
      (silu (group-norm-nchw input num-groups weight bias eps)))))
 
+(defn layer-norm-last
+  "PyTorch-compatible LayerNorm over the final tensor dimension. `weight` and
+  `bias` are optional `[features]` affine parameters. The implementation
+  reshapes contiguous rows to `[rows features 1 1]` and dispatches the
+  mathematically equivalent one-group GroupNorm path, including its native
+  f32/f16 GPU kernels."
+  ([input] (layer-norm-last input nil nil 1.0e-5))
+  ([input weight bias eps]
+   (let [shape (vec (:shape input))]
+     (when (empty? shape)
+       (throw (ex-info "num.tensor/layer-norm-last requires rank >= 1"
+                       {:shape shape})))
+     (let [features (long (peek shape))
+           rows (quot (arr/nelems shape) features)]
+       (when-not (pos? features)
+         (throw (ex-info "layer norm final dimension must be positive"
+                         {:shape shape})))
+       (-> (reshape input [rows features 1 1])
+           (group-norm-nchw 1 weight bias eps)
+           (reshape shape))))))
+
 (defn upsample-nearest2d
   "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.
   ITensorBackend implementations execute it device-native."

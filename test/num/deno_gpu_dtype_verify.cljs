@@ -28,6 +28,10 @@
                   (arr/from-vec cpu-backend [0.9 1.0 1.1 1.2] [4] :f16)
                   (arr/from-vec cpu-backend [0.01 -0.02 0.03 -0.04] [4] :f16)
                   1.0e-5)
+        cpu-layernorm (tensor/layer-norm-last
+                       cpu-a
+                       (arr/from-vec cpu-backend [0.9 1.1] [2] :f16)
+                       (arr/from-vec cpu-backend [0.1 -0.2] [2] :f16) 1.0e-5)
         expected [(arr/->vec (num/add cpu-a cpu-b))
                   (arr/->vec (num/silu cpu-a))
                   (arr/->vec (num/sigmoid cpu-a))
@@ -35,7 +39,8 @@
                   (arr/->vec (num/gelu cpu-a))
                   (arr/->vec (num/matmul cpu-a cpu-b))
                   (arr/->vec cpu-conv)
-                  (arr/->vec cpu-norm)]]
+                  (arr/->vec cpu-norm)
+                  (arr/->vec cpu-layernorm)]]
     (-> (gpu/request-device)
         (.then
          (fn [device-result]
@@ -52,16 +57,20 @@
                        (arr/from-vec backend [0.9 1.0 1.1 1.2] [4] :f16)
                        (arr/from-vec backend [0.01 -0.02 0.03 -0.04] [4] :f16)
                        1.0e-5)
+                 layernorm (tensor/layer-norm-last
+                            a
+                            (arr/from-vec backend [0.9 1.1] [2] :f16)
+                            (arr/from-vec backend [0.1 -0.2] [2] :f16) 1.0e-5)
                  outputs [(num/add a b) (num/silu a) (num/sigmoid a) (num/tanh a)
                           (num/gelu a)
-                          (num/matmul a b) conv norm]]
+                          (num/matmul a b) conv norm layernorm]]
              (println "adapter:" (or (gpu/adapter-description device-result) "unknown"))
              (println "f16 physical bytes:" (.-size (:handle a)))
              (.then
               (js/Promise.all (into-array (map arr/->vec (into [a] outputs))))
               (fn [actual]
                 (let [input-values (vec (aget actual 0))
-                      actual-values (mapv #(vec (aget actual %)) (range 1 9))
+                      actual-values (mapv #(vec (aget actual %)) (range 1 10))
                       _ (println "uploaded:" input-values)
                       checks [(= 8 (.-size (:handle a)))
                               (approx-vec? (nth expected 0) (nth actual-values 0) 0.002)
@@ -71,7 +80,8 @@
                               (approx-vec? (nth expected 4) (nth actual-values 4) 0.002)
                               (approx-vec? (nth expected 5) (nth actual-values 5) 0.01)
                               (approx-vec? (nth expected 6) (nth actual-values 6) 0.01)
-                              (approx-vec? (nth expected 7) (nth actual-values 7) 0.03)]
+                              (approx-vec? (nth expected 7) (nth actual-values 7) 0.03)
+                              (approx-vec? (nth expected 8) (nth actual-values 8) 0.01)]
                       passed (count (filter true? checks))]
                   (println (str "Metal f16: " passed "/" (count checks) " passed"))
                   (when-not (= passed (count checks))

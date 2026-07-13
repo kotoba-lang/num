@@ -600,6 +600,22 @@
                    (accumulate! bias (arr/from-vec (:backend bias-data) (vec dbias)
                                                    (:shape bias-data)))))))))))
 
+(defn layer-norm-last*
+  "Differentiable LayerNorm over the final dimension, composed from metadata
+  reshapes and the verified one-group GroupNorm VJP."
+  ([x] (layer-norm-last* x nil nil 1.0e-5))
+  ([x weight bias eps]
+   (let [shape (:shape (:data x))]
+     (when (empty? shape)
+       (throw (ex-info "num.autograd/layer-norm-last* requires rank >= 1"
+                       {:shape shape})))
+     (let [features (long (peek shape))
+           rows (quot (arr/nelems shape) features)]
+       (reshape*
+        (group-norm-nchw* (reshape* x [rows features 1 1])
+                          1 weight bias eps)
+        shape)))))
+
 (defn cat*
   "Differentiable `num.tensor/cat`. Backward slices the upstream gradient
   along the concatenation axis and accumulates one contiguous gradient per

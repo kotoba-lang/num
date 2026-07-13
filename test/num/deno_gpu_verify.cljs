@@ -58,6 +58,11 @@
         exp-tanh-gradient (arr/->vec (nm/tanh-gradient (nm/tanh c)))
         exp-gelu (arr/->vec (nm/gelu c))
         exp-gelu-gradient (arr/->vec (nm/gelu-gradient c))
+        exp-layernorm (arr/->vec
+                       (t/layer-norm-last c
+                                          (arr/from-vec cpu-b [0.8 1.1 -0.7 1.3] [4])
+                                          (arr/from-vec cpu-b [0.1 -0.2 0.05 0.3] [4])
+                                          1.0e-5))
         A (arr/from-vec cpu-b [1 2 3 4] [2 2])
         xv (arr/from-vec cpu-b [1 1] [2])
         B (arr/from-vec cpu-b [5 6 7 8] [2 2])
@@ -212,6 +217,11 @@
                  scale-out (t/scale slice-out 0.5)
                  pad-out (t/pad-right-bottom-nchw
                           (arr/from-vec gpu pad-values [1 2 2 2]))
+                 layernorm-out
+                 (t/layer-norm-last cg
+                                    (arr/from-vec gpu [0.8 1.1 -0.7 1.3] [4])
+                                    (arr/from-vec gpu [0.1 -0.2 0.05 0.3] [4])
+                                    1.0e-5)
                  bias-add-out (t/add (arr/from-vec gpu bias-input-values [2 3])
                                      (arr/from-vec gpu bias-values [3]))
                  mha-out (t/multi-head-attention
@@ -275,6 +285,8 @@
                    (fn [g] (contract/approx-vec? g exp-gelu))]
                   ["gelu-gradient" (->p (arr/->vec (nm/gelu-gradient cg)))
                    (fn [g] (contract/approx-vec? g exp-gelu-gradient))]
+                  ["layernorm-last" (->p (arr/->vec layernorm-out))
+                   (fn [g] (contract/approx-vec? g exp-layernorm))]
                   ["conv2d-nchw" (->p (arr/->vec conv-out))                    (fn [g] (contract/approx-vec? g exp-conv))]
                   ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]
                   ["conv2d-output-channel-4" (->p (arr/->vec oc4-out))

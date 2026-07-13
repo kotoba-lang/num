@@ -367,6 +367,39 @@
               (str label " analytic=" (arr/->vec analytic)
                    " numeric=" (arr/->vec numeric))))))))
 
+(deftest layernorm-gradients-match-finite-differences
+  (testing "rank-3 final-axis LayerNorm differentiates input, gamma, and beta"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7, 1.1 -0.3 0.8,
+                                    1.4 -0.9 0.1, 0.5 -0.2 0.6] [2 2 3])
+          wd (arr/from-vec backend [0.8 1.1 -0.7] [3])
+          bd (arr/from-vec backend [0.1 -0.2 0.05] [3])
+          target (arr/from-vec backend (repeat 12 0.15) [2 2 3])
+          loss-of (fn [xd' wd' bd']
+                    (let [[loss _]
+                          (ag/with-tape
+                            (ag/mse-loss*
+                             (ag/layer-norm-last* (ag/value xd')
+                                                  (ag/value wd') (ag/value bd') 1.0e-5)
+                             target))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) w (ag/value wd) b (ag/value bd)
+                  loss (ag/mse-loss* (ag/layer-norm-last* x w b 1.0e-5) target)]
+              {:loss loss :x x :weight w :bias b}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["weight" :weight wd] ["bias" :bias bd]]]
+        (let [numeric (numerical-grad
+                       (fn [perturbed]
+                         (loss-of (if (= key :x) perturbed xd)
+                                  (if (= key :weight) perturbed wd)
+                                  (if (= key :bias) perturbed bd)))
+                       data 1.0e-5)]
+          (is (approx-vec-tol? (arr/->vec @(:grad (get result key)))
+                               (arr/->vec numeric) 1.0e-4)
+              label))))))
+
 (deftest upsample-cat-skip-gradients-match-finite-differences
   (testing "a branched UNet-style upsample + channel skip concatenation graph
             propagates gradients into both source tensors"
