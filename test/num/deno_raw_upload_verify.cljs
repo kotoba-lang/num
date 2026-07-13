@@ -16,15 +16,19 @@
                f32 (dg/upload-byte-view backend
                                         (js/Uint8Array. (.-buffer f32-source)) [2 2] :f32)
                f16 (dg/upload-byte-view backend
-                                        (js/Uint8Array. (.-buffer f16-bits)) [3] :f16)]
-           (-> (js/Promise.all #js [(arr/->vec f32) (arr/->vec f16)])
+                                        (js/Uint8Array. (.-buffer f16-bits)) [3] :f16)
+               expanded (dg/upload-f16-as-f32-byte-view
+                         backend (js/Uint8Array. (.-buffer f16-bits)) [3])]
+           (-> (js/Promise.all #js [(arr/->vec f32) (arr/->vec f16)
+                                    (arr/->vec expanded)])
                (.then
                 (fn [values]
-                  (arr/release-all! [f32 f16])
+                  (arr/release-all! [f32 f16 expanded])
                   (let [stats (dg/backend-stats backend)]
                     (when-not (and (approx? [1.25 -2.5 3.75 0.125]
                                              (aget values 0) 1.0e-7)
                                    (approx? [1.0 -2.0 3.0] (aget values 1) 1.0e-3)
+                                   (approx? [1.0 -2.0 3.0] (aget values 2) 1.0e-7)
                                    (= (:live-buffers baseline) (:live-buffers stats))
                                    (= (:live-bytes baseline) (:live-bytes stats)))
                       (throw (ex-info "raw GPU upload verification failed"

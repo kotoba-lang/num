@@ -781,6 +781,30 @@
            (.writeBuffer (.-queue device) buffer 0 source)
            (assoc (arr/->NDArray backend buffer (vec shape)) :dtype dtype*))))
 
+     (defn cast-f16-to-f32
+       "Expand a physical f16 NDArray into a device-resident f32 NDArray."
+       [input]
+       (when-not (= :f16 (:dtype input))
+         (throw (ex-info "cast-f16-to-f32 requires f16 input"
+                         {:dtype (:dtype input)})))
+       (let [backend (:backend input)
+             count (arr/nelems (:shape input))
+             dev (.-dev backend)
+             output (w/-create-buffer dev count :storage)]
+         (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :f16-to-f32)
+                      [(:handle input) output
+                       (wb/uni dev (wb/u32-tag [count 0 0 0]))]
+                      [(wb/ceil-div count 64) 1 1])
+         (assoc (arr/->NDArray backend output (:shape input)) :dtype :f32)))
+
+     (defn upload-f16-as-f32-byte-view
+       "Upload encoded f16 bytes and expand them to f32 entirely on the GPU."
+       [backend bytes shape]
+       (let [packed (upload-byte-view backend bytes shape :f16)
+             output (cast-f16-to-f32 packed)]
+         (arr/release! packed)
+         output))
+
      (defn gpu-backend
        "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.
        Mirrors num.cpu/cpu-backend's explicit-construction pattern (num has no
@@ -798,4 +822,6 @@
      (defn adapter-description [_] (throw (ex-info "num.deno-gpu/adapter-description requires a cljs/Deno host." {})))
      (defn backend [_] (throw (ex-info "num.deno-gpu/backend requires a cljs/Deno host." {})))
      (defn upload-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-byte-view requires a cljs/Deno host." {})))
+     (defn cast-f16-to-f32 [& _] (throw (ex-info "num.deno-gpu/cast-f16-to-f32 requires a cljs/Deno host." {})))
+     (defn upload-f16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-f16-as-f32-byte-view requires a cljs/Deno host." {})))
      (defn gpu-backend [] (throw (ex-info "num.deno-gpu/gpu-backend requires a cljs/Deno host." {})))))

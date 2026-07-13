@@ -360,6 +360,10 @@ Large checkpoint hosts can bypass per-element JavaScript number allocation with
 `num.deno-gpu/upload-byte-view`. It validates shape × dtype byte length and sends
 an existing little-endian `ArrayBufferView` directly to WebGPU storage for f32
 or f16 (padding only an odd f16 tail to WebGPU's four-byte write alignment).
+`upload-f16-as-f32-byte-view` follows that upload with a packed-half expansion
+kernel (`unpack2x16float`) and retires the temporary f16 buffer, allowing an f32
+inference graph to consume half-precision checkpoint files without allocating a
+host-side vector of decoded numbers.
 The live raw-upload gate covers both physical formats and exact buffer cleanup:
 
 ```bash
