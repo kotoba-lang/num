@@ -93,18 +93,19 @@ elementwise operations, activations, and GEMM with f32 accumulation followed by
 output quantization. IEEE subnormals, infinities, NaNs, and round-to-nearest-even
 are covered by tests on JVM and the core compiles and runs under ClojureScript.
 The Deno/WebGPU→Metal backend also has real packed-f16 buffers and typed add,
-sub, mul, div, unary activation, and GEMM kernels. Because Deno's current Naga
+sub, mul, div, unary activation, GEMM, grouped NCHW convolution, and GroupNorm
+kernels. Because Deno's current Naga
 rejects WGSL's advertised `enable f16`, those kernels use two IEEE halves per
 `u32`, `unpack2x16float`/`pack2x16float`, and f32 evaluation/accumulation. Apple
 M4 Metal verification proves four values occupy eight GPU bytes and matches the
-CPU half oracle. This is physical half storage with quantized operation
+CPU half oracle across all six kernel checks. This is physical half storage with quantized operation
 boundaries, not a claim of native f16 ALU throughput; BF16 GPU kernels and typed
-convolution/normalization remain open.
+upsample/cat and BF16 GPU kernels remain open.
 
 ```sh
 clojure -M:deno-dtype-verify
 deno run --allow-all target/deno-gpu-dtype-verify.cjs
-# Apple M4: physical bytes 8; Metal f16 4/4 passed
+# Apple M4: physical bytes 8; Metal f16 6/6 passed
 ```
 
 Ops: `axpy! scal! dot nrm2 add sub mul div sum amax amin matvec matmul spmv`.

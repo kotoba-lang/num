@@ -11,6 +11,7 @@
   (testing "every accelerated IBackend op has a non-empty WGSL kernel"
     (doseq [op [:axpy :scal :ewise :ewise1 :reduce :gemv :gemm
                 :ewise-f16 :ewise1-f16 :gemm-f16
+                :conv2d-nchw-f16 :group-norm-nchw-f16
                 :conv2d-nchw :group-norm-nchw :upsample-nearest2d :cat-copy :spmv]]
       (is (string? (get w/shaders op)) (str "missing shader: " op))
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))

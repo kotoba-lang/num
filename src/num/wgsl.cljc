@@ -456,6 +456,119 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   C[word] = pack2x16float(vec2<f32>(dot_at(base), second));
 }")
 
+(def conv2d-nchw-f16-wgsl
+  "Packed-f16 NCHW grouped convolution with f32 accumulation."
+  "
+struct Params {
+  n: u32, cin: u32, h: u32, w: u32,
+  cout: u32, cin_group: u32, kh: u32, kw: u32,
+  oh: u32, ow: u32, sh: u32, sw: u32,
+  ph: u32, pw: u32, dh: u32, dw: u32,
+  groups: u32, pad0: u32, pad1: u32, pad2: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> bias: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn load_input(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_weight(index: u32) -> f32 {
+  let pair = unpack2x16float(weight[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_bias(index: u32) -> f32 {
+  let pair = unpack2x16float(bias[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn convolve(index: u32) -> f32 {
+  let oj = index % p.ow;
+  let oi = (index / p.ow) % p.oh;
+  let oc = (index / (p.ow * p.oh)) % p.cout;
+  let batch = index / (p.ow * p.oh * p.cout);
+  let outputs_per_group = p.cout / p.groups;
+  let input_channel_base = (oc / outputs_per_group) * p.cin_group;
+  var sum = load_bias(oc);
+  for (var icg = 0u; icg < p.cin_group; icg = icg + 1u) {
+    let ic = input_channel_base + icg;
+    for (var ki = 0u; ki < p.kh; ki = ki + 1u) {
+      let ih = i32(oi * p.sh + ki * p.dh) - i32(p.ph);
+      if (ih < 0 || ih >= i32(p.h)) { continue; }
+      for (var kj = 0u; kj < p.kw; kj = kj + 1u) {
+        let iw = i32(oj * p.sw + kj * p.dw) - i32(p.pw);
+        if (iw < 0 || iw >= i32(p.w)) { continue; }
+        let xi = ((batch * p.cin + ic) * p.h + u32(ih)) * p.w + u32(iw);
+        let wi = ((oc * p.cin_group + icg) * p.kh + ki) * p.kw + kj;
+        sum = sum + load_input(xi) * load_weight(wi);
+      }
+    }
+  }
+  return sum;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let base = gid.x * 2u;
+  let total = p.n * p.cout * p.oh * p.ow;
+  if (base >= total) { return; }
+  var second = 0.0;
+  if (base + 1u < total) { second = convolve(base + 1u); }
+  output[gid.x] = pack2x16float(vec2<f32>(convolve(base), second));
+}")
+
+(def group-norm-nchw-f16-wgsl
+  "Packed-f16 GroupNorm reference kernel with f32 statistics."
+  "
+struct Dims {
+  n: u32, c: u32, h: u32, w: u32,
+  groups: u32, channels_group: u32, group_size: u32, spatial: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> bias: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+@group(0) @binding(5) var<uniform> epsilon: f32;
+fn load_input_value(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_weight_value(index: u32) -> f32 {
+  let pair = unpack2x16float(weight[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_bias_value(index: u32) -> f32 {
+  let pair = unpack2x16float(bias[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn normalize(index: u32) -> f32 {
+  let batch = index / (d.c * d.h * d.w);
+  let channel = (index / d.spatial) % d.c;
+  let group = channel / d.channels_group;
+  let base = batch * d.c * d.h * d.w + group * d.group_size;
+  var sum = 0.0;
+  var sum_square = 0.0;
+  for (var i = 0u; i < d.group_size; i = i + 1u) {
+    let v = load_input_value(base + i);
+    sum = sum + v;
+    sum_square = sum_square + v * v;
+  }
+  let mean = sum / f32(d.group_size);
+  let variance = max(sum_square / f32(d.group_size) - mean * mean, 0.0);
+  return (load_input_value(index) - mean) * inverseSqrt(variance + epsilon)
+         * load_weight_value(channel) + load_bias_value(channel);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let base = gid.x * 2u;
+  let total = d.n * d.c * d.h * d.w;
+  if (base >= total) { return; }
+  var second = 0.0;
+  if (base + 1u < total) { second = normalize(base + 1u); }
+  output[gid.x] = pack2x16float(vec2<f32>(normalize(base), second));
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -475,6 +588,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :ewise-f16 ewise-f16-wgsl
    :ewise1-f16 ewise1-f16-wgsl
    :gemm-f16 gemm-f16-wgsl
+   :conv2d-nchw-f16 conv2d-nchw-f16-wgsl
+   :group-norm-nchw-f16 group-norm-nchw-f16-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------

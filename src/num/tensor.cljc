@@ -504,12 +504,23 @@
              params {:n N :cin Cin :h H :width W :cout Cout
                      :cin-group Cin-per-group :kh kh :kw kw :oh oh :ow ow
                      :sh sh :sw sw :ph ph :pw pw :dh dh :dw dw :groups groups}]
-         (if (and (= :f32 (array-dtype input))
-                  (satisfies? p/ITensorBackend backend))
+         (cond
+           (and (not= :f32 (array-dtype input))
+                (satisfies? p/IDTypeTensorOps backend))
+           (assoc (arr/->NDArray backend
+                                  (p/-conv2d-nchw-dtype
+                                   backend (:handle input) (:handle weight)
+                                   (when bias (:handle bias)) params (array-dtype input))
+                                  [N Cout oh ow])
+                  :dtype (array-dtype input))
+
+           (and (= :f32 (array-dtype input))
+                (satisfies? p/ITensorBackend backend))
            (assoc (arr/->NDArray backend
                           (p/-conv2d-nchw backend (:handle input) (:handle weight)
                                           (when bias (:handle bias)) params)
                           [N Cout oh ow]) :dtype :f32)
+           :else
            (let [xs (double-array (arr/->vec input))
                  ws (double-array (arr/->vec weight))
                  bs (when bias (double-array (arr/->vec bias)))
@@ -650,13 +661,25 @@
            params {:n N :c C :h H :width W :groups groups
                    :channels-group channels-per-group :group-size group-size
                    :eps eps}]
-       (if (and (= :f32 (array-dtype input))
-                (satisfies? p/ITensorBackend backend))
+       (cond
+         (and (not= :f32 (array-dtype input))
+              (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray backend
+                                (p/-group-norm-nchw-dtype
+                                 backend (:handle input)
+                                 (when weight (:handle weight))
+                                 (when bias (:handle bias)) params (array-dtype input))
+                                [N C H W])
+                :dtype (array-dtype input))
+
+         (and (= :f32 (array-dtype input))
+              (satisfies? p/ITensorBackend backend))
          (assoc (arr/->NDArray backend
                         (p/-group-norm-nchw backend (:handle input)
                                             (when weight (:handle weight))
                                             (when bias (:handle bias)) params)
                         [N C H W]) :dtype :f32)
+         :else
          (let [xs (double-array (arr/->vec input))
                ws (when weight (double-array (arr/->vec weight)))
                bs (when bias (double-array (arr/->vec bias)))

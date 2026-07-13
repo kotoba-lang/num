@@ -61,6 +61,11 @@
   (-ewise1-dtype [b op xh n dtype])
   (-gemm-dtype [b Ah m k Bh n dtype]))
 
+(defprotocol IDTypeTensorOps
+  "Optional N-D compute operations over physical typed storage."
+  (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])
+  (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype]))
+
 (defprotocol ITensorBackend
   "Optional device-native N-D operations. Backends that do not implement this
   protocol continue to use num.tensor's portable host oracle."

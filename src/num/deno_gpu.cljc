@@ -129,7 +129,7 @@
          (when-not (= dtype* :f16)
            (throw (ex-info "WebGPU typed storage currently supports f16 only"
                            {:dtype dtype*})))
-         (.createBuffer dev #js {:size (max (* 2 (long n)) 4)
+         (.createBuffer dev #js {:size (max (* 4 (quot (+ (long n) 1) 2)) 4)
                                  :usage (usage->flags usage)}))
        (-write-buffer-dtype [_ buf xs dtype*]
          (when-not (= dtype* :f16)
@@ -140,7 +140,7 @@
        (-read-buffer-dtype [_ buf n dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
-         (let [nbytes (max (* 2 (long n)) 4)
+         (let [nbytes (max (* 4 (quot (+ (long n) 1) 2)) 4)
                staging (.createBuffer dev #js {:size nbytes :usage readback-usage})
                encoder (.createCommandEncoder dev)]
            (.copyBufferToBuffer encoder buf 0 staging 0 nbytes)
@@ -283,6 +283,43 @@
            (w/-dispatch dev (wb/get-pipeline dev pipes :gemm-f16)
                         [Ah Bh output (wb/uni dev (wb/u32-tag [m k n 0]))]
                         [(wb/ceil-div (wb/ceil-div (* m n) 2) 64) 1 1])
+           output))
+
+       p/IDTypeTensorOps
+       (-conv2d-nchw-dtype [_ input-h weight-h bias-h
+                            {:keys [n cout oh ow] :as params} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU convolution supports f16 only" {:dtype dtype*})))
+         (let [total (* n cout oh ow)
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               bias (or bias-h (w/-create-buffer-dtype dev cout :storage :f16))
+               values ((juxt :n :cin :h :width :cout :cin-group :kh :kw
+                             :oh :ow :sh :sw :ph :pw :dh :dw :groups)
+                       params)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :conv2d-nchw-f16)
+                        [input-h weight-h bias output
+                         (wb/uni dev (wb/u32-tag (into (vec values) [0 0 0])))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-group-norm-nchw-dtype [_ input-h weight-h bias-h
+                                {:keys [n c h width groups channels-group
+                                        group-size eps]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU GroupNorm supports f16 only" {:dtype dtype*})))
+         (let [total (* n c h width)
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               weight (or weight-h
+                          (let [buffer (w/-create-buffer-dtype dev c :storage :f16)]
+                            (w/-write-buffer-dtype dev buffer (repeat c 1.0) :f16)
+                            buffer))
+               bias (or bias-h (w/-create-buffer-dtype dev c :storage :f16))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :group-norm-nchw-f16)
+                        [input-h weight bias output
+                         (wb/uni dev (wb/u32-tag
+                                      [n c h width groups channels-group
+                                       group-size (* h width)]))
+                         (wb/uni dev [(double eps)])]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
            output))
 
        p/ITensorBackend
