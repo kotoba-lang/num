@@ -118,7 +118,22 @@ direct-to-`IBackend` dispatch as before, zero behavior change.
 (def A (a/from-vec b (range 1 13) [2 2 3]))   ; 2 batches of 2×3
 (def B (a/from-vec b (range 1 13) [2 3 2]))   ; 2 batches of 3×2
 (:shape (t/matmul A B))                   ;=> [2 2 2]
+
+;; production-shaped convolution: NCHW input, OIHW weights
+(def image (a/from-vec b (range (* 2 4 32 32)) [2 4 32 32]))
+(def weight (a/from-vec b (repeat (* 320 4 3 3) 0.01) [320 4 3 3]))
+(:shape (t/conv2d-nchw image weight nil {:padding 1})) ;=> [2 320 32 32]
 ```
+
+`conv2d-nchw` follows the PyTorch/ComfyUI tensor convention and supports
+batching, multiple input/output channels, bias, scalar or pair
+`stride`/`padding`/`dilation`, groups, and depthwise convolution. Its autograd
+twin `num.autograd/conv2d-nchw*` propagates gradients to input, weight, and
+bias under the same options; grouped padding+stride gradients are checked
+element-by-element against central finite differences. This removes the
+single-image/single-channel convolution fence for real UNet graphs. It remains
+host-materialized, like the other general N-D operations described below;
+device-native NCHW convolution is still required for production throughput.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque

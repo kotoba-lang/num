@@ -255,3 +255,73 @@
         scaled (scale* (/ 1.0 (Math/sqrt d)) scores)
         weights (softmax* scaled)]
     (matmul* weights V)))
+(defn- pair-option [value]
+  (mapv long (if (sequential? value) value [value value])))
+
+(defn conv2d-nchw*
+  "Differentiable NCHW convolution matching `num.tensor/conv2d-nchw`.
+
+  `x`, `weight`, and optional `bias` are autograd Values. Backward computes
+  gradients for all three and supports the forward op's stride, padding,
+  dilation, and groups semantics, including depthwise convolution."
+  ([x weight] (conv2d-nchw* x weight nil {}))
+  ([x weight bias] (conv2d-nchw* x weight bias {}))
+  ([x weight bias {:keys [stride padding dilation groups] :as opts
+                   :or {stride 1 padding 0 dilation 1 groups 1}}]
+   (let [input-data (:data x)
+         weight-data (:data weight)
+         bias-data (when bias (:data bias))
+         output (t/conv2d-nchw input-data weight-data bias-data opts)
+         [N Cin H W] (mapv long (:shape input-data))
+         [Cout Cin-per-group kh kw] (mapv long (:shape weight-data))
+         [_ _ oh ow] (mapv long (:shape output))
+         [sh sw] (pair-option stride)
+         [ph pw] (pair-option padding)
+         [dh dw] (pair-option dilation)
+         groups (long groups)
+         outputs-per-group (quot Cout groups)]
+     (node output
+           (cond-> [x weight] bias (conj bias))
+           (fn [self]
+             (when-let [g @(:grad self)]
+               (let [xs (double-array (arr/->vec input-data))
+                     ws (double-array (arr/->vec weight-data))
+                     gs (double-array (arr/->vec g))
+                     dx (double-array (* N Cin H W))
+                     dw-gradient (double-array (* Cout Cin-per-group kh kw))
+                     db-gradient (when bias (double-array Cout))]
+                 (dotimes [n N]
+                   (dotimes [oc Cout]
+                     (let [group (quot oc outputs-per-group)
+                           input-channel-base (* group Cin-per-group)]
+                       (dotimes [oi oh]
+                         (dotimes [oj ow]
+                           (let [g-index (+ (* n Cout oh ow) (* oc oh ow) (* oi ow) oj)
+                                 gradient (aget gs g-index)]
+                             (when db-gradient
+                               (aset db-gradient oc (+ (aget db-gradient oc) gradient)))
+                             (dotimes [icg Cin-per-group]
+                               (let [ic (+ input-channel-base icg)]
+                                 (dotimes [ki kh]
+                                   (let [ih (+ (- (* oi sh) ph) (* ki dh))]
+                                     (when (and (<= 0 ih) (< ih H))
+                                       (dotimes [kj kw]
+                                         (let [iw (+ (- (* oj sw) pw) (* kj dw))]
+                                           (when (and (<= 0 iw) (< iw W))
+                                             (let [x-index (+ (* n Cin H W) (* ic H W) (* ih W) iw)
+                                                   w-index (+ (* oc Cin-per-group kh kw)
+                                                              (* icg kh kw) (* ki kw) kj)]
+                                               (aset dx x-index
+                                                     (+ (aget dx x-index)
+                                                        (* gradient (aget ws w-index))))
+                                               (aset dw-gradient w-index
+                                                     (+ (aget dw-gradient w-index)
+                                                        (* gradient (aget xs x-index)))))))))))))))))))
+                 (accumulate! x (arr/from-vec (:backend input-data) (vec dx) (:shape input-data)))
+                 (accumulate! weight
+                              (arr/from-vec (:backend weight-data) (vec dw-gradient)
+                                            (:shape weight-data)))
+                 (when bias
+                   (accumulate! bias
+                                (arr/from-vec (:backend bias-data) (vec db-gradient)
+                                              (:shape bias-data)))))))))))

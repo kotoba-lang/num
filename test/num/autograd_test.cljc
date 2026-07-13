@@ -207,3 +207,40 @@
             numeric (arr/->vec (numerical-grad loss-of xd 1.0e-4))]
         (is (approx-vec-tol? analytic numeric 1.0e-3)
             (str "x analytic=" analytic " numeric=" numeric))))))
+(deftest conv2d-nchw-gradients-match-finite-differences
+  (testing "batched/channel-aware convolution differentiates input, grouped
+            weights, and bias under padding+stride, not only valid 2-D toys"
+    (let [xd (arr/from-vec backend (mapv #(* 0.07 (inc %)) (range 18)) [1 2 3 3])
+          wd (arr/from-vec backend [0.2 -0.1 0.3 0.4 -0.2 0.5 0.1 -0.3]
+                           [2 1 2 2])
+          bd (arr/from-vec backend [0.05 -0.08] [2])
+          target (arr/from-vec backend [0.2 0.1 -0.1 0.3 0.4 -0.2 0.15 0.05]
+                               [1 2 2 2])
+          opts {:padding 1 :stride 2 :groups 2}
+          loss-of
+          (fn [xd' wd' bd']
+            (let [[loss _]
+                  (ag/with-tape
+                    (ag/mse-loss*
+                     (ag/conv2d-nchw* (ag/value xd') (ag/value wd') (ag/value bd') opts)
+                     target))]
+              (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) weight (ag/value wd) bias (ag/value bd)
+                  loss (ag/mse-loss* (ag/conv2d-nchw* x weight bias opts) target)]
+              {:loss loss :x x :weight weight :bias bias}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["weight" :weight wd] ["bias" :bias bd]]]
+        (let [numeric
+              (numerical-grad
+               (fn [perturbed]
+                 (loss-of (if (= key :x) perturbed xd)
+                          (if (= key :weight) perturbed wd)
+                          (if (= key :bias) perturbed bd)))
+               data 1.0e-5)
+              analytic @(:grad (get result key))]
+          (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+              (str label " analytic=" (arr/->vec analytic)
+                   " numeric=" (arr/->vec numeric))))))))

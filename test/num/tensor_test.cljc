@@ -355,6 +355,53 @@
                  (t/conv2d-mc (arr/from-vec backend (range 8) [2 2 2])
                               (arr/from-vec backend (range 12) [1 2 3 3]))))))
 
+(deftest conv2d-nchw-batch-channels-and-bias
+  (testing "two batches, two input/output channels, and per-output bias"
+    (let [input (arr/from-vec backend [1 2 3 4  5 6 7 8] [2 2 1 2])
+          weight (arr/from-vec backend [1 10  -1 1] [2 2 1 1])
+          bias (arr/from-vec backend [0.5 -0.5] [2])
+          out (t/conv2d-nchw input weight bias)]
+      (is (= [2 2 1 2] (:shape out)))
+      (is (= [31.5 42.5 1.5 1.5 75.5 86.5 1.5 1.5]
+             (arr/->vec out))))))
+
+(deftest conv2d-nchw-padding-stride-dilation-and-groups
+  (testing "same-style padding and stride follow PyTorch's floor output rule"
+    (let [input (arr/from-vec backend (range 1 10) [1 1 3 3])
+          weight (arr/from-vec backend [1 1 1 1] [1 1 2 2])
+          out (t/conv2d-nchw input weight nil {:padding 1 :stride 2})]
+      (is (= [1 1 2 2] (:shape out)))
+      (is (= [1.0 5.0 11.0 28.0] (arr/->vec out)))))
+  (testing "dilation samples spaced kernel points"
+    (let [input (arr/from-vec backend (range 1 10) [1 1 3 3])
+          weight (arr/from-vec backend [1 1 1 1] [1 1 2 2])
+          out (t/conv2d-nchw input weight nil {:dilation 2})]
+      (is (= [1 1 1 1] (:shape out)))
+      (is (= [20.0] (arr/->vec out)))))
+  (testing "groups=C_in is depthwise convolution"
+    (let [input (arr/from-vec backend [1 2 3 4 10 20 30 40] [1 2 2 2])
+          weight (arr/from-vec backend [2 3] [2 1 1 1])
+          out (t/conv2d-nchw input weight nil {:groups 2})]
+      (is (= [1 2 2 2] (:shape out)))
+      (is (= [2.0 4.0 6.0 8.0 30.0 60.0 90.0 120.0]
+             (arr/->vec out))))))
+
+(deftest conv2d-nchw-validates-production-shapes
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (t/conv2d-nchw (arr/from-vec backend (range 9) [1 3 3])
+                              (arr/from-vec backend [1] [1 1 1 1]))))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (t/conv2d-nchw (arr/from-vec backend (range 18) [1 2 3 3])
+                              (arr/from-vec backend (range 12) [3 1 2 2])
+                              nil {:groups 1})))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (t/conv2d-nchw (arr/from-vec backend (range 9) [1 1 3 3])
+                              (arr/from-vec backend [1] [1 1 1 1])
+                              (arr/from-vec backend [1 2] [2]))))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (t/conv2d-nchw (arr/from-vec backend (range 4) [1 1 2 2])
+                              (arr/from-vec backend (range 9) [1 1 3 3])))))
+
 (deftest attention-matches-hand-computed
   (testing "zero queries (no signal) produce uniform attention over any K/V"
     (let [Q (arr/from-vec backend [0 0] [2 1])
