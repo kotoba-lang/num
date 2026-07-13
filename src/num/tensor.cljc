@@ -884,6 +884,8 @@
   the portable fallback is the CPU oracle below."
   ([input num-groups] (group-norm-nchw input num-groups nil nil 1.0e-5))
   ([input num-groups weight bias eps]
+   (group-norm-nchw input num-groups weight bias eps false))
+  ([input num-groups weight bias eps silu?]
    (require-same-dtype! "num.tensor/group-norm-nchw" [input weight bias])
    (let [[N C H W :as shape] (:shape input)
          groups (long num-groups)]
@@ -901,7 +903,7 @@
            backend (:backend input)
            params {:n N :c C :h H :width W :groups groups
                    :channels-group channels-per-group :group-size group-size
-                   :eps eps}]
+                   :eps eps :silu? silu?}]
        (cond
          (and (not= :f32 (array-dtype input))
               (satisfies? p/IDTypeTensorOps backend))
@@ -945,10 +947,22 @@
                                     (quot i (* H W)))
                          normalized (* (- (aget xs (+ base i)) mean) inv-std)
                          value (+ (* normalized (if ws (aget ws channel) 1.0))
-                                  (if bs (aget bs channel) 0.0))]
+                                  (if bs (aget bs channel) 0.0))
+                         value (if silu?
+                                 (/ value (+ 1.0 (Math/exp (- value)))) value)]
                      (aset out (+ base i) value))))))
            (arr/from-vec backend (vec out) [N C H W]
                          (array-dtype input))))))))
+
+(defn group-norm-silu-nchw
+  "Fused PyTorch GroupNorm followed by SiLU. f32 ITensorBackend execution uses
+  one kernel and one output buffer; other dtypes preserve semantics by composition."
+  ([input num-groups]
+   (group-norm-silu-nchw input num-groups nil nil 1.0e-5))
+  ([input num-groups weight bias eps]
+   (if (= :f32 (array-dtype input))
+     (group-norm-nchw input num-groups weight bias eps true)
+     (silu (group-norm-nchw input num-groups weight bias eps)))))
 
 (defn upsample-nearest2d
   "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.

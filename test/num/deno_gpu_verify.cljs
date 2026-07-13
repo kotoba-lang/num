@@ -112,6 +112,11 @@
                                  (t/group-norm-nchw
                                   (arr/from-vec cpu-b (take 32 norm-input-values)
                                                 [1 4 4 2]) 2))
+        exp-groupnorm-silu (arr/->vec
+                            (t/group-norm-silu-nchw
+                             (arr/from-vec cpu-b norm-input-values [2 32 16 16]) 4
+                             (arr/from-vec cpu-b norm-weight-values [32])
+                             (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5))
         exp-unet-chain
         (arr/->vec
          (t/upsample-nearest2d
@@ -188,6 +193,11 @@
                  groupnorm-no-affine-out
                  (t/group-norm-nchw
                   (arr/from-vec gpu (take 32 norm-input-values) [1 4 4 2]) 2)
+                 groupnorm-silu-out
+                 (t/group-norm-silu-nchw
+                  (arr/from-vec gpu norm-input-values [2 32 16 16]) 4
+                  (arr/from-vec gpu norm-weight-values [32])
+                  (arr/from-vec gpu norm-bias-values [32]) 1.0e-5)
                  unet-chain-out (t/upsample-nearest2d (nm/silu groupnorm-out) [2 2])
                  cat-out (t/cat [unet-chain-out
                                  (t/upsample-nearest2d groupnorm-out 2)] 1)
@@ -256,6 +266,8 @@
                   ["groupnorm-nchw" (->p (arr/->vec groupnorm-out))            (fn [g] (contract/approx-vec? g exp-groupnorm))]
                   ["groupnorm-no-affine" (->p (arr/->vec groupnorm-no-affine-out))
                                             (fn [g] (contract/approx-vec? g exp-groupnorm-no-affine))]
+                  ["groupnorm-silu-fused" (->p (arr/->vec groupnorm-silu-out))
+                   (fn [g] (contract/approx-vec? g exp-groupnorm-silu))]
                   ["groupnorm-silu-upsample-chain" (->p (arr/->vec unet-chain-out))
                                                     (fn [g] (contract/approx-vec? g exp-unet-chain))]
                   ["unet-skip-cat" (->p (arr/->vec cat-out))

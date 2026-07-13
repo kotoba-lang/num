@@ -186,6 +186,9 @@ padding are verified against the CPU oracle on Apple M4 Metal. None of these
 paths downloads intermediate tensors.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
+`group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet
+`GroupNorm → SiLU` pair into one reduction/normalization kernel and one output
+buffer. Non-f32 backends retain identical semantics through composition.
 
 Long-running graphs can explicitly end tensor lifetimes with
 `num.array/release!`; `release-all!` deduplicates reshape/transpose aliases that
@@ -333,11 +336,11 @@ full `NCHW conv(pad=1) → GroupNorm(8) → SiLU` chain:
 
 | path | elapsed |
 |---|---:|
-| ClojureScript CPU oracle | 1008.30 ms |
-| Metal cold (pipeline compile included) | 41.87 ms |
-| Metal warm | 26.52 ms |
+| ClojureScript CPU oracle | 980.92 ms |
+| Metal cold (pipeline compile included) | 39.57 ms |
+| Metal warm | 25.66 ms |
 
-Warm speedup is **38.02×**, with maximum absolute error `2.38e-6` against the
+Warm speedup is **38.23×**, with maximum absolute error `2.38e-6` against the
 CPU oracle. The full-width mode separately measures a real latent-resolution
 `[1,320,64,64] × [320,320,3,3]` convolution. The four-output-channel kernel
 reduced it from 184.51 ms to 107.95 ms warm (41.5% lower), with its interior

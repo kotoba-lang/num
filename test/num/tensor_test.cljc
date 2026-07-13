@@ -412,9 +412,11 @@
     (let [input (arr/from-vec backend [1 3 2 6] [1 4 1 1])
           weight (arr/from-vec backend [1 2 3 4] [4])
           bias (arr/from-vec backend [0.5 0.5 0 0] [4])
-          out (t/group-norm-nchw input 2 weight bias 0.0)]
+          out (t/group-norm-nchw input 2 weight bias 0.0)
+          fused (t/group-norm-silu-nchw input 2 weight bias 0.0)]
       (is (= [1 4 1 1] (:shape out)))
-      (is (= [-0.5 2.5 -3.0 4.0] (arr/->vec out)))))
+      (is (= [-0.5 2.5 -3.0 4.0] (arr/->vec out)))
+      (is (contract/approx-vec? (arr/->vec (t/silu out)) (arr/->vec fused)))))
   (testing "channel concat preserves NCHW block order"
     (let [a (arr/from-vec backend [1 2 3 4] [1 1 2 2])
           b (arr/from-vec backend [10 20 30 40 50 60 70 80] [1 2 2 2])

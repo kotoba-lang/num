@@ -28,9 +28,9 @@
    :beta (arr/from-vec backend beta-values [64])})
 
 (defn- chain [{:keys [input weight bias gamma beta]}]
-  (-> (t/conv2d-nchw input weight bias {:padding 1})
-      (t/group-norm-nchw 8 gamma beta 1.0e-5)
-      (t/silu)))
+  (t/group-norm-silu-nchw
+   (t/conv2d-nchw input weight bias {:padding 1})
+   8 gamma beta 1.0e-5))
 
 (defn- force-output [output]
   (arr/->vec output))

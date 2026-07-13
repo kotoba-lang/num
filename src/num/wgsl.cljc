@@ -17,7 +17,7 @@
 
   The shaders here are the real, reviewable artifacts; the contract test
   (`num.contract`) is what proves a live WgslBackend ≡ the CPU reference."
-  )
+  (:require [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
 ;; Host port — the seam the browser / native host fills in (no native code here)
@@ -1045,6 +1045,12 @@ fn main(@builtin(local_invocation_id) lid3: vec3<u32>,
   }
 }")
 
+(def group-norm-silu-nchw-wgsl
+  (str/replace
+   group-norm-nchw-wgsl
+   "output[base + i] = (input[base + i] - mean) * inv_std * weight[channel] + bias[channel];"
+   "let normalized = (input[base + i] - mean) * inv_std * weight[channel] + bias[channel];\n    output[base + i] = normalized / (1.0 + exp(-normalized));"))
+
 (def upsample-nearest2d-wgsl
   "Nearest-neighbor NCHW upsampling, one invocation per output element."
   "
@@ -1338,6 +1344,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :conv2d-nchw conv2d-nchw-wgsl
    :conv2d-nchw-oc4 conv2d-nchw-oc4-wgsl
    :group-norm-nchw group-norm-nchw-wgsl
+   :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
    :slice-axis slice-axis-wgsl

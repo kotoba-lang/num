@@ -13,7 +13,8 @@
                 :ewise-f16 :ewise1-f16 :gemm-f16
                 :conv2d-nchw-f16 :group-norm-nchw-f16
                 :conv2d-nchw :conv2d-nchw-oc4
-                :group-norm-nchw :upsample-nearest2d :cat-copy
+                :group-norm-nchw :group-norm-silu-nchw
+                :upsample-nearest2d :cat-copy
                 :slice-axis :pad-right-bottom-nchw
                 :add-last-axis-bias :multi-head-attention
                 :multi-head-attention-backward :transpose-2d :bias-gradient
@@ -23,6 +24,8 @@
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"
     (is (re-find #"var<workgroup>" (:gemm w/shaders))))
+  (testing "fused GroupNorm applies SiLU in the normalization kernel"
+    (is (re-find #"exp\(-normalized\)" (:group-norm-silu-nchw w/shaders))))
   (testing "typed kernels use packed physical halves and accumulate GEMM in f32"
     (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))

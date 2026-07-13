@@ -143,7 +143,8 @@
                      [(ceil-div invocations 64) 1 1]))
       output))
   (-group-norm-nchw [_ input-h weight-h bias-h
-                     {:keys [n c h width groups channels-group group-size eps]}]
+                     {:keys [n c h width groups channels-group group-size eps]
+                      :as params}]
     (let [total (* n c h width)
           output (w/-create-buffer dev total :storage)
           weight (or weight-h
@@ -151,7 +152,9 @@
                        (w/-write-buffer dev buffer (repeat c 1.0)) buffer))
           bias (or bias-h (w/-create-buffer dev c :storage))
           dims [n c h width groups channels-group group-size (* h width)]]
-      (w/-dispatch dev (get-pipeline dev pipes :group-norm-nchw)
+      (w/-dispatch dev (get-pipeline dev pipes
+                                    (if (:silu? params)
+                                      :group-norm-silu-nchw :group-norm-nchw))
                    [input-h weight bias output (uni dev (u32-tag dims))
                     (uni dev [(double eps)])]
                    [(* n groups) 1 1])
