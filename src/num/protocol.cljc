@@ -32,7 +32,7 @@
 
   ;; elementwise + reduction -------------------------------------------------
   (-ewise [b op xh yh n] "op ∈ #{:add :sub :mul :div}; returns a NEW handle z=op(x,y).")
-  (-ewise1 [b op xh n] "UNARY elementwise; op ∈ #{:exp :relu :neg}; returns a NEW handle z=op(x).")
+  (-ewise1 [b op xh n] "UNARY elementwise; op ∈ #{:exp :relu :neg :silu}; returns a NEW handle z=op(x).")
   (-reduce [b op xh n] "op ∈ #{:sum :max :min}; → host scalar.")
 
   ;; level-2 / level-3 BLAS (dense, row-major) -------------------------------
@@ -46,3 +46,35 @@
   "Does `x` satisfy IBackend?"
   [x]
   (satisfies? IBackend x))
+
+(defprotocol IDTypeStorage
+  "Optional physical storage contract for non-f32 arrays. Implementations must
+  allocate and transfer the requested dtype rather than merely tagging values."
+  (-alloc-dtype [b n dtype] "Allocate `n` physical elements of `dtype`.")
+  (-copy-from-host-dtype [b xs dtype] "Quantize/upload host values as `dtype`.")
+  (-copy-to-host-dtype [b h n dtype] "Decode/download `n` `dtype` elements."))
+
+(defprotocol IDTypeOps
+  "Optional compute contract over physical non-f32 storage. Accumulation policy
+  is backend-defined; outputs must be materialized in the requested dtype."
+  (-ewise-dtype [b op xh yh n dtype])
+  (-ewise1-dtype [b op xh n dtype])
+  (-gemm-dtype [b Ah m k Bh n dtype]))
+
+(defprotocol IDTypeTensorOps
+  "Optional N-D compute operations over physical typed storage."
+  (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])
+  (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype]))
+
+(defprotocol ITensorBackend
+  "Optional device-native N-D operations. Backends that do not implement this
+  protocol continue to use num.tensor's portable host oracle."
+  (-conv2d-nchw [b input-h weight-h bias-h params]
+    "NCHW cross-correlation. `params` contains validated dimensions/options;
+    returns a newly allocated output handle.")
+  (-group-norm-nchw [b input-h weight-h bias-h params]
+    "NCHW GroupNorm with optional affine parameters; returns a new handle.")
+  (-upsample-nearest2d [b input-h params]
+    "Integer nearest-neighbor NCHW upsampling; returns a new handle.")
+  (-cat [b input-handles params]
+    "Concatenate contiguous tensors along an arbitrary axis; returns a new handle."))

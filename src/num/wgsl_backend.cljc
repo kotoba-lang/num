@@ -86,7 +86,7 @@
   (-ewise1 [_ op xh n]
     (let [z (w/-create-buffer dev n :storage)]
       (w/-dispatch dev (get-pipeline dev pipes :ewise1)
-                   [xh z (uni dev (u32-tag [({:exp 0 :relu 1 :neg 2} op)]))]
+                   [xh z (uni dev (u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)]))]
                    [(ceil-div n 64) 1 1])
       z))
 
@@ -122,7 +122,50 @@
       (w/-write-buffer dev ci (u32-tag (seq (:col-idx csr))))
       (w/-write-buffer dev v (seq (:vals csr)))
       (w/-dispatch dev (get-pipeline dev pipes :spmv) [rp ci v xh y] [(ceil-div m 64) 1 1])
-      y)))
+      y))
+
+  p/ITensorBackend
+  (-conv2d-nchw [_ input-h weight-h bias-h
+                 {:keys [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw groups]}]
+    (let [total (* n cout oh ow)
+          output (w/-create-buffer dev total :storage)
+          bias (or bias-h (w/-create-buffer dev cout :storage))
+          params [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw
+                  groups 0 0 0]]
+      (w/-dispatch dev (get-pipeline dev pipes :conv2d-nchw)
+                   [input-h weight-h bias output (uni dev (u32-tag params))]
+                   [(ceil-div total 64) 1 1])
+      output))
+  (-group-norm-nchw [_ input-h weight-h bias-h
+                     {:keys [n c h width groups channels-group group-size eps]}]
+    (let [total (* n c h width)
+          output (w/-create-buffer dev total :storage)
+          weight (or weight-h
+                     (let [buffer (w/-create-buffer dev c :storage)]
+                       (w/-write-buffer dev buffer (repeat c 1.0)) buffer))
+          bias (or bias-h (w/-create-buffer dev c :storage))
+          dims [n c h width groups channels-group group-size (* h width)]]
+      (w/-dispatch dev (get-pipeline dev pipes :group-norm-nchw)
+                   [input-h weight bias output (uni dev (u32-tag dims))
+                    (uni dev [(double eps)])]
+                   [(* n groups) 1 1])
+      output))
+  (-upsample-nearest2d [_ input-h {:keys [n c h width oh ow scale-h scale-w]}]
+    (let [total (* n c oh ow)
+          output (w/-create-buffer dev total :storage)
+          dims [n c h width oh ow scale-h scale-w]]
+      (w/-dispatch dev (get-pipeline dev pipes :upsample-nearest2d)
+                   [input-h output (uni dev (u32-tag dims))]
+                   [(ceil-div total 64) 1 1])
+      output))
+  (-cat [_ input-handles {:keys [total-output output-block inputs]}]
+    (let [output (w/-create-buffer dev total-output :storage)]
+      (doseq [[input-h {:keys [total block axis-offset]}]
+              (map vector input-handles inputs)]
+        (w/-dispatch dev (get-pipeline dev pipes :cat-copy)
+                     [input-h output (uni dev (u32-tag [total block output-block axis-offset]))]
+                     [(ceil-div total 64) 1 1]))
+      output)))
 
 (defn wgsl-backend
   "Construct a WgslBackend over an injected `IGpuDevice` (native, blocking

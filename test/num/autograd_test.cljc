@@ -207,6 +207,37 @@
             numeric (arr/->vec (numerical-grad loss-of xd 1.0e-4))]
         (is (approx-vec-tol? analytic numeric 1.0e-3)
             (str "x analytic=" analytic " numeric=" numeric))))))
+
+(deftest multi-head-attention-gradient-matches-finite-differences
+  (testing "two-head self-attention differentiates through rank-3 batched
+            matmul and inverse axis permutations"
+    (let [xd (arr/from-vec backend
+                           [0.2 -0.1 0.3 0.4
+                            -0.2 0.1 0.5 -0.3
+                            0.6 0.2 -0.4 0.1]
+                           [3 4])
+          target (arr/from-vec backend (repeat 12 0.0) [3 4])
+          loss-of (fn [xd']
+                    (let [[loss _]
+                          (ag/with-tape
+                            (let [x (ag/value xd')]
+                              (ag/mse-loss*
+                               (ag/multi-head-attention* x x x 2) target)))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd)
+                  prediction (ag/multi-head-attention* x x x 2)
+                  loss (ag/mse-loss* prediction target)]
+              {:loss loss :prediction prediction :x x}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (let [analytic @(:grad (:x result))
+            numeric (numerical-grad loss-of xd 1.0e-5)]
+        (is (= [3 4] (:shape (:data (:prediction result)))))
+        (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+            (str "analytic=" (arr/->vec analytic)
+                 " numeric=" (arr/->vec numeric)))))))
+
 (deftest conv2d-nchw-gradients-match-finite-differences
   (testing "batched/channel-aware convolution differentiates input, grouped
             weights, and bias under padding+stride, not only valid 2-D toys"
@@ -280,6 +311,44 @@
                           (if (= key :weight) perturbed wd)
                           (if (= key :bias) perturbed bd)))
                data 1.0e-5)
+              analytic @(:grad (get result key))]
+          (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+              (str label " analytic=" (arr/->vec analytic)
+                   " numeric=" (arr/->vec numeric))))))))
+
+(deftest upsample-cat-skip-gradients-match-finite-differences
+  (testing "a branched UNet-style upsample + channel skip concatenation graph
+            propagates gradients into both source tensors"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1] [1 1 2 2])
+          skipd (arr/from-vec backend [-0.3 0.8 1.4 -0.9 0.1 0.5 -0.2 0.6]
+                              [1 2 2 2])
+          target (arr/from-vec backend (repeat 48 0.15) [1 3 4 4])
+          loss-of
+          (fn [xd' skipd']
+            (let [[loss _]
+                  (ag/with-tape
+                    (let [x (ag/value xd') skip (ag/value skipd')]
+                      (ag/mse-loss*
+                       (ag/silu*
+                        (ag/cat* [(ag/upsample-nearest2d* x 2)
+                                  (ag/upsample-nearest2d* skip 2)] 1))
+                       target)))]
+              (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) skip (ag/value skipd)
+                  merged (ag/cat* [(ag/upsample-nearest2d* x 2)
+                                   (ag/upsample-nearest2d* skip 2)] 1)
+                  loss (ag/mse-loss* (ag/silu* merged) target)]
+              {:loss loss :x x :skip skip}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["skip" :skip skipd]]]
+        (let [numeric (numerical-grad
+                       (fn [perturbed]
+                         (loss-of (if (= key :x) perturbed xd)
+                                  (if (= key :skip) perturbed skipd)))
+                       data 1.0e-5)
               analytic @(:grad (get result key))]
           (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
               (str label " analytic=" (arr/->vec analytic)

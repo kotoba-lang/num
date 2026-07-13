@@ -62,15 +62,23 @@
 
 ;; --- ops -------------------------------------------------------------------
 
+(defn- swap-last-two
+  "Transpose the matrix dimensions while preserving any batch dimensions."
+  [a]
+  (let [rank (count (:shape a))
+        perm (vec (concat (range (- rank 2)) [(dec rank) (- rank 2)]))]
+    (t/transpose a perm)))
+
 (defn matmul*
-  "z = x @ W. dL/dx = dL/dz @ W^T; dL/dW = x^T @ dL/dz."
+  "z = x @ W, including batched matrix multiplication. Gradients transpose
+  only the final two (matrix) axes and preserve all leading batch axes."
   [x W]
-  (node (nm/matmul (:data x) (:data W))
+  (node (t/matmul (:data x) (:data W))
         [x W]
         (fn [self]
           (when-let [g @(:grad self)]
-            (accumulate! x (nm/matmul g (t/transpose (:data W))))
-            (accumulate! W (nm/matmul (t/transpose (:data x)) g))))))
+            (accumulate! x (t/matmul g (swap-last-two (:data W))))
+            (accumulate! W (t/matmul (swap-last-two (:data x)) g))))))
 
 (defn add-bias*
   "z = x + b, b broadcast over x's leading (batch) axis. dL/dx = dL/dz;
@@ -123,7 +131,9 @@
   [pred target]
   (let [diff (t/sub (:data pred) target)
         n (double (arr/nelems (:shape diff)))
-        loss-val (/ (nm/sum (nm/mul diff diff)) n)]
+        loss-val (if (= :f32 (or (:dtype diff) :f32))
+                   (/ (nm/sum (nm/mul diff diff)) n)
+                   (/ (reduce + (map #(* % %) (arr/->vec diff))) n))]
     (node (arr/from-vec (:backend (:data pred)) [loss-val] [])
           [pred]
           (fn [self]
@@ -216,15 +226,21 @@
 ;; --- attention (2026-07-13 "raise the maturity" loop) -----------------------
 
 (defn transpose*
-  "z = transpose(x) (2-D full reversal, like num.tensor/transpose with no
-  perm). dL/dx = transpose(dL/dz) — a full-reversal transpose is its own
-  adjoint (transposing twice is the identity)."
-  [x]
-  (node (t/transpose (:data x))
-        [x]
-        (fn [self]
-          (when-let [g @(:grad self)]
-            (accumulate! x (t/transpose g))))))
+  "Permute tensor axes with a differentiable transpose. With no permutation,
+  reverses all axes like `num.tensor/transpose`. Backward applies the inverse
+  permutation, so arbitrary-rank head splitting/merging remains differentiable."
+  ([x]
+   (transpose* x (vec (reverse (range (count (:shape (:data x))))))))
+  ([x perm]
+   (let [perm (mapv long perm)
+         inverse (reduce-kv (fn [out destination source]
+                              (assoc out source destination))
+                            (vec (repeat (count perm) 0)) perm)]
+     (node (t/transpose (:data x) perm)
+           [x]
+           (fn [self]
+             (when-let [g @(:grad self)]
+               (accumulate! x (t/transpose g inverse))))))))
 
 (defn- copy-nd [a] (arr/from-vec (:backend a) (arr/->vec a) (:shape a)))
 
@@ -255,6 +271,34 @@
         scaled (scale* (/ 1.0 (Math/sqrt d)) scores)
         weights (softmax* scaled)]
     (matmul* weights V)))
+
+(defn multi-head-attention*
+  "Differentiable multi-head scaled dot-product attention matching
+  `num.tensor/multi-head-attention`. Q is `[seqQ d-model]`, K/V are
+  `[seqK d-model]`; `num-heads` evenly divides d-model."
+  [Q K V num-heads]
+  (let [[seq-q d-model] (:shape (:data Q))
+        [seq-k k-d-model] (:shape (:data K))
+        [_ v-d-model] (:shape (:data V))
+        heads (long num-heads)]
+    (when-not (and (pos? heads)
+                   (= d-model k-d-model v-d-model)
+                   (zero? (mod (long d-model) heads)))
+      (throw (ex-info "num.autograd/multi-head-attention*: incompatible dimensions"
+                      {:q-shape (:shape (:data Q))
+                       :k-shape (:shape (:data K))
+                       :v-shape (:shape (:data V))
+                       :num-heads heads})))
+    (let [d-head (quot (long d-model) heads)
+          split-heads (fn [x seq-len]
+                        (transpose* (reshape* x [seq-len heads d-head]) [1 0 2]))
+          qh (split-heads Q seq-q)
+          kh (split-heads K seq-k)
+          vh (split-heads V seq-k)
+          scores (matmul* qh (transpose* kh [0 2 1]))
+          weights (softmax* (scale* (/ 1.0 (Math/sqrt d-head)) scores))
+          heads-out (matmul* weights vh)]
+      (reshape* (transpose* heads-out [1 0 2]) [seq-q d-model]))))
 (defn- pair-option [value]
   (mapv long (if (sequential? value) value [value value])))
 
@@ -428,3 +472,69 @@
                  (when bias
                    (accumulate! bias (arr/from-vec (:backend bias-data) (vec dbias)
                                                    (:shape bias-data)))))))))))
+
+(defn cat*
+  "Differentiable `num.tensor/cat`. Backward slices the upstream gradient
+  along the concatenation axis and accumulates one contiguous gradient per
+  input Value."
+  [values axis]
+  (let [values (vec values)
+        data (mapv :data values)
+        output (t/cat data axis)
+        rank (count (:shape output))
+        axis (long (if (neg? axis) (+ rank axis) axis))
+        first-shape (:shape (first data))
+        inner (long (arr/nelems (subvec first-shape (inc axis))))
+        outer (long (arr/nelems (subvec first-shape 0 axis)))
+        output-axis (long (nth (:shape output) axis))
+        axis-sizes (mapv #(long (nth (:shape %) axis)) data)]
+    (node output values
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [gs (double-array (arr/->vec g))]
+                (loop [value-index 0 axis-offset 0]
+                  (when (< value-index (count values))
+                    (let [value (nth values value-index)
+                          shape (:shape (:data value))
+                          axis-size (nth axis-sizes value-index)
+                          block (* axis-size inner)
+                          sliced (double-array (arr/nelems shape))]
+                      (dotimes [outer-index outer]
+                        (let [source-base (+ (* outer-index output-axis inner)
+                                             (* axis-offset inner))
+                              destination-base (* outer-index block)]
+                          (dotimes [i block]
+                            (aset sliced (+ destination-base i)
+                                  (aget gs (+ source-base i))))))
+                      (accumulate! value
+                                   (arr/from-vec (:backend (:data value))
+                                                 (vec sliced) shape))
+                      (recur (inc value-index) (+ axis-offset axis-size)))))))))))
+
+(defn upsample-nearest2d*
+  "Differentiable nearest-neighbor NCHW upsampling. Backward sums every
+  repeated output cell into its source input cell."
+  [x scale-factor]
+  (let [input-data (:data x)
+        [N C H W] (mapv long (:shape input-data))
+        [scale-h scale-w] (pair-option scale-factor)
+        output (t/upsample-nearest2d input-data scale-factor)
+        [_ _ oh ow] (mapv long (:shape output))]
+    (node output [x]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [gs (double-array (arr/->vec g))
+                    dx (double-array (* N C H W))]
+                (dotimes [n N]
+                  (dotimes [c C]
+                    (dotimes [oi oh]
+                      (dotimes [oj ow]
+                        (let [input-index (+ (* n C H W) (* c H W)
+                                             (* (quot oi scale-h) W)
+                                             (quot oj scale-w))
+                              output-index (+ (* n C oh ow) (* c oh ow)
+                                              (* oi ow) oj)]
+                          (aset dx input-index
+                                (+ (aget dx input-index) (aget gs output-index))))))))
+                (accumulate! x (arr/from-vec (:backend input-data) (vec dx)
+                                             (:shape input-data)))))))))

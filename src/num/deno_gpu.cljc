@@ -45,6 +45,7 @@
   pulling in `core.async` (not needed here — no complex internal control flow, just
   a couple of `.then` chains)."
   (:require [num.protocol :as p]
+            [num.dtype :as dtype]
             [num.wgsl :as w]
             [num.wgsl-backend :as wb]))
 
@@ -121,7 +122,36 @@
            (.setBindGroup pass 0 bind-group)
            (.dispatchWorkgroups pass wx wy wz)
            (.end pass)
-           (.submit (.-queue dev) #js [(.finish encoder)]))))
+           (.submit (.-queue dev) #js [(.finish encoder)])))
+
+       w/IGpuDeviceDType
+       (-create-buffer-dtype [_ n usage dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "WebGPU typed storage currently supports f16 only"
+                           {:dtype dtype*})))
+         (.createBuffer dev #js {:size (max (* 4 (quot (+ (long n) 1) 2)) 4)
+                                 :usage (usage->flags usage)}))
+       (-write-buffer-dtype [_ buf xs dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
+         (let [encoded (js/Uint16Array.
+                        (into-array (map #(bit-and (dtype/f32->f16-bits %) 0xffff) xs)))]
+           (.writeBuffer (.-queue dev) buf 0 encoded)))
+       (-read-buffer-dtype [_ buf n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
+         (let [nbytes (max (* 4 (quot (+ (long n) 1) 2)) 4)
+               staging (.createBuffer dev #js {:size nbytes :usage readback-usage})
+               encoder (.createCommandEncoder dev)]
+           (.copyBufferToBuffer encoder buf 0 staging 0 nbytes)
+           (.submit (.-queue dev) #js [(.finish encoder)])
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [raw (js/Uint16Array. (.slice (.getMappedRange staging) 0))
+                              out (mapv dtype/f16-bits->f32
+                                        (take n (js/Array.from raw)))]
+                          (.unmap staging)
+                          out)))))))
 
      ;; --- device negotiation (the ONLY inherently-async step) ------------------
 
@@ -132,7 +162,10 @@
        (-> (.requestAdapter js/navigator.gpu)
            (.then (fn [adapter]
                     (-> (.requestDevice adapter)
-                        (.then (fn [dev] #js {:adapter adapter :device dev})))))))
+                        (.then (fn [dev]
+                                 (set! (.-onuncapturederror dev)
+                                       (fn [event] (js/console.error (.-error event))))
+                                 #js {:adapter adapter :device dev})))))))
 
      (defn adapter-description
        "Best-effort adapter description string for logging (mirrors
@@ -173,7 +206,7 @@
        (-ewise1 [_ op xh n]
          (let [z (w/-create-buffer dev n :storage)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1)
-                        [xh z (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2} op)]))]
+                        [xh z (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)]))]
                         [(wb/ceil-div n 64) 1 1])
            z))
 
@@ -210,7 +243,129 @@
            (w/-write-buffer dev ci (wb/u32-tag (seq (:col-idx csr))))
            (w/-write-buffer dev v (seq (:vals csr)))
            (w/-dispatch dev (wb/get-pipeline dev pipes :spmv) [rp ci v xh y] [(wb/ceil-div m 64) 1 1])
-           y)))
+           y))
+
+       p/IDTypeStorage
+       (-alloc-dtype [_ n dtype*]
+         (w/-create-buffer-dtype dev n :storage dtype*))
+       (-copy-from-host-dtype [_ xs dtype*]
+         (let [buffer (w/-create-buffer-dtype dev (count xs) :storage dtype*)]
+           (w/-write-buffer-dtype dev buffer xs dtype*)
+           buffer))
+       (-copy-to-host-dtype [_ h n dtype*]
+         (w/-read-buffer-dtype dev h n dtype*))
+
+       p/IDTypeOps
+       (-ewise-dtype [_ op xh yh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :ewise-f16)
+                        [xh yh output
+                         (wb/uni dev (wb/u32-tag [({:add 0 :sub 1 :mul 2 :div 3} op)
+                                                  n 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+           output))
+       (-ewise1-dtype [_ op xh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1-f16)
+                        [xh output
+                         (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)
+                                                  n 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+           output))
+       (-gemm-dtype [_ Ah m k Bh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev (* m n) :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :gemm-f16)
+                        [Ah Bh output (wb/uni dev (wb/u32-tag [m k n 0]))]
+                        [(wb/ceil-div (wb/ceil-div (* m n) 2) 64) 1 1])
+           output))
+
+       p/IDTypeTensorOps
+       (-conv2d-nchw-dtype [_ input-h weight-h bias-h
+                            {:keys [n cout oh ow] :as params} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU convolution supports f16 only" {:dtype dtype*})))
+         (let [total (* n cout oh ow)
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               bias (or bias-h (w/-create-buffer-dtype dev cout :storage :f16))
+               values ((juxt :n :cin :h :width :cout :cin-group :kh :kw
+                             :oh :ow :sh :sw :ph :pw :dh :dw :groups)
+                       params)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :conv2d-nchw-f16)
+                        [input-h weight-h bias output
+                         (wb/uni dev (wb/u32-tag (into (vec values) [0 0 0])))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-group-norm-nchw-dtype [_ input-h weight-h bias-h
+                                {:keys [n c h width groups channels-group
+                                        group-size eps]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU GroupNorm supports f16 only" {:dtype dtype*})))
+         (let [total (* n c h width)
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               weight (or weight-h
+                          (let [buffer (w/-create-buffer-dtype dev c :storage :f16)]
+                            (w/-write-buffer-dtype dev buffer (repeat c 1.0) :f16)
+                            buffer))
+               bias (or bias-h (w/-create-buffer-dtype dev c :storage :f16))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :group-norm-nchw-f16)
+                        [input-h weight bias output
+                         (wb/uni dev (wb/u32-tag
+                                      [n c h width groups channels-group
+                                       group-size (* h width)]))
+                         (wb/uni dev [(double eps)])]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+
+       p/ITensorBackend
+       (-conv2d-nchw [_ input-h weight-h bias-h
+                      {:keys [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw groups]}]
+         (let [total (* n cout oh ow)
+               output (w/-create-buffer dev total :storage)
+               bias (or bias-h (w/-create-buffer dev cout :storage))
+               params [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw
+                       groups 0 0 0]]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :conv2d-nchw)
+                        [input-h weight-h bias output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-group-norm-nchw [_ input-h weight-h bias-h
+                          {:keys [n c h width groups channels-group group-size eps]}]
+         (let [total (* n c h width)
+               output (w/-create-buffer dev total :storage)
+               weight (or weight-h
+                          (let [buffer (w/-create-buffer dev c :storage)]
+                            (w/-write-buffer dev buffer (repeat c 1.0)) buffer))
+               bias (or bias-h (w/-create-buffer dev c :storage))
+               dims [n c h width groups channels-group group-size (* h width)]]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :group-norm-nchw)
+                        [input-h weight bias output (wb/uni dev (wb/u32-tag dims))
+                         (wb/uni dev [(double eps)])]
+                        [(* n groups) 1 1])
+           output))
+       (-upsample-nearest2d [_ input-h
+                             {:keys [n c h width oh ow scale-h scale-w]}]
+         (let [total (* n c oh ow)
+               output (w/-create-buffer dev total :storage)
+               dims [n c h width oh ow scale-h scale-w]]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :upsample-nearest2d)
+                        [input-h output (wb/uni dev (wb/u32-tag dims))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-cat [_ input-handles {:keys [total-output output-block inputs]}]
+         (let [output (w/-create-buffer dev total-output :storage)]
+           (doseq [[input-h {:keys [total block axis-offset]}]
+                   (map vector input-handles inputs)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :cat-copy)
+                          [input-h output
+                           (wb/uni dev (wb/u32-tag [total block output-block axis-offset]))]
+                          [(wb/ceil-div total 64) 1 1]))
+           output)))
 
      (defn backend
        "Wrap an already-negotiated `r` (`request-device`'s resolved value) as a

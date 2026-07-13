@@ -44,10 +44,11 @@
   see that namespace's docstring). Calling any op below (including the
   `softmax`/`conv2d`/`attention` this phase adds) against a Deno GPU backend
   throws (`[object Promise] is not ISeqable`), confirmed by direct test.
-  So: every op in this namespace is verified real on the CPU oracle backend
-  (below and `test/num/tensor_test.cljc`); NONE of them are directly runnable
-  on Metal the way the raw IBackend ops are (`num.deno-gpu-verify`, 17/17 on
-  real Apple M4).
+  Most generic operations in this namespace still require that synchronous
+  readback. Device-native exceptions now include metadata-only reshapes and the
+  UNet path (SiLU, full NCHW convolution, GroupNorm, nearest upsampling, cat)
+  through `ITensorBackend`; they are directly verified on Apple M4 Metal
+  (`num.deno-gpu-verify`, 24/24).
 
   PARTIALLY CLOSED (same day): `num.tensor-async` (cljs-only) adds async
   twins of exactly `conv2d`/`attention`'s underlying ops (2-D transpose, 2-D
@@ -67,6 +68,14 @@
             [num.protocol :as p]))
 
 ;; --- shape / stride helpers ---------------------------------------------------
+
+(defn- array-dtype [a] (or (:dtype a) :f32))
+
+(defn- require-same-dtype! [operation arrays]
+  (let [dtypes (set (map array-dtype (remove nil? arrays)))]
+    (when-not (= 1 (count dtypes))
+      (throw (ex-info (str operation " requires matching dtypes")
+                      {:dtypes dtypes})))))
 
 (defn row-major-strides
   "Row-major (C-order) strides for `shape`: stride[i] = product of shape[i+1..]."
@@ -148,7 +157,7 @@
             out (double-array n)]
         (dotimes [oi n]
           (aset out oi (aget xs (ravel (unravel oi target-shape out-strides) eff-strides))))
-        (arr/from-vec (:backend a) (vec out) target-shape)))))
+        (arr/from-vec (:backend a) (vec out) target-shape (array-dtype a))))))
 
 (defn- ewise-bc
   "Broadcasting elementwise dispatch: broadcast both operands to their common
@@ -159,8 +168,8 @@
   (let [shape (broadcast-shapes (:shape x) (:shape y))
         x' (broadcast-to x shape)
         y' (broadcast-to y shape)
-        b (:backend x')]
-    (arr/->NDArray b (p/-ewise b op (:handle x') (:handle y') (arr/nelems shape)) shape)))
+        _ (require-same-dtype! "num.tensor elementwise" [x' y'])]
+    ((case op :add nm/add :sub nm/sub :mul nm/mul :div nm/div) x' y')))
 
 (defn add "Broadcasting x + y." [x y] (ewise-bc :add x y))
 (defn sub "Broadcasting x - y." [x y] (ewise-bc :sub x y))
@@ -445,13 +454,14 @@
 
   This closes the shape/semantics boundary needed by real UNets: batching,
   input/output channels, same-padding, downsampling stride, dilation, grouped
-  and depthwise convolution, and bias. Like the general N-D ops in this
-  namespace it is currently host-materialized; a device-native kernel remains
-  a performance task, not a correctness ambiguity."
+  and depthwise convolution, and bias. Backends implementing
+  `num.protocol/ITensorBackend` execute it device-native; other backends use
+  the portable host oracle below."
   ([input weight] (conv2d-nchw input weight nil {}))
   ([input weight bias] (conv2d-nchw input weight bias {}))
   ([input weight bias {:keys [stride padding dilation groups]
                        :or {stride 1 padding 0 dilation 1 groups 1}}]
+   (require-same-dtype! "num.tensor/conv2d-nchw" [input weight bias])
    (let [input-shape (:shape input)
          weight-shape (:shape weight)]
      (when-not (= 4 (count input-shape))
@@ -490,60 +500,84 @@
                                   :dilation [dh dw]})))
              oh (inc (quot (- (+ H (* 2 ph)) effective-kh) sh))
              ow (inc (quot (- (+ W (* 2 pw)) effective-kw) sw))
-             xs (double-array (arr/->vec input))
-               ws (double-array (arr/->vec weight))
-               bs (when bias (double-array (arr/->vec bias)))
-               out (double-array (* N Cout oh ow))
-               outputs-per-group (quot Cout groups)]
-           (dotimes [n N]
-             (dotimes [oc Cout]
-               (let [group (quot oc outputs-per-group)
-                     input-channel-base (* group Cin-per-group)]
-                 (dotimes [oi oh]
-                   (dotimes [oj ow]
-                     (let [sum
-                           (loop [icg 0 sum (if bs (aget bs oc) 0.0)]
-                             (if (< icg Cin-per-group)
-                               (let [ic (+ input-channel-base icg)
-                                     sum
-                                     (loop [ki 0 sum sum]
-                                       (if (< ki kh)
-                                         (let [ih (+ (- (* oi sh) ph) (* ki dh))
-                                               sum
-                                               (if (or (neg? ih) (>= ih H))
+             backend (:backend input)
+             params {:n N :cin Cin :h H :width W :cout Cout
+                     :cin-group Cin-per-group :kh kh :kw kw :oh oh :ow ow
+                     :sh sh :sw sw :ph ph :pw pw :dh dh :dw dw :groups groups}]
+         (cond
+           (and (not= :f32 (array-dtype input))
+                (satisfies? p/IDTypeTensorOps backend))
+           (assoc (arr/->NDArray backend
+                                  (p/-conv2d-nchw-dtype
+                                   backend (:handle input) (:handle weight)
+                                   (when bias (:handle bias)) params (array-dtype input))
+                                  [N Cout oh ow])
+                  :dtype (array-dtype input))
+
+           (and (= :f32 (array-dtype input))
+                (satisfies? p/ITensorBackend backend))
+           (assoc (arr/->NDArray backend
+                          (p/-conv2d-nchw backend (:handle input) (:handle weight)
+                                          (when bias (:handle bias)) params)
+                          [N Cout oh ow]) :dtype :f32)
+           :else
+           (let [xs (double-array (arr/->vec input))
+                 ws (double-array (arr/->vec weight))
+                 bs (when bias (double-array (arr/->vec bias)))
+                 out (double-array (* N Cout oh ow))
+                 outputs-per-group (quot Cout groups)]
+             (dotimes [n N]
+               (dotimes [oc Cout]
+                 (let [group (quot oc outputs-per-group)
+                       input-channel-base (* group Cin-per-group)]
+                   (dotimes [oi oh]
+                     (dotimes [oj ow]
+                       (let [sum
+                             (loop [icg 0 sum (if bs (aget bs oc) 0.0)]
+                               (if (< icg Cin-per-group)
+                                 (let [ic (+ input-channel-base icg)
+                                       sum
+                                       (loop [ki 0 sum sum]
+                                         (if (< ki kh)
+                                           (let [ih (+ (- (* oi sh) ph) (* ki dh))
                                                  sum
-                                                 (loop [kj 0 sum sum]
-                                                   (if (< kj kw)
-                                                     (let [iw (+ (- (* oj sw) pw) (* kj dw))]
-                                                       (recur (inc kj)
-                                                              (if (or (neg? iw) (>= iw W))
-                                                                sum
-                                                                (+ sum
-                                                                   (* (aget xs (+ (* n Cin H W)
-                                                                                  (* ic H W)
-                                                                                  (* ih W) iw))
-                                                                      (aget ws (+ (* oc Cin-per-group kh kw)
-                                                                                  (* icg kh kw)
-                                                                                  (* ki kw) kj)))))))
-                                                     sum)))]
-                                           (recur (inc ki) sum))
-                                         sum))]
-                                 (recur (inc icg) sum))
-                               sum))]
-                       (aset out (+ (* n Cout oh ow) (* oc oh ow) (* oi ow) oj) sum)))))))
-         (arr/from-vec (:backend input) (vec out) [N Cout oh ow]))))))
+                                                 (if (or (neg? ih) (>= ih H))
+                                                   sum
+                                                   (loop [kj 0 sum sum]
+                                                     (if (< kj kw)
+                                                       (let [iw (+ (- (* oj sw) pw) (* kj dw))]
+                                                         (recur (inc kj)
+                                                                (if (or (neg? iw) (>= iw W))
+                                                                  sum
+                                                                  (+ sum
+                                                                     (* (aget xs (+ (* n Cin H W)
+                                                                                    (* ic H W)
+                                                                                    (* ih W) iw))
+                                                                        (aget ws (+ (* oc Cin-per-group kh kw)
+                                                                                    (* icg kh kw)
+                                                                                    (* ki kw) kj)))))))
+                                                       sum)))]
+                                             (recur (inc ki) sum))
+                                           sum))]
+                                   (recur (inc icg) sum))
+                                 sum))]
+                         (aset out (+ (* n Cout oh ow) (* oc oh ow) (* oi ow) oj)
+                               sum)))))))
+             (arr/from-vec backend (vec out) [N Cout oh ow]
+                           (array-dtype input)))))))))
 
 ;; --- UNet tensor building blocks -----------------------------------------------
 
 (defn silu
-  "Elementwise SiLU/Swish: `x * sigmoid(x)`."
+  "Elementwise SiLU/Swish: `x * sigmoid(x)`, dispatched as one backend unary
+  kernel (device-native on WGSL/Metal; no host readback)."
   [input]
-  (let [one (arr/from-vec (:backend input) [1.0] [])]
-    (div input (add one (nm/exp (nm/neg input))))))
+  (nm/silu input))
 
 (defn cat
   "Concatenate equal-rank tensors along `axis` (PyTorch `torch.cat` shape
-  semantics). All non-concatenated dimensions must match."
+  semantics). All non-concatenated dimensions must match. ITensorBackend
+  implementations dispatch device-to-device slice copies."
   [tensors axis]
   (let [tensors (vec tensors)]
     (when (empty? tensors)
@@ -551,6 +585,7 @@
     (let [first-shape (:shape (first tensors))
           rank (count first-shape)
           axis (long (if (neg? axis) (+ rank axis) axis))]
+      (require-same-dtype! "num.tensor/cat" tensors)
       (when-not (< -1 axis rank)
         (throw (ex-info "num.tensor/cat axis out of range"
                         {:axis axis :rank rank})))
@@ -567,29 +602,48 @@
                              (reduce + (map #(long (nth (:shape %) axis)) tensors)))
             outer (long (arr/nelems (subvec first-shape 0 axis)))
             inner (long (arr/nelems (subvec first-shape (inc axis))))
-            out (double-array (arr/nelems out-shape))
-            sources (mapv #(double-array (arr/->vec %)) tensors)
-            axis-sizes (mapv #(long (nth (:shape %) axis)) tensors)]
-        (dotimes [outer-index outer]
-          (loop [tensor-index 0 axis-offset 0]
-            (when (< tensor-index (count tensors))
-              (let [axis-size (nth axis-sizes tensor-index)
-                    ^doubles source (nth sources tensor-index)
-                    count (* axis-size inner)
-                    source-base (* outer-index count)
-                    output-base (+ (* outer-index (nth out-shape axis) inner)
-                                   (* axis-offset inner))]
-                (dotimes [i count]
-                  (aset out (+ output-base i) (aget source (+ source-base i))))
-                (recur (inc tensor-index) (+ axis-offset axis-size))))))
-        (arr/from-vec (:backend (first tensors)) (vec out) out-shape)))))
+            axis-sizes (mapv #(long (nth (:shape %) axis)) tensors)
+            backend (:backend (first tensors))]
+        (if (and (= :f32 (array-dtype (first tensors)))
+                 (satisfies? p/ITensorBackend backend)
+                 (every? #(= backend (:backend %)) tensors))
+          (let [offsets (butlast (reductions + 0 axis-sizes))
+                inputs (mapv (fn [tensor axis-size axis-offset]
+                               {:total (arr/nelems (:shape tensor))
+                                :block (* axis-size inner)
+                                :axis-offset (* axis-offset inner)})
+                             tensors axis-sizes offsets)
+                params {:total-output (arr/nelems out-shape)
+                        :output-block (* (nth out-shape axis) inner)
+                        :inputs inputs}]
+            (assoc (arr/->NDArray backend
+                           (p/-cat backend (mapv :handle tensors) params)
+                           out-shape) :dtype :f32))
+          (let [out (double-array (arr/nelems out-shape))
+                sources (mapv #(double-array (arr/->vec %)) tensors)]
+            (dotimes [outer-index outer]
+              (loop [tensor-index 0 axis-offset 0]
+                (when (< tensor-index (count tensors))
+                  (let [axis-size (nth axis-sizes tensor-index)
+                        ^doubles source (nth sources tensor-index)
+                        count (* axis-size inner)
+                        source-base (* outer-index count)
+                        output-base (+ (* outer-index (nth out-shape axis) inner)
+                                       (* axis-offset inner))]
+                    (dotimes [i count]
+                      (aset out (+ output-base i) (aget source (+ source-base i))))
+                    (recur (inc tensor-index) (+ axis-offset axis-size))))))
+            (arr/from-vec backend (vec out) out-shape
+                          (array-dtype (first tensors)))))))))
 
 (defn group-norm-nchw
   "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
   (`unbiased=false`), as in `torch.nn.GroupNorm`. Optional affine `weight` and
-  `bias` have shape `[C]`."
+  `bias` have shape `[C]`. ITensorBackend implementations run device-native;
+  the portable fallback is the CPU oracle below."
   ([input num-groups] (group-norm-nchw input num-groups nil nil 1.0e-5))
   ([input num-groups weight bias eps]
+   (require-same-dtype! "num.tensor/group-norm-nchw" [input weight bias])
    (let [[N C H W :as shape] (:shape input)
          groups (long num-groups)]
      (when-not (and (= 4 (count shape)) (pos? groups) (zero? (mod (long C) groups))
@@ -603,36 +657,61 @@
      (let [N (long N) C (long C) H (long H) W (long W)
            channels-per-group (quot C groups)
            group-size (* channels-per-group H W)
-           xs (double-array (arr/->vec input))
-           ws (when weight (double-array (arr/->vec weight)))
-           bs (when bias (double-array (arr/->vec bias)))
-           out (double-array (* N C H W))]
-       (dotimes [n N]
-         (dotimes [group groups]
-           (let [base (+ (* n C H W) (* group group-size))
-                 mean (/ (loop [i 0 sum 0.0]
-                           (if (< i group-size)
-                             (recur (inc i) (+ sum (aget xs (+ base i))))
-                             sum))
-                         group-size)
-                 variance (/ (loop [i 0 sum 0.0]
+           backend (:backend input)
+           params {:n N :c C :h H :width W :groups groups
+                   :channels-group channels-per-group :group-size group-size
+                   :eps eps}]
+       (cond
+         (and (not= :f32 (array-dtype input))
+              (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray backend
+                                (p/-group-norm-nchw-dtype
+                                 backend (:handle input)
+                                 (when weight (:handle weight))
+                                 (when bias (:handle bias)) params (array-dtype input))
+                                [N C H W])
+                :dtype (array-dtype input))
+
+         (and (= :f32 (array-dtype input))
+              (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray backend
+                        (p/-group-norm-nchw backend (:handle input)
+                                            (when weight (:handle weight))
+                                            (when bias (:handle bias)) params)
+                        [N C H W]) :dtype :f32)
+         :else
+         (let [xs (double-array (arr/->vec input))
+               ws (when weight (double-array (arr/->vec weight)))
+               bs (when bias (double-array (arr/->vec bias)))
+               out (double-array (* N C H W))]
+           (dotimes [n N]
+             (dotimes [group groups]
+               (let [base (+ (* n C H W) (* group group-size))
+                     mean (/ (loop [i 0 sum 0.0]
                                (if (< i group-size)
-                                 (let [d (- (aget xs (+ base i)) mean)]
-                                   (recur (inc i) (+ sum (* d d))))
+                                 (recur (inc i) (+ sum (aget xs (+ base i))))
                                  sum))
                              group-size)
-                 inv-std (/ 1.0 (Math/sqrt (+ variance eps)))]
-             (dotimes [i group-size]
-               (let [channel (+ (* group channels-per-group)
-                                (quot i (* H W)))
-                     normalized (* (- (aget xs (+ base i)) mean) inv-std)
-                     value (+ (* normalized (if ws (aget ws channel) 1.0))
-                              (if bs (aget bs channel) 0.0))]
-                 (aset out (+ base i) value))))))
-       (arr/from-vec (:backend input) (vec out) [N C H W])))))
+                     variance (/ (loop [i 0 sum 0.0]
+                                   (if (< i group-size)
+                                     (let [d (- (aget xs (+ base i)) mean)]
+                                       (recur (inc i) (+ sum (* d d))))
+                                     sum))
+                                 group-size)
+                     inv-std (/ 1.0 (Math/sqrt (+ variance eps)))]
+                 (dotimes [i group-size]
+                   (let [channel (+ (* group channels-per-group)
+                                    (quot i (* H W)))
+                         normalized (* (- (aget xs (+ base i)) mean) inv-std)
+                         value (+ (* normalized (if ws (aget ws channel) 1.0))
+                                  (if bs (aget bs channel) 0.0))]
+                     (aset out (+ base i) value))))))
+           (arr/from-vec backend (vec out) [N C H W]
+                         (array-dtype input))))))))
 
 (defn upsample-nearest2d
-  "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`."
+  "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.
+  ITensorBackend implementations execute it device-native."
   [input scale-factor]
   (let [[N C H W :as shape] (:shape input)
         [scale-h scale-w] (pair-option :scale-factor scale-factor)]
@@ -641,16 +720,25 @@
                       {:shape shape :scale-factor [scale-h scale-w]})))
     (let [N (long N) C (long C) H (long H) W (long W)
           oh (* H scale-h) ow (* W scale-w)
-          xs (double-array (arr/->vec input))
-          out (double-array (* N C oh ow))]
-      (dotimes [n N]
-        (dotimes [c C]
-          (dotimes [oi oh]
-            (dotimes [oj ow]
-              (aset out (+ (* n C oh ow) (* c oh ow) (* oi ow) oj)
-                    (aget xs (+ (* n C H W) (* c H W)
-                                (* (quot oi scale-h) W) (quot oj scale-w))))))))
-      (arr/from-vec (:backend input) (vec out) [N C oh ow]))))
+          backend (:backend input)
+          params {:n N :c C :h H :width W :oh oh :ow ow
+                  :scale-h scale-h :scale-w scale-w}]
+      (if (and (= :f32 (array-dtype input))
+               (satisfies? p/ITensorBackend backend))
+        (assoc (arr/->NDArray backend
+                       (p/-upsample-nearest2d backend (:handle input) params)
+                       [N C oh ow]) :dtype :f32)
+        (let [xs (double-array (arr/->vec input))
+              out (double-array (* N C oh ow))]
+          (dotimes [n N]
+            (dotimes [c C]
+              (dotimes [oi oh]
+                (dotimes [oj ow]
+                  (aset out (+ (* n C oh ow) (* c oh ow) (* oi ow) oj)
+                        (aget xs (+ (* n C H W) (* c H W)
+                                    (* (quot oi scale-h) W) (quot oj scale-w))))))))
+          (arr/from-vec backend (vec out) [N C oh ow]
+                        (array-dtype input)))))))
 
 ;; --- attention (ADR-2607131500 Phase 1) -----------------------------------------
 

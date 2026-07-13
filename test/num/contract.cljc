@@ -41,7 +41,9 @@
     (check (approx-vec? [1.0 (Math/exp 1) (Math/exp -2) (Math/exp 3)]
                         (arr/->vec (nm/exp c))) "exp")
     (check (approx-vec? [0 1 0 3] (arr/->vec (nm/relu c))) "relu")
-    (check (approx-vec? [0 -1 2 -3] (arr/->vec (nm/neg c))) "neg"))
+    (check (approx-vec? [0 -1 2 -3] (arr/->vec (nm/neg c))) "neg")
+    (check (approx-vec? (mapv #(/ % (+ 1.0 (Math/exp (- %)))) [0 1 -2 3])
+                        (arr/->vec (nm/silu c))) "silu"))
   ;; level-2 / level-3
   (let [A (arr/from-vec backend [1 2 3 4] [2 2])          ; [[1 2][3 4]]
         x (arr/from-vec backend [1 1] [2])

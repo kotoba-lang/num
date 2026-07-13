@@ -21,6 +21,7 @@
   (:require [num.array :as arr]
             [num.core :as nm]
             [num.sparse :as sp]
+            [num.tensor :as t]
             [num.cpu :as cpu]
             [num.contract :as contract]
             [num.deno-gpu :as dg]))
@@ -50,6 +51,7 @@
         exp-exp (arr/->vec (nm/exp c))
         exp-relu (arr/->vec (nm/relu c))
         exp-neg (arr/->vec (nm/neg c))
+        exp-silu (arr/->vec (nm/silu c))
         A (arr/from-vec cpu-b [1 2 3 4] [2 2])
         xv (arr/from-vec cpu-b [1 1] [2])
         B (arr/from-vec cpu-b [5 6 7 8] [2 2])
@@ -57,7 +59,53 @@
         exp-matmul (arr/->vec (nm/matmul A B))
         csr (sp/dense->csr 2 3 [1 0 2 0 3 0])
         xs (arr/from-vec cpu-b [1 1 1] [3])
-        exp-spmv (arr/->vec (nm/spmv cpu-b csr xs))]
+        exp-spmv (arr/->vec (nm/spmv cpu-b csr xs))
+        conv-input-values (mapv #(- (* 0.07 %) 0.4) (range (* 2 4 16 16)))
+        conv-weight-values (mapv #(- (* 0.013 (mod % 19)) 0.1)
+                                 (range (* 8 2 3 3)))
+        conv-bias-values (mapv #(- (* 0.02 %) 0.05) (range 8))
+        conv-opts {:padding 1 :stride 2 :groups 2}
+        exp-conv (arr/->vec
+                  (t/conv2d-nchw
+                   (arr/from-vec cpu-b conv-input-values [2 4 16 16])
+                   (arr/from-vec cpu-b conv-weight-values [8 2 3 3])
+                   (arr/from-vec cpu-b conv-bias-values [8]) conv-opts))
+        depth-input-values (mapv #(* 0.1 (inc %)) (range 32))
+        depth-weight-values [0.2 -0.1 0.3 0.4 -0.2 0.5 0.1 -0.3]
+        exp-depthwise (arr/->vec
+                       (t/conv2d-nchw
+                        (arr/from-vec cpu-b depth-input-values [1 2 4 4])
+                        (arr/from-vec cpu-b depth-weight-values [2 1 2 2]) nil
+                        {:dilation 2 :groups 2}))
+        norm-input-values (mapv #(- (* 0.011 (mod % 97)) 0.5)
+                                (range (* 2 32 16 16)))
+        norm-weight-values (mapv #(+ 0.7 (* 0.01 %)) (range 32))
+        norm-bias-values (mapv #(- (* 0.005 %) 0.08) (range 32))
+        exp-groupnorm (arr/->vec
+                       (t/group-norm-nchw
+                        (arr/from-vec cpu-b norm-input-values [2 32 16 16]) 4
+                        (arr/from-vec cpu-b norm-weight-values [32])
+                        (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5))
+        exp-groupnorm-no-affine (arr/->vec
+                                 (t/group-norm-nchw
+                                  (arr/from-vec cpu-b (take 32 norm-input-values)
+                                                [1 4 4 2]) 2))
+        exp-unet-chain
+        (arr/->vec
+         (t/upsample-nearest2d
+          (nm/silu
+           (t/group-norm-nchw
+            (arr/from-vec cpu-b norm-input-values [2 32 16 16]) 4
+            (arr/from-vec cpu-b norm-weight-values [32])
+            (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5))
+          [2 2]))
+        cpu-groupnorm (t/group-norm-nchw
+                       (arr/from-vec cpu-b norm-input-values [2 32 16 16]) 4
+                       (arr/from-vec cpu-b norm-weight-values [32])
+                       (arr/from-vec cpu-b norm-bias-values [32]) 1.0e-5)
+        exp-cat (arr/->vec
+                 (t/cat [(t/upsample-nearest2d (nm/silu cpu-groupnorm) 2)
+                         (t/upsample-nearest2d cpu-groupnorm 2)] 1))]
     (-> (dg/request-device)
         (.then
          (fn [r]
@@ -75,6 +123,24 @@
                  Bg (arr/from-vec gpu [5 6 7 8] [2 2])
                  xsg (arr/from-vec gpu [1 1 1] [3])
                  cg (arr/from-vec gpu [0 1 -2 3] [4])
+                 conv-out (t/conv2d-nchw
+                           (arr/from-vec gpu conv-input-values [2 4 16 16])
+                           (arr/from-vec gpu conv-weight-values [8 2 3 3])
+                           (arr/from-vec gpu conv-bias-values [8]) conv-opts)
+                 depthwise-out (t/conv2d-nchw
+                                (arr/from-vec gpu depth-input-values [1 2 4 4])
+                                (arr/from-vec gpu depth-weight-values [2 1 2 2]) nil
+                                {:dilation 2 :groups 2})
+                 groupnorm-out (t/group-norm-nchw
+                                (arr/from-vec gpu norm-input-values [2 32 16 16]) 4
+                                (arr/from-vec gpu norm-weight-values [32])
+                                (arr/from-vec gpu norm-bias-values [32]) 1.0e-5)
+                 groupnorm-no-affine-out
+                 (t/group-norm-nchw
+                  (arr/from-vec gpu (take 32 norm-input-values) [1 4 4 2]) 2)
+                 unet-chain-out (t/upsample-nearest2d (nm/silu groupnorm-out) [2 2])
+                 cat-out (t/cat [unet-chain-out
+                                 (t/upsample-nearest2d groupnorm-out 2)] 1)
                  checks
                  [["dot"    (->p (nm/dot xg yg))                              (fn [g] (contract/approx? g exp-dot))]
                   ["nrm2"   (->p (nm/nrm2 (arr/from-vec gpu [3 4] [2])))      (fn [g] (contract/approx? g exp-nrm2))]
@@ -93,7 +159,16 @@
                   ["spmv"   (->p (arr/->vec (nm/spmv gpu csr xsg)))           (fn [g] (contract/approx-vec? g exp-spmv))]
                   ["exp"    (->p (arr/->vec (nm/exp cg)))                     (fn [g] (contract/approx-vec? g exp-exp))]
                   ["relu"   (->p (arr/->vec (nm/relu cg)))                    (fn [g] (contract/approx-vec? g exp-relu))]
-                  ["neg"    (->p (arr/->vec (nm/neg cg)))                     (fn [g] (contract/approx-vec? g exp-neg))]]]
+                  ["neg"    (->p (arr/->vec (nm/neg cg)))                     (fn [g] (contract/approx-vec? g exp-neg))]
+                  ["silu"   (->p (arr/->vec (nm/silu cg)))                    (fn [g] (contract/approx-vec? g exp-silu))]
+                  ["conv2d-nchw" (->p (arr/->vec conv-out))                    (fn [g] (contract/approx-vec? g exp-conv))]
+                  ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]
+                  ["groupnorm-nchw" (->p (arr/->vec groupnorm-out))            (fn [g] (contract/approx-vec? g exp-groupnorm))]
+                  ["groupnorm-no-affine" (->p (arr/->vec groupnorm-no-affine-out))
+                                            (fn [g] (contract/approx-vec? g exp-groupnorm-no-affine))]
+                  ["groupnorm-silu-upsample-chain" (->p (arr/->vec unet-chain-out))
+                                                    (fn [g] (contract/approx-vec? g exp-unet-chain))]
+                  ["unet-skip-cat" (->p (arr/->vec cat-out))                  (fn [g] (contract/approx-vec? g exp-cat))]]]
              (-> (js/Promise.all
                   (into-array
                    (map (fn [[label prom okfn]]

@@ -76,6 +76,38 @@ JVM/native only, never required.
 (a/->vec (nm/spmv b K x))               ;=> [3.0 3.0]   (sparse A·x)
 ```
 
+### Physical f16/bf16 storage
+
+`from-vec` and `zeros` accept an optional dtype, and `cast` materializes a new
+buffer rather than attaching a cosmetic label:
+
+```clojure
+(def half (a/from-vec b [0.1 0.2 0.3 0.4] [2 2] :f16))
+(def brain (a/cast half :bf16))
+(:dtype half)                              ;=> :f16
+(a/->vec half)                             ; quantized host values
+```
+
+The CPU oracle stores f16/bf16 in real two-byte elements and implements typed
+elementwise operations, activations, and GEMM with f32 accumulation followed by
+output quantization. IEEE subnormals, infinities, NaNs, and round-to-nearest-even
+are covered by tests on JVM and the core compiles and runs under ClojureScript.
+The Deno/WebGPU→Metal backend also has real packed-f16 buffers and typed add,
+sub, mul, div, unary activation, GEMM, grouped NCHW convolution, and GroupNorm
+kernels. Because Deno's current Naga
+rejects WGSL's advertised `enable f16`, those kernels use two IEEE halves per
+`u32`, `unpack2x16float`/`pack2x16float`, and f32 evaluation/accumulation. Apple
+M4 Metal verification proves four values occupy eight GPU bytes and matches the
+CPU half oracle across all six kernel checks. This is physical half storage with quantized operation
+boundaries, not a claim of native f16 ALU throughput; BF16 GPU kernels and typed
+upsample/cat and BF16 GPU kernels remain open.
+
+```sh
+clojure -M:deno-dtype-verify
+deno run --allow-all target/deno-gpu-dtype-verify.cjs
+# Apple M4: physical bytes 8; Metal f16 6/6 passed
+```
+
 Ops: `axpy! scal! dot nrm2 add sub mul div sum amax amin matvec matmul spmv`.
 
 ## N-D tensors (`num.tensor`, ADR-2607051400 §Phase 1)
@@ -131,18 +163,28 @@ batching, multiple input/output channels, bias, scalar or pair
 twin `num.autograd/conv2d-nchw*` propagates gradients to input, weight, and
 bias under the same options; grouped padding+stride gradients are checked
 element-by-element against central finite differences. This removes the
-single-image/single-channel convolution fence for real UNet graphs. It remains
-host-materialized, like the other general N-D operations described below;
-device-native NCHW convolution is still required for production throughput.
+single-image/single-channel convolution fence for real UNet graphs. WGSL
+backends now implement it device-native through the optional `ITensorBackend`
+protocol; the same kernel covers batches, bias, groups/depthwise, stride,
+padding, and dilation. A 2×4×16×16 grouped fixture plus a depthwise+dilated
+fixture pass against the CPU oracle on Apple M4 Metal. Other backends retain
+the portable host implementation.
 
 The same NCHW layer also includes the other structural UNet primitives:
 `silu`, PyTorch-compatible biased-variance `group-norm-nchw`, `cat` for skip
 connections, and integer `upsample-nearest2d`. Their forward values and shape
-validation are hand-checked. `silu*` and `group-norm-nchw*` provide the
+validation are hand-checked. SiLU dispatches through one device-native unary
+WGSL kernel, GroupNorm uses one 256-thread reduction workgroup per normalization
+group, nearest upsampling maps one thread per output, and `cat` uses queue-ordered
+device-to-device slice dispatches. None requires tensor host readback. A complete
+`GroupNorm → SiLU → upsample → skip cat` chain is verified against the CPU oracle
+on Apple M4 Metal, alongside affine and non-affine normalization cases.
+`silu*` and `group-norm-nchw*` provide the
 corresponding training path; GroupNorm propagates input plus affine weight/bias
 gradients and the composed GroupNorm→SiLU chain is checked against central
-finite differences. Device-native kernels and gradients for `cat`/upsampling
-remain open.
+finite differences. `cat*` and `upsample-nearest2d*` complete the skip-path
+training graph; a branched upsample+channel-concat+SiLU loss matches central
+finite differences for both source tensors.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
@@ -217,11 +259,36 @@ no `--unstable-webgpu` flag needed):
 clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
 ```
 
+### UNet Metal benchmark
+
+The benchmark forces final readback, so it measures completed GPU work rather
+than near-zero queue submission latency:
+
+```bash
+clojure -M:deno-benchmark
+deno run --allow-all target/deno-gpu-benchmark.cjs
+```
+
+Measured on Apple M4 with input `[1,32,64,64]`, weights `[64,32,3,3]`, and a
+full `NCHW conv(pad=1) → GroupNorm(8) → SiLU` chain:
+
+| path | elapsed |
+|---|---:|
+| ClojureScript CPU oracle | 934.46 ms |
+| Metal cold (pipeline compile included) | 41.14 ms |
+| Metal warm | 36.68 ms |
+
+Warm speedup is **25.48×**, with maximum absolute error `2.38e-6` against the
+CPU oracle. This is a concrete kernel-chain measurement, not a claim of
+PyTorch/MPS-wide parity: larger 320-channel blocks, memory pressure, mixed
+precision, fusion, and full-model throughput still require separate benchmarks.
+
 This cross-checks the live GPU backend against `num.cpu`'s reference oracle (dispatched
 through `num.core`/`num.array`, i.e. through `IBackend`, the same seam any real caller
-uses) — **verified passing on real Apple M1 Max Metal hardware while building this**:
-`Deno WgslBackendAsync ≡ CPU oracle: 14 passed, 0 failed` (all 14 `num.core` ops:
-axpy!/scal!/add/sub/mul/div/dot/nrm2/sum/amax/amin/matvec/matmul/spmv).
+uses) — **verified passing on real Apple M4 Metal hardware while building this**:
+`Deno WgslBackendAsync ≡ CPU oracle: 24 passed, 0 failed` (BLAS, reductions,
+sparse matvec, unary exp/relu/neg/SiLU, full NCHW/depthwise convolution, and
+affine/non-affine GroupNorm, upsampling, and skip concatenation).
 
 ## Status
 
@@ -248,16 +315,19 @@ clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs   # PR
 
 **Portability is proven, not just claimed.** The `.cljc` core (CPU backend, array/CSR
 types, the full op contract) compiles to JS via ClojureScript and runs green on node —
-`cljs CPU contract: 14 passed, 0 failed`. The WGSL kernels are verified on real
+`cljs CPU contract: 18 passed, 0 failed`. The WGSL kernels are verified on real
 **Apple M4/M1 Metal** three separate ways now: the standalone harness
 (`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
 (`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
-`num.core` Clojure code (`deno-gpu-verify`, 14/14 against the CPU oracle). So num-clj
+`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 24/24 against the CPU
+oracle). So num-clj
 genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
 longer only exercised by a script outside the Clojure dispatch seam.
 
-**Honest gap:** `num.tensor`'s N-D ops (broadcast/reshape/axis-reduce/batched-matmul,
+**Honest gap:** most `num.tensor` N-D ops (broadcast/transpose/axis-reduce/batched-matmul,
 ADR-2607051400 §Phase 1) do not yet dispatch through `num.deno-gpu` or any GPU backend —
 they are host-materialized (round-trip through `arr/->vec`/`arr/from-vec`) regardless of
-which `IBackend` is injected. Extending the WGSL kernel set to N-D broadcast/batched-
+which `IBackend` is injected. Metadata-only reshape/squeeze/unsqueeze and the
+UNet path (SiLU, NCHW convolution, GroupNorm, nearest upsampling, cat) are
+exceptions. Extending the WGSL kernel set to N-D broadcast/batched-
 matmul dispatch is unimplemented net-new shader work, not attempted in this pass.
