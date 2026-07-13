@@ -36,6 +36,12 @@
     (check (approx? 10.0 (nm/sum a)) "sum")
     (check (approx? 4.0 (nm/amax a)) "amax")
     (check (approx? 1.0 (nm/amin a)) "amin"))
+  ;; unary elementwise
+  (let [c (arr/from-vec backend [0 1 -2 3] [4])]
+    (check (approx-vec? [1.0 (Math/exp 1) (Math/exp -2) (Math/exp 3)]
+                        (arr/->vec (nm/exp c))) "exp")
+    (check (approx-vec? [0 1 0 3] (arr/->vec (nm/relu c))) "relu")
+    (check (approx-vec? [0 -1 2 -3] (arr/->vec (nm/neg c))) "neg"))
   ;; level-2 / level-3
   (let [A (arr/from-vec backend [1 2 3 4] [2 2])          ; [[1 2][3 4]]
         x (arr/from-vec backend [1 1] [2])

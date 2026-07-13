@@ -46,6 +46,10 @@
         exp-mul (arr/->vec (nm/mul a b))
         exp-div (arr/->vec (nm/div a b))
         exp-sum (nm/sum a) exp-amax (nm/amax a) exp-amin (nm/amin a)
+        c (arr/from-vec cpu-b [0 1 -2 3] [4])
+        exp-exp (arr/->vec (nm/exp c))
+        exp-relu (arr/->vec (nm/relu c))
+        exp-neg (arr/->vec (nm/neg c))
         A (arr/from-vec cpu-b [1 2 3 4] [2 2])
         xv (arr/from-vec cpu-b [1 1] [2])
         B (arr/from-vec cpu-b [5 6 7 8] [2 2])
@@ -70,6 +74,7 @@
                  xvg (arr/from-vec gpu [1 1] [2])
                  Bg (arr/from-vec gpu [5 6 7 8] [2 2])
                  xsg (arr/from-vec gpu [1 1 1] [3])
+                 cg (arr/from-vec gpu [0 1 -2 3] [4])
                  checks
                  [["dot"    (->p (nm/dot xg yg))                              (fn [g] (contract/approx? g exp-dot))]
                   ["nrm2"   (->p (nm/nrm2 (arr/from-vec gpu [3 4] [2])))      (fn [g] (contract/approx? g exp-nrm2))]
@@ -85,7 +90,10 @@
                   ["amin"   (->p (nm/amin ag))                                (fn [g] (contract/approx? g exp-amin))]
                   ["matvec" (->p (arr/->vec (nm/matvec Ag xvg)))              (fn [g] (contract/approx-vec? g exp-matvec))]
                   ["matmul" (->p (arr/->vec (nm/matmul Ag Bg)))               (fn [g] (contract/approx-vec? g exp-matmul))]
-                  ["spmv"   (->p (arr/->vec (nm/spmv gpu csr xsg)))           (fn [g] (contract/approx-vec? g exp-spmv))]]]
+                  ["spmv"   (->p (arr/->vec (nm/spmv gpu csr xsg)))           (fn [g] (contract/approx-vec? g exp-spmv))]
+                  ["exp"    (->p (arr/->vec (nm/exp cg)))                     (fn [g] (contract/approx-vec? g exp-exp))]
+                  ["relu"   (->p (arr/->vec (nm/relu cg)))                    (fn [g] (contract/approx-vec? g exp-relu))]
+                  ["neg"    (->p (arr/->vec (nm/neg cg)))                     (fn [g] (contract/approx-vec? g exp-neg))]]]
              (-> (js/Promise.all
                   (into-array
                    (map (fn [[label prom okfn]]

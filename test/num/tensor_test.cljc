@@ -5,6 +5,7 @@
   oracle backend — never against NumPy (no such dependency exists or ever will)."
   (:require [clojure.test :refer [deftest is testing]]
             [num.array :as arr]
+            [num.contract :as contract]
             [num.core :as nm]
             [num.cpu :as cpu]
             [num.tensor :as t]))
@@ -279,3 +280,61 @@
           out (t/matmul A B)]
       (is (= [2 3 4 6] (:shape out)))
       (is (= naive (arr/->vec out))))))
+
+;; --- softmax / conv2d / attention (ADR-2607131500 Phase 1) ----------------------
+
+(deftest softmax-matches-hand-computed
+  (testing "a uniform row softmaxes to 1/n everywhere regardless of the constant"
+    (let [a (arr/from-vec backend [5 5 5] [1 3])]
+      (is (contract/approx-vec? [(/ 1.0 3) (/ 1.0 3) (/ 1.0 3)] (arr/->vec (t/softmax a))))))
+  (testing "[1 2 3] softmaxes to the textbook values, independently computed
+            (subtract max, exponentiate, normalize — done here by hand in
+            plain doubles, not by calling t/softmax's own machinery)"
+    (let [a (arr/from-vec backend [1 2 3] [1 3])
+          e0 (Math/exp -2.0) e1 (Math/exp -1.0) e2 (Math/exp 0.0)
+          s (+ e0 e1 e2)]
+      (is (contract/approx-vec? [(/ e0 s) (/ e1 s) (/ e2 s)] (arr/->vec (t/softmax a))))))
+  (testing "row-wise: each row of a 2x3 matrix softmaxes independently"
+    (let [a (arr/from-vec backend [5 5 5 1 2 3] [2 3])
+          out (arr/->vec (t/softmax a 1))
+          e0 (Math/exp -2.0) e1 (Math/exp -1.0) e2 (Math/exp 0.0) s (+ e0 e1 e2)]
+      (is (contract/approx-vec? [(/ 1.0 3) (/ 1.0 3) (/ 1.0 3) (/ e0 s) (/ e1 s) (/ e2 s)] out)))))
+
+(deftest conv2d-matches-hand-computed
+  (testing "3x3 input, 2x2 all-ones kernel = sliding-window sum, hand-computed
+            independently of t/conv2d"
+    ;; input [[1 2 3][4 5 6][7 8 9]], kernel [[1 1][1 1]]
+    ;; out[0][0]=1+2+4+5=12  out[0][1]=2+3+5+6=16
+    ;; out[1][0]=4+5+7+8=24  out[1][1]=5+6+8+9=28
+    (let [a (arr/from-vec backend (range 1 10) [3 3])
+          k (arr/from-vec backend [1 1 1 1] [2 2])
+          out (t/conv2d a k)]
+      (is (= [2 2] (:shape out)))
+      (is (= [12.0 16.0 24.0 28.0] (arr/->vec out)))))
+  (testing "a 1x1 kernel is pointwise scaling"
+    (let [a (arr/from-vec backend [1 2 3 4] [2 2])
+          k (arr/from-vec backend [10] [1 1])
+          out (t/conv2d a k)]
+      (is (= [2 2] (:shape out)))
+      (is (= [10.0 20.0 30.0 40.0] (arr/->vec out)))))
+  (testing "kernel larger than input throws"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/conv2d (arr/from-vec backend [1 2 3 4] [2 2])
+                           (arr/from-vec backend (range 9) [3 3]))))))
+
+(deftest attention-matches-hand-computed
+  (testing "zero queries (no signal) produce uniform attention over any K/V"
+    (let [Q (arr/from-vec backend [0 0] [2 1])
+          K (arr/from-vec backend [1 2] [2 1])
+          V (arr/from-vec backend [10 20 30 40] [2 2])
+          out (arr/->vec (t/attention Q K V))
+          mean-v [20.0 30.0]] ; (10+30)/2, (20+40)/2 — uniform 0.5/0.5 weights, both query rows
+      (is (contract/approx-vec? (into mean-v mean-v) out))))
+  (testing "a 1-D-embedding case with an independently-computed (not t/attention-derived)
+            softmax weighting: Q=[1], K=[ln2, 0] -> scores [ln2 0] (d=1, no scaling
+            divisor) -> softmax [2/3 1/3] -> weights . V"
+    (let [Q (arr/from-vec backend [1] [1 1])
+          K (arr/from-vec backend [(Math/log 2) 0] [2 1])
+          V (arr/from-vec backend [10 20 30 40] [2 2])
+          out (arr/->vec (t/attention Q K V))]
+      (is (contract/approx-vec? [(/ 50.0 3) (/ 80.0 3)] out)))))

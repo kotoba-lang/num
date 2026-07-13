@@ -83,6 +83,13 @@
                    [(ceil-div n 64) 1 1])
       z))
 
+  (-ewise1 [_ op xh n]
+    (let [z (w/-create-buffer dev n :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :ewise1)
+                   [xh z (uni dev (u32-tag [({:exp 0 :relu 1 :neg 2} op)]))]
+                   [(ceil-div n 64) 1 1])
+      z))
+
   (-reduce [_ op xh n]
     (let [nwg (ceil-div n 256)
           parts (w/-create-buffer dev nwg :storage)]
