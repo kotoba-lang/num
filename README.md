@@ -135,6 +135,12 @@ single-image/single-channel convolution fence for real UNet graphs. It remains
 host-materialized, like the other general N-D operations described below;
 device-native NCHW convolution is still required for production throughput.
 
+The same NCHW layer also includes the other structural UNet primitives:
+`silu`, PyTorch-compatible biased-variance `group-norm-nchw`, `cat` for skip
+connections, and integer `upsample-nearest2d`. Their forward values and shape
+validation are hand-checked. Autograd for GroupNorm/SiLU and device-native
+kernels remain open; only `conv2d-nchw*` currently has the full training path.
+
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
 flat contiguous buffer. So `broadcast-to`/`transpose`/axis-reductions/`matmul` here read

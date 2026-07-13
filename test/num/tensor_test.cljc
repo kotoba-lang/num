@@ -402,6 +402,44 @@
                (t/conv2d-nchw (arr/from-vec backend (range 4) [1 1 2 2])
                               (arr/from-vec backend (range 9) [1 1 3 3])))))
 
+(deftest unet-silu-groupnorm-concat-and-upsample
+  (testing "SiLU matches its scalar definition"
+    (let [xs [-2.0 0.0 2.0]
+          out (arr/->vec (t/silu (arr/from-vec backend xs [3])))
+          expected (mapv #(/ % (+ 1.0 (Math/exp (- %)))) xs)]
+      (is (contract/approx-vec? expected out))))
+  (testing "GroupNorm uses per-sample group statistics and affine channels"
+    (let [input (arr/from-vec backend [1 3 2 6] [1 4 1 1])
+          weight (arr/from-vec backend [1 2 3 4] [4])
+          bias (arr/from-vec backend [0.5 0.5 0 0] [4])
+          out (t/group-norm-nchw input 2 weight bias 0.0)]
+      (is (= [1 4 1 1] (:shape out)))
+      (is (= [-0.5 2.5 -3.0 4.0] (arr/->vec out)))))
+  (testing "channel concat preserves NCHW block order"
+    (let [a (arr/from-vec backend [1 2 3 4] [1 1 2 2])
+          b (arr/from-vec backend [10 20 30 40 50 60 70 80] [1 2 2 2])
+          out (t/cat [a b] 1)]
+      (is (= [1 3 2 2] (:shape out)))
+      (is (= [1.0 2.0 3.0 4.0 10.0 20.0 30.0 40.0 50.0 60.0 70.0 80.0]
+             (arr/->vec out)))))
+  (testing "nearest upsample repeats each source pixel spatially"
+    (let [input (arr/from-vec backend [1 2 3 4] [1 1 2 2])
+          out (t/upsample-nearest2d input 2)]
+      (is (= [1 1 4 4] (:shape out)))
+      (is (= [1.0 1.0 2.0 2.0
+              1.0 1.0 2.0 2.0
+              3.0 3.0 4.0 4.0
+              3.0 3.0 4.0 4.0]
+             (arr/->vec out))))))
+
+(deftest unet-ops-validate-shapes
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (t/group-norm-nchw (arr/from-vec backend (range 12) [1 3 2 2]) 2)))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (t/cat [(arr/from-vec backend (range 4) [1 1 2 2])
+                       (arr/from-vec backend (range 6) [1 1 2 3])]
+                      1))))
+
 (deftest attention-matches-hand-computed
   (testing "zero queries (no signal) produce uniform attention over any K/V"
     (let [Q (arr/from-vec backend [0 0] [2 1])
