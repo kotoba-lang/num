@@ -15,7 +15,8 @@
                 :conv2d-nchw :group-norm-nchw :upsample-nearest2d :cat-copy
                 :add-last-axis-bias :multi-head-attention
                 :multi-head-attention-backward :transpose-2d :bias-gradient
-                :mse-loss :mse-gradient :sgd-step :adamw-step :spmv]]
+                :mse-loss :mse-gradient :sgd-step :adamw-step
+                :unscale-gradient :spmv]]
       (is (string? (get w/shaders op)) (str "missing shader: " op))
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"
@@ -89,3 +90,9 @@
   (is (re-find #"next_moment\[i\] = m" w/adamw-step-wgsl))
   (is (re-find #"next_variance\[i\] = v" w/adamw-step-wgsl))
   (is (re-find #"weight_decay \* parameter\[i\]" w/adamw-step-wgsl)))
+
+(deftest unscale-kernel-atomically-reports-nonfinite-values
+  (is (re-find #"value != value" w/unscale-gradient-wgsl))
+  (is (re-find #"abs\(value\) >" w/unscale-gradient-wgsl))
+  (is (re-find #"atomicOr\(&found_inf, 1u\)" w/unscale-gradient-wgsl))
+  (is (re-find #"value \* inverse_scale" w/unscale-gradient-wgsl)))

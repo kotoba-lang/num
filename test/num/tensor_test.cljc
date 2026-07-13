@@ -522,6 +522,17 @@
     (is (not= (arr/->vec (:parameter first))
               (arr/->vec (:parameter second))))))
 
+(deftest fused-gradient-unscale-detects-overflow
+  (let [finite (t/unscale-gradient
+                (arr/from-vec backend [16.0 -8.0] [2]) 8.0)
+        overflow (t/unscale-gradient
+                  (arr/from-vec backend [1.0 ##Inf] [2]) 4.0)]
+    (is (= [2.0 -1.0] (arr/->vec (:gradient finite))))
+    (is (= [0.0] (arr/->vec (:found-inf finite))))
+    (is (pos? (first (arr/->vec (:found-inf overflow)))))
+    (is (#?(:clj Double/isInfinite :cljs (complement js/isFinite))
+         (double (second (arr/->vec (:gradient overflow))))))))
+
 (deftest batched-causal-padding-multi-head-attention
   (let [query (arr/from-vec backend (repeat 12 0.0) [2 3 2])
         key (arr/from-vec backend (repeat 12 0.0) [2 3 2])

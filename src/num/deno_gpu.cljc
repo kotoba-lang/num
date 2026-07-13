@@ -427,6 +427,15 @@
                         [(wb/ceil-div count 64) 1 1])
            {:parameter next-parameter :moment next-moment
             :variance next-variance}))
+       (-unscale-gradient [_ gradient-h {:keys [count inverse-scale]}]
+         (let [output (w/-create-buffer dev count :storage)
+               found-inf (w/-create-buffer dev 1 :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :unscale-gradient)
+                        [gradient-h output found-inf
+                         (wb/uni dev [(double inverse-scale)])
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [(wb/ceil-div count 64) 1 1])
+           {:gradient output :found-inf found-inf}))
        (-multi-head-attention [_ query-h key-h value-h key-padding-mask-h
                                {:keys [batch seq-q seq-k d-model heads head-dim total
                                        causal? has-key-padding-mask?]}]

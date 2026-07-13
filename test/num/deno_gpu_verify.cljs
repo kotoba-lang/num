@@ -181,6 +181,10 @@
                              (arr/from-vec gpu adam-gradient-values [4])
                              (:moment gpu-adam-1) (:variance gpu-adam-1)
                              2 adam-options)
+                 gpu-unscale (t/unscale-gradient
+                              (arr/from-vec gpu [16.0 -8.0 4.0] [3]) 8.0)
+                 gpu-overflow (t/unscale-gradient
+                               (arr/from-vec gpu [1.0 js/Infinity] [2]) 4.0)
                  checks
                  [["dot"    (->p (nm/dot xg yg))                              (fn [g] (contract/approx? g exp-dot))]
                   ["nrm2"   (->p (nm/nrm2 (arr/from-vec gpu [3 4] [2])))      (fn [g] (contract/approx? g exp-nrm2))]
@@ -204,6 +208,12 @@
                    (fn [g] (contract/approx-vec? g (arr/->vec (:moment cpu-adam-2))))]
                   ["adamw-variance-step2" (->p (arr/->vec (:variance gpu-adam-2)))
                    (fn [g] (contract/approx-vec? g (arr/->vec (:variance cpu-adam-2))))]
+                  ["unscale-gradient" (->p (arr/->vec (:gradient gpu-unscale)))
+                   (fn [g] (contract/approx-vec? g [2.0 -1.0 0.5]))]
+                  ["unscale-finite-flag" (->p (arr/->vec (:found-inf gpu-unscale)))
+                   (fn [g] (zero? (first g)))]
+                  ["unscale-overflow-flag" (->p (arr/->vec (:found-inf gpu-overflow)))
+                   (fn [g] (pos? (first g)))]
                   ["spmv"   (->p (arr/->vec (nm/spmv gpu csr xsg)))           (fn [g] (contract/approx-vec? g exp-spmv))]
                   ["exp"    (->p (arr/->vec (nm/exp cg)))                     (fn [g] (contract/approx-vec? g exp-exp))]
                   ["relu"   (->p (arr/->vec (nm/relu cg)))                    (fn [g] (contract/approx-vec? g exp-relu))]

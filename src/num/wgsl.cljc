@@ -868,6 +868,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                       (adaptive + h.weight_decay * parameter[i]);
 }")
 
+(def unscale-gradient-wgsl
+  "Fused loss-scale removal and atomic non-finite detection."
+  "
+@group(0) @binding(0) var<storage, read> gradient: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> found_inf: atomic<u32>;
+@group(0) @binding(3) var<uniform> inverse_scale: f32;
+@group(0) @binding(4) var<uniform> count: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= count) { return; }
+  let value = gradient[i];
+  if (value != value || abs(value) > 3.402823e+38) {
+    atomicOr(&found_inf, 1u);
+  }
+  output[i] = value * inverse_scale;
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."
@@ -1230,6 +1248,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :mse-gradient mse-gradient-wgsl
    :sgd-step sgd-step-wgsl
    :adamw-step adamw-step-wgsl
+   :unscale-gradient unscale-gradient-wgsl
    :multi-head-attention multi-head-attention-wgsl
    :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl

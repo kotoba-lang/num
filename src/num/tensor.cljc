@@ -275,6 +275,34 @@
            :moment (arr/from-vec backend next-m shape dtype)
            :variance (arr/from-vec backend next-v shape dtype)})))))
 
+(defn unscale-gradient
+  "Divide one gradient by `scale` and return a device-readable overflow flag.
+
+  The result is `{:gradient NDArray :found-inf NDArray-scalar}`. The scalar is
+  zero when all source values are finite and positive otherwise. GPU backends
+  perform both operations in one dispatch without downloading the gradient."
+  [gradient scale]
+  (when-not (and (number? scale) (pos? scale))
+    (throw (ex-info "num.tensor/unscale-gradient: scale must be positive"
+                    {:scale scale})))
+  (let [backend (:backend gradient) shape (:shape gradient)
+        dtype (array-dtype gradient) count (arr/nelems shape)]
+    (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+      (let [{:keys [gradient found-inf]}
+            (p/-unscale-gradient backend (:handle gradient)
+                                 {:count count :inverse-scale (/ 1.0 scale)})]
+        {:gradient (assoc (arr/->NDArray backend gradient shape) :dtype :f32)
+         :found-inf (assoc (arr/->NDArray backend found-inf []) :dtype :f32)})
+      (let [found? (volatile! false)
+            values (mapv (fn [value]
+                           (when-not #?(:clj (Double/isFinite (double value))
+                                        :cljs (js/isFinite value))
+                             (vreset! found? true))
+                           (/ value scale))
+                         (arr/->vec gradient))]
+        {:gradient (arr/from-vec backend values shape dtype)
+         :found-inf (arr/from-vec backend [(if @found? 1.0 0.0)] [] :f32)}))))
+
 ;; --- reshape / transpose / squeeze / unsqueeze --------------------------------
 
 (defn reshape
