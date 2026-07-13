@@ -26,3 +26,8 @@
   (testing "the WgslBackend constructor and IGpuDevice port compile on the JVM"
     (is (fn? wb/wgsl-backend))
     (is (some? (resolve 'num.wgsl/IGpuDevice)))))
+
+(deftest q8-gemv-shader-decodes-packed-signed-blocks
+  (is (string? w/q8-0-gemv-wgsl))
+  (is (re-find #"signed_byte" w/q8-0-gemv-wgsl))
+  (is (re-find #"scale \* signed_byte" w/q8-0-gemv-wgsl)))

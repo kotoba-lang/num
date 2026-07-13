@@ -230,6 +230,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   y[i] = s;
 }")
 
+(def q8-0-gemv-wgsl
+  "GGML Q8_0 GEMV without an intermediate dequantized matrix. Quants are
+  packed four signed bytes per u32; scales are one f32 per 32-value block."
+  "
+@group(0) @binding(0) var<storage, read>       q: array<u32>;
+@group(0) @binding(1) var<storage, read>       scales: array<f32>;
+@group(0) @binding(2) var<storage, read>       x: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<uniform>             d: vec3<u32>; // rows, cols, blocks/row
+
+fn signed_byte(byte_index: u32) -> f32 {
+  let word = q[byte_index / 4u];
+  let raw = (word >> ((byte_index % 4u) * 8u)) & 255u;
+  return f32(select(i32(raw), i32(raw) - 256, raw >= 128u));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.x;
+  if (row >= d.x) { return; }
+  var sum: f32 = 0.0;
+  for (var block: u32 = 0u; block < d.z; block = block + 1u) {
+    let scale = scales[row * d.z + block];
+    let qbase = (row * d.z + block) * 32u;
+    let xbase = block * 32u;
+    for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+      sum = sum + scale * signed_byte(qbase + i) * x[xbase + i];
+    }
+  }
+  y[row] = sum;
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."

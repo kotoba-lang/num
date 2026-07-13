@@ -220,6 +220,18 @@ without leaving the device) is **Phase 2** work per ADR-2607051400, not this pas
 
 ## Live GPU backend (Deno + WebGPU → Metal, ADR-2607051400 §Phase 2)
 
+GGML Q8_0 inference now has a fused GPU GEMV kernel. Packed signed bytes and
+per-32-value scales stay quantized in GPU storage and are decoded inside WGSL;
+no full F32 matrix is materialized. Verify it against the CPU oracle on the
+actual adapter:
+
+```sh
+clojure -M:deno-q8-verify
+deno run --allow-all target/deno-q8-verify.cjs
+# Apple M4: expected [73.76000009 95.44000039]
+#           Metal    [73.75999451 95.43997955]
+```
+
 `num.deno-gpu` promotes `verify/metal_contract.js`'s raw JS harness into a REAL
 `num.wgsl/IGpuDevice` + `num.protocol/IBackend` implementation — `num.core`'s ops
 (`axpy!`/`scal!`/`add`/`sub`/`mul`/`div`/`sum`/`amax`/`amin`/`dot`/`nrm2`/`matvec`/
