@@ -70,6 +70,45 @@
                                                  (arr/from-vec gpu Vd [3 2]))
                              (fn [out]
                                (check-out "attention-async ≡ CPU-sync oracle (cross-attention, seqQ≠seqK)"
+                                          out cpu-out))))
+
+                    ;; --- multi-head-attention-async, num-heads=1 must equal
+                    ;; attention-async exactly, same relationship the sync
+                    ;; versions have (num.tensor-test verifies this for the
+                    ;; sync pair directly against `attention`, not just
+                    ;; internal consistency).
+                    (let [Qd [1 2 3 4] Kd [5 6 7 8 9 10] Vd [1 0 0 1 1 1]]
+                      (.then (ta/attention-async (arr/from-vec gpu Qd [2 2])
+                                                 (arr/from-vec gpu Kd [3 2])
+                                                 (arr/from-vec gpu Vd [3 2]))
+                             (fn [single-head-out]
+                               (.then (->p (arr/->vec single-head-out))
+                                      (fn [expect]
+                                        (.then (ta/multi-head-attention-async
+                                                (arr/from-vec gpu Qd [2 2])
+                                                (arr/from-vec gpu Kd [3 2])
+                                                (arr/from-vec gpu Vd [3 2]) 1)
+                                               (fn [out]
+                                                 (check-out "multi-head-attention-async (num-heads=1 ≡ attention-async)"
+                                                            out expect))))))))
+
+                    ;; --- multi-head-attention-async, num-heads=2, seqQ≠seqK —
+                    ;; genuine cross-attention shape, cross-checked against
+                    ;; `num.tensor/multi-head-attention`'s CPU-sync oracle.
+                    (let [Qd [0.2 -0.1 0.3 0.4, -0.2 0.1 0.5 -0.3]
+                          Kd [1.0 0.0 0.0 1.0, 0.5 0.5 0.5 0.5, -0.3 0.2 0.1 0.4]
+                          Vd [0.1 0.2 0.3 0.4, -0.1 -0.2 -0.3 -0.4, 0.5 0.0 -0.5 0.0]
+                          cpu-out (arr/->vec
+                                   (t/multi-head-attention
+                                    (arr/from-vec cpu-b Qd [2 4])
+                                    (arr/from-vec cpu-b Kd [3 4])
+                                    (arr/from-vec cpu-b Vd [3 4]) 2))]
+                      (.then (ta/multi-head-attention-async
+                              (arr/from-vec gpu Qd [2 4])
+                              (arr/from-vec gpu Kd [3 4])
+                              (arr/from-vec gpu Vd [3 4]) 2)
+                             (fn [out]
+                               (check-out "multi-head-attention-async ≡ CPU-sync oracle (2 heads, seqQ≠seqK)"
                                           out cpu-out))))]))
                  (.then (fn [_]
                           (println (str "\ntensor-async on real Metal: " @pass " passed, " @fail " failed"))

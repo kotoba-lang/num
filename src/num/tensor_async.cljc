@@ -21,6 +21,17 @@
   worked on the live GPU device with zero modification, verified by the
   14/14 in `num.deno-gpu-verify`.
 
+  2026-07-13 (raise-the-maturity loop) adds `multi-head-attention-async`,
+  closing the SAME gap for `num.tensor/multi-head-attention` — the real
+  transformer/UNet attention block `comfyui.diffusion.model`'s
+  `spatial-transformer`/`cross-attention`/CLIP's `self-attention` all need,
+  now that `comfyui.diffusion.model`/`comfyui.clip.encoder` are `.cljc`.
+  Unlike single-head `attention`, multi-head needs `num.tensor/matmul`'s
+  BATCHED form, which is NOT async-safe (it does its own host round-trip) —
+  see that function's own docstring for why it computes everything as one
+  direct flat-index host round-trip instead of composing already-async
+  primitives.
+
   CLJS-only (needs `navigator.gpu`/Deno, same as `num.deno-gpu`); the `:clj`
   branch is an informative stub, same convention as that namespace."
   (:require [num.array :as arr]
@@ -100,11 +111,82 @@
                   (let [scores (nm/matmul Q Kt)
                         scaled (nm/scal! (/ 1.0 (Math/sqrt d)) scores)]
                     (.then (softmax-2d-async scaled)
-                           (fn [weights] (nm/matmul weights V)))))))))
+                           (fn [weights] (nm/matmul weights V))))))))
+
+     (defn multi-head-attention-async
+       "Async twin of `num.tensor/multi-head-attention`. Unlike single-head
+       `attention` (plain 2-D `num.core/matmul`, already async-safe — see this
+       ns's own docstring), `multi-head-attention` needs `num.tensor/matmul`'s
+       BATCHED generalization, which does its own host round-trip
+       (`double-array (arr/->vec ...)`) inside `num.tensor.cljc` — so it hits
+       the exact Promise-readback gap this ns exists to close, and there is no
+       narrower already-async primitive to reuse unchanged the way
+       `conv2d-async`/`attention-async` reuse plain matmul.
+
+       Computed as ONE self-contained host round-trip directly over the flat
+       `[seq d_model]` Q/K/V buffers: head `head`'s slice of row `i` is the
+       contiguous `d_head` run at offset `i*d_model + head*d_head` — so no
+       reshape/transpose value ever needs to materialize, sidestepping the gap
+       rather than working around it with more async primitives. Mirrors
+       `multi-head-attention`'s exact per-head scaled-dot-product-softmax math
+       (same scale `1/√d_head`, same numerically-stable subtract-max softmax).
+       `num-heads=1` is verified to match `attention-async` exactly, the same
+       relationship the sync versions have (see
+       `test/num/tensor_async_verify.cljs`)."
+       [Q K V num-heads]
+       (let [[seqQ d-model] (:shape Q)
+             [seqK _] (:shape K)
+             h (long num-heads)]
+         (when-not (zero? (mod (long d-model) h))
+           (throw (ex-info (str "num.tensor-async/multi-head-attention-async: "
+                                 "num-heads must evenly divide d_model")
+                            {:d-model d-model :num-heads h})))
+         (let [d-model (long d-model)
+               seqQ (long seqQ)
+               seqK (long seqK)
+               d-head (quot d-model h)
+               scale (/ 1.0 (Math/sqrt d-head))]
+           (.then
+            (js/Promise.all (into-array [(->p (arr/->vec Q)) (->p (arr/->vec K)) (->p (arr/->vec V))]))
+            (fn [results]
+              (let [qs (vec (aget results 0))
+                    ks (vec (aget results 1))
+                    vs (vec (aget results 2))
+                    out (double-array (* seqQ d-model))
+                    dot (fn [row-base col-base]
+                          (loop [l 0 s 0.0]
+                            (if (< l d-head)
+                              (recur (inc l)
+                                     (+ s (* (nth qs (+ row-base l)) (nth ks (+ col-base l)))))
+                              s)))]
+                (dotimes [head h]
+                  (let [offset (* head d-head)]
+                    (dotimes [i seqQ]
+                      (let [row-base (+ (* i d-model) offset)
+                            scores (double-array seqK)]
+                        (dotimes [j seqK]
+                          (aset scores j (* scale (dot row-base (+ (* j d-model) offset)))))
+                        (let [mx (loop [j 0 mx (aget scores 0)]
+                                   (if (< j seqK) (recur (inc j) (max mx (aget scores j))) mx))
+                              total (loop [j 0 total 0.0]
+                                      (if (< j seqK)
+                                        (do (aset scores j (Math/exp (- (aget scores j) mx)))
+                                            (recur (inc j) (+ total (aget scores j))))
+                                        total))]
+                          (dotimes [l d-head]
+                            (aset out (+ row-base l)
+                                  (loop [j 0 acc 0.0]
+                                    (if (< j seqK)
+                                      (recur (inc j)
+                                             (+ acc (* (/ (aget scores j) total)
+                                                       (nth vs (+ (* j d-model) offset l)))))
+                                      acc)))))))))
+                (arr/from-vec (:backend Q) (vec out) [seqQ d-model]))))))))
 
    :clj
    (do
      (defn transpose-2d-async [_a] (throw (ex-info "num.tensor-async/transpose-2d-async requires ClojureScript compiled for a Deno/WebGPU host." {})))
      (defn softmax-2d-async [_a] (throw (ex-info "num.tensor-async/softmax-2d-async requires ClojureScript compiled for a Deno/WebGPU host." {})))
      (defn conv2d-async [_a _kernel] (throw (ex-info "num.tensor-async/conv2d-async requires ClojureScript compiled for a Deno/WebGPU host." {})))
-     (defn attention-async [_Q _K _V] (throw (ex-info "num.tensor-async/attention-async requires ClojureScript compiled for a Deno/WebGPU host." {})))))
+     (defn attention-async [_Q _K _V] (throw (ex-info "num.tensor-async/attention-async requires ClojureScript compiled for a Deno/WebGPU host." {})))
+     (defn multi-head-attention-async [_Q _K _V _num-heads] (throw (ex-info "num.tensor-async/multi-head-attention-async requires ClojureScript compiled for a Deno/WebGPU host." {})))))
