@@ -131,3 +131,84 @@
               (let [scale (* 2.0 (arr/->scalar g) (/ 1.0 n))
                     diff-copy (arr/from-vec (:backend diff) (arr/->vec diff) (:shape diff))]
                 (accumulate! pred (nm/scal! scale diff-copy))))))))
+
+;; --- conv2d (2026-07-13 "raise the maturity" loop) --------------------------
+;; num.tensor/conv2d bundles im2col + matmul + reshape into one opaque
+;; function with no seam to hook a backward onto. conv2d* below decomposes
+;; the SAME shape convention (x: [H W], kernel: [kh kw], out: [oh ow]) back
+;; into that exact im2col+matmul+reshape pipeline, wrapping each step as a
+;; differentiable node — matmul* and reshape*'s gradients are already real;
+;; im2col*/col2im (below) is the one genuinely new backward formula.
+
+(defn reshape*
+  "z = reshape(x, new-shape) (zero-copy, like num.tensor/reshape). dL/dx =
+  reshape(dL/dz, x's original shape) — reshape's backward is itself, since
+  it never moves data, only relabels shape."
+  [x new-shape]
+  (let [old-shape (:shape (:data x))]
+    (node (t/reshape (:data x) new-shape)
+          [x]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (accumulate! x (t/reshape g old-shape)))))))
+
+(defn- im2col-nd
+  "[oh*ow kh*kw] patches NDArray from a `[H W]` NDArray `a` — the exact same
+  patch layout `num.tensor/conv2d` uses internally (mirrored here rather
+  than reused, since that function has no seam to extract just this step)."
+  [a kh kw]
+  (let [[H W] (:shape a) kh (long kh) kw (long kw)
+        oh (inc (- (long H) kh)) ow (inc (- (long W) kw))
+        xs (vec (arr/->vec a))
+        W (long W)
+        patches (double-array (* oh ow kh kw))]
+    (dotimes [oi oh]
+      (dotimes [oj ow]
+        (dotimes [ki kh]
+          (dotimes [kj kw]
+            (aset patches (+ (* (+ (* oi ow) oj) kh kw) (* ki kw) kj)
+                  (nth xs (+ (* (+ oi ki) W) (+ oj kj))))))))
+    (arr/from-vec (:backend a) (vec patches) [(* oh ow) (* kh kw)])))
+
+(defn- col2im-nd
+  "Adjoint of `im2col-nd`: scatter-ADD `patches-grad` (`[oh*ow kh*kw]`) back
+  to an `in-shape`-shaped (`[H W]`) gradient. A pixel touched by more than
+  one sliding window (any interior pixel once `kh`/`kw` > 1) accumulates the
+  SUM of every window's contribution — the standard im2col-conv adjoint."
+  [patches-grad in-shape kh kw]
+  (let [[H W] in-shape kh (long kh) kw (long kw)
+        oh (inc (- (long H) kh)) ow (inc (- (long W) kw))
+        pg (vec (arr/->vec patches-grad))
+        W (long W)
+        out (double-array (* (long H) W))]
+    (dotimes [oi oh]
+      (dotimes [oj ow]
+        (dotimes [ki kh]
+          (dotimes [kj kw]
+            (let [idx (+ (* (+ oi ki) W) (+ oj kj))
+                  pidx (+ (* (+ (* oi ow) oj) kh kw) (* ki kw) kj)]
+              (aset out idx (+ (aget out idx) (double (nth pg pidx)))))))))
+    (arr/from-vec (:backend patches-grad) (vec out) in-shape)))
+
+(defn im2col*
+  [x kh kw]
+  (node (im2col-nd (:data x) kh kw)
+        [x]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x (col2im-nd g (:shape (:data x)) kh kw))))))
+
+(defn conv2d*
+  "Single-channel 2-D 'valid' convolution with real gradients — same shape
+  convention as `num.tensor/conv2d` (`x`: `[H W]`, `kernel`: `[kh kw]`,
+  output `[oh ow]`), built from `im2col*` (the one new backward formula) +
+  the already-real `matmul*`/`reshape*`."
+  [x kernel]
+  (let [[kh kw] (:shape (:data kernel))
+        kh (long kh) kw (long kw)
+        [H W] (:shape (:data x))
+        oh (inc (- (long H) kh)) ow (inc (- (long W) kw))
+        P (im2col* x kh kw)
+        kflat (reshape* kernel [(* kh kw) 1])
+        out-flat (matmul* P kflat)]
+    (reshape* out-flat [oh ow])))

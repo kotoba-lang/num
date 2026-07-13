@@ -134,3 +134,45 @@
                 (str "losses: " losses)))
           (let [{:keys [loss w1 b1 w2 b2]} (step w1d b1d w2d b2d)]
             (recur (dec n) w1 b1 w2 b2 (conj losses loss))))))))
+
+(deftest conv2d-gradients-match-finite-differences
+  (testing "conv2d*'s im2col*/col2im backward (the one genuinely new formula
+            — matmul*/reshape* are already verified elsewhere), checked
+            against finite differences for BOTH the kernel and the INPUT.
+            Checking dL/dx specifically exercises col2im's overlapping-
+            window scatter-add (kh=kw=2 on a 4x4 input means every interior
+            input pixel contributes to more than one output position) —
+            a bug there would not show up if only dL/dkernel were checked.
+            All values kept strictly positive (x, kernel, and therefore the
+            conv output) to stay clear of relu's non-differentiable kink at
+            0, which would make the numerical estimate unstable/misleading,
+            not the analytic gradient wrong."
+    (let [H 4 W 4 kh 2 kw 2
+          xd (arr/from-vec backend (mapv #(* 0.1 (inc %)) (range (* H W))) [H W])
+          kd (arr/from-vec backend [0.1 0.2 0.3 0.4] [kh kw])
+          targetd (arr/from-vec backend (repeat 9 0.3) [3 3]) ; oh=ow=3 for 4x4 in, 2x2 kernel
+
+          loss-of (fn [xd' kd']
+                    (let [[result _tape]
+                          (ag/with-tape
+                            (let [x (ag/value xd') k (ag/value kd')]
+                              (ag/mse-loss* (ag/relu* (ag/conv2d* x k)) targetd)))]
+                      (arr/->scalar (:data result))))
+
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) k (ag/value kd)
+                  loss (ag/mse-loss* (ag/relu* (ag/conv2d* x k)) targetd)]
+              {:loss loss :x x :k k}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+
+      (doseq [[label key data] [["kernel" :k kd] ["input" :x xd]]]
+        (testing (str label " gradient")
+          (let [analytic (arr/->vec @(:grad (get result key)))
+                numeric (arr/->vec
+                         (numerical-grad
+                          (fn [perturbed]
+                            (if (= key :k) (loss-of xd perturbed) (loss-of perturbed kd)))
+                          data 1.0e-4))]
+            (is (approx-vec-tol? analytic numeric 1.0e-3)
+                (str label " analytic=" analytic " numeric=" numeric))))))))
