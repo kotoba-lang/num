@@ -384,9 +384,12 @@ CPU oracle. The full-width mode separately measures a real latent-resolution
 `[1,320,64,64] × [320,320,3,3]` convolution. The four-output-channel kernel
 now measures 109.01 ms warm, with its interior
 constant-input result within `4.51e-7` of the analytic value. Packed physical
-f16 currently takes 621.65 ms on the same case: Deno's Naga rejects native WGSL
+f16 now takes 586.35 ms on the same case after adding a four-output-channel,
+two-spatial-position packed fast path (down from 621.65 ms). Deno's Naga rejects native WGSL
 `enable f16` despite the adapter advertising `shader-f16`, so f16 remains a
-correctness/storage path rather than a performance claim.
+correctness/storage path rather than a performance claim: repeated
+`unpack2x16float` of every convolution weight still dominates and leaves it
+5.38× slower than f32 despite using half the persistent bytes.
 The benchmark also checks explicit GPUBuffer lifetime. After two warm/cold
 executions the 32→64 chain returns to its five persistent input/weight buffers
 (`598,784` bytes) from a `2,695,984`-byte peak; the 320-channel case returns to

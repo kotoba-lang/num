@@ -11,7 +11,7 @@
   (testing "every accelerated IBackend op has a non-empty WGSL kernel"
     (doseq [op [:axpy :scal :ewise :ewise1 :reduce :gemv :gemm
                 :ewise-f16 :ewise1-f16 :gemm-f16
-                :conv2d-nchw-f16 :group-norm-nchw-f16
+                :conv2d-nchw-f16 :conv2d-nchw-f16-oc4 :group-norm-nchw-f16
                 :conv2d-nchw :conv2d-nchw-oc4
                 :group-norm-nchw :group-norm-silu-nchw
                 :upsample-nearest2d :cat-copy
@@ -35,6 +35,12 @@
     (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"var sum: f32" (:gemm-f16 w/shaders)))))
+
+(deftest packed-f16-convolution-reuses-input-across-four-output-channels
+  (let [shader (:conv2d-nchw-f16-oc4 w/shaders)]
+    (is (re-find #"fn convolve4" shader))
+    (is (re-find #"vec4<f32>\(x\) \* weights" shader))
+    (is (re-find #"pack2x16float" shader))))
 
 (deftest image-boundary-shaders-fuse-layout-and-range-conversion
   (is (re-find #"let source" (:rgb-image-to-nchw w/shaders)))

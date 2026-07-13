@@ -405,13 +405,20 @@
          (let [total (* n cout oh ow)
                output (w/-create-buffer-dtype dev total :storage :f16)
                bias (or bias-h (w/-create-buffer-dtype dev cout :storage :f16))
+               spatial (* oh ow)
+               oc4? (and (= 1 (:groups params))
+                         (zero? (mod cout 4)) (zero? (mod spatial 2)))
+               invocations (if oc4? (* n (quot cout 4) (quot spatial 2))
+                               (wb/ceil-div total 2))
                values ((juxt :n :cin :h :width :cout :cin-group :kh :kw
                              :oh :ow :sh :sw :ph :pw :dh :dw :groups)
                        params)]
-           (w/-dispatch dev (wb/get-pipeline dev pipes :conv2d-nchw-f16)
+           (w/-dispatch dev (wb/get-pipeline dev pipes
+                                             (if oc4? :conv2d-nchw-f16-oc4
+                                                 :conv2d-nchw-f16))
                         [input-h weight-h bias output
                          (wb/uni dev (wb/u32-tag (into (vec values) [0 0 0])))]
-                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+                        [(wb/ceil-div invocations 64) 1 1])
            (when-not bias-h (w/-destroy-buffer dev bias))
            output))
        (-group-norm-nchw-dtype [_ input-h weight-h bias-h

@@ -1402,6 +1402,76 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[gid.x] = pack2x16float(vec2<f32>(convolve(base), second));
 }")
 
+(def conv2d-nchw-f16-oc4-wgsl
+  "Packed-f16 groups=1 fast path. One invocation computes four output
+  channels at two adjacent spatial positions, reusing each input load across
+  four FMAs and emitting four naturally aligned packed-f16 words."
+  "
+struct Params {
+  n: u32, cin: u32, h: u32, w: u32,
+  cout: u32, cin_group: u32, kh: u32, kw: u32,
+  oh: u32, ow: u32, sh: u32, sw: u32,
+  ph: u32, pw: u32, dh: u32, dw: u32,
+  groups: u32, pad0: u32, pad1: u32, pad2: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> bias: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn load_input_oc4(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_weight_oc4(index: u32) -> f32 {
+  let pair = unpack2x16float(weight[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_bias_oc4(index: u32) -> f32 {
+  let pair = unpack2x16float(bias[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn convolve4(batch: u32, oc: u32, position: u32) -> vec4<f32> {
+  let oi = position / p.ow; let oj = position % p.ow;
+  let kernel_size = p.cin * p.kh * p.kw;
+  var sum = vec4<f32>(load_bias_oc4(oc), load_bias_oc4(oc + 1u),
+                      load_bias_oc4(oc + 2u), load_bias_oc4(oc + 3u));
+  for (var ic = 0u; ic < p.cin; ic = ic + 1u) {
+    for (var ki = 0u; ki < p.kh; ki = ki + 1u) {
+      let ih = i32(oi * p.sh + ki * p.dh) - i32(p.ph);
+      if (ih < 0 || ih >= i32(p.h)) { continue; }
+      for (var kj = 0u; kj < p.kw; kj = kj + 1u) {
+        let iw = i32(oj * p.sw + kj * p.dw) - i32(p.pw);
+        if (iw < 0 || iw >= i32(p.w)) { continue; }
+        let kernel_index = (ic * p.kh + ki) * p.kw + kj;
+        let xi = ((batch * p.cin + ic) * p.h + u32(ih)) * p.w + u32(iw);
+        let x = load_input_oc4(xi);
+        let weights = vec4<f32>(load_weight_oc4(oc * kernel_size + kernel_index),
+          load_weight_oc4((oc + 1u) * kernel_size + kernel_index),
+          load_weight_oc4((oc + 2u) * kernel_size + kernel_index),
+          load_weight_oc4((oc + 3u) * kernel_size + kernel_index));
+        sum = sum + vec4<f32>(x) * weights;
+      }
+    }
+  }
+  return sum;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let spatial = p.oh * p.ow; let pairs = spatial / 2u; let cout4 = p.cout / 4u;
+  let total = p.n * cout4 * pairs; let index = gid.x;
+  if (index >= total) { return; }
+  let pair_position = index % pairs; let position = pair_position * 2u;
+  let oc_block = (index / pairs) % cout4; let oc = oc_block * 4u;
+  let batch = index / (pairs * cout4);
+  let first = convolve4(batch, oc, position);
+  let second = convolve4(batch, oc, position + 1u);
+  for (var lane = 0u; lane < 4u; lane = lane + 1u) {
+    let output_index = ((batch * p.cout + oc + lane) * spatial + position) / 2u;
+    output[output_index] = pack2x16float(vec2<f32>(first[lane], second[lane]));
+  }
+}")
+
 (def group-norm-nchw-f16-wgsl
   "Packed-f16 GroupNorm reference kernel with f32 statistics."
   "
@@ -2008,6 +2078,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :ewise1-f16 ewise1-f16-wgsl
    :gemm-f16 gemm-f16-wgsl
    :conv2d-nchw-f16 conv2d-nchw-f16-wgsl
+   :conv2d-nchw-f16-oc4 conv2d-nchw-f16-oc4-wgsl
    :group-norm-nchw-f16 group-norm-nchw-f16-wgsl
    :embedding-f16 embedding-f16-wgsl
    :rms-norm-f16 rms-norm-f16-wgsl
