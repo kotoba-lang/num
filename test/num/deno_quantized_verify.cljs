@@ -19,11 +19,10 @@
                (repeat 128 0x21))))
 
 (def packed-bytes (vec (concat (block 0.5 0.25) (block -0.125 0.5))))
-(def inputs (vec (concat (repeat 256 1.0)
-                         (map #(if (even? %) 0.5 -0.25) (range 256)))))
+(def inputs (mapv #(- (* 0.01 (mod % 17)) 0.08) (range (* 5 256))))
 
 (defn run-q4 [backend]
-  (q/matmul (arr/from-vec backend inputs [2 256])
+  (q/matmul (arr/from-vec backend inputs [5 256])
             (q/matrix backend packed-bytes [2 256] :q4-k)))
 
 (defn q6-block [d]
@@ -34,7 +33,7 @@
 (def q6-bytes (vec (concat (q6-block 0.25) (q6-block -0.125))))
 
 (defn run-q6 [backend]
-  (q/matmul (arr/from-vec backend inputs [2 256])
+  (q/matmul (arr/from-vec backend inputs [5 256])
             (q/matrix backend q6-bytes [2 256] :q6-k)))
 
 (defn q8-block [d]
@@ -43,7 +42,7 @@
 (def q8-bytes (vec (concat (q8-block 0.25) (q8-block -0.5))))
 
 (defn run-q8 [backend]
-  (q/matmul (arr/from-vec backend (repeat 32 1.0) [1 32])
+  (q/matmul (arr/from-vec backend (take (* 5 32) inputs) [5 32])
             (q/matrix backend q8-bytes [2 32] :q8-0)))
 
 (defn run-embedding [backend bytes shape quant-type]

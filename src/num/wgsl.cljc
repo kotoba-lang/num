@@ -1627,22 +1627,38 @@ fn value_at(row: u32, column: u32) -> f32 {
   let quant = select(packed & 15u, packed >> 4u, subblock % 2u == 1u);
   return dm.x * f32(sm.x) * f32(quant) - dm.y * f32(sm.y);
 }
-var<workgroup> partial: array<f32, 64>;
+var<workgroup> partial: array<f32, 256>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid3: vec3<u32>) {
-  let index = wid.x; let lid = lid3.x;
-  let row = index / p.n; let column = index % p.n;
-  var sum: f32 = 0.0;
+  let tile = wid.x / p.n; let column = wid.x % p.n;
+  let row = tile * 4u; let lid = lid3.x;
+  var sums = vec4<f32>(0.0);
   for (var inner: u32 = lid; inner < p.k; inner = inner + 64u) {
-    sum = sum + input[row * p.k + inner] * value_at(column, inner);
+    let weight_value = value_at(column, inner);
+    if (row + 0u < p.m) { sums.x = sums.x + input[(row + 0u) * p.k + inner] * weight_value; }
+    if (row + 1u < p.m) { sums.y = sums.y + input[(row + 1u) * p.k + inner] * weight_value; }
+    if (row + 2u < p.m) { sums.z = sums.z + input[(row + 2u) * p.k + inner] * weight_value; }
+    if (row + 3u < p.m) { sums.w = sums.w + input[(row + 3u) * p.k + inner] * weight_value; }
   }
-  partial[lid] = sum; workgroupBarrier();
+  partial[lid] = sums.x; partial[64u + lid] = sums.y;
+  partial[128u + lid] = sums.z; partial[192u + lid] = sums.w;
+  workgroupBarrier();
   for (var stride: u32 = 32u; stride > 0u; stride = stride / 2u) {
-    if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+    if (lid < stride) {
+      partial[lid] = partial[lid] + partial[lid + stride];
+      partial[64u + lid] = partial[64u + lid] + partial[64u + lid + stride];
+      partial[128u + lid] = partial[128u + lid] + partial[128u + lid + stride];
+      partial[192u + lid] = partial[192u + lid] + partial[192u + lid + stride];
+    }
     workgroupBarrier();
   }
-  if (lid == 0u) { output[index] = partial[0]; }
+  if (lid == 0u) {
+    if (row + 0u < p.m) { output[(row + 0u) * p.n + column] = partial[0]; }
+    if (row + 1u < p.m) { output[(row + 1u) * p.n + column] = partial[64]; }
+    if (row + 2u < p.m) { output[(row + 2u) * p.n + column] = partial[128]; }
+    if (row + 3u < p.m) { output[(row + 3u) * p.n + column] = partial[192]; }
+  }
 }")
 
 (def q6-k-matmul-wgsl
@@ -1675,22 +1691,38 @@ fn value_at(row: u32, column: u32) -> f32 {
   let d = unpack2x16float(d_bits).x;
   return d * f32(scale * quant);
 }
-var<workgroup> partial: array<f32, 64>;
+var<workgroup> partial: array<f32, 256>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid3: vec3<u32>) {
-  let index = wid.x; let lid = lid3.x;
-  let row = index / p.n; let column = index % p.n;
-  var sum: f32 = 0.0;
+  let tile = wid.x / p.n; let column = wid.x % p.n;
+  let row = tile * 4u; let lid = lid3.x;
+  var sums = vec4<f32>(0.0);
   for (var inner: u32 = lid; inner < p.k; inner = inner + 64u) {
-    sum = sum + input[row * p.k + inner] * value_at(column, inner);
+    let weight_value = value_at(column, inner);
+    if (row + 0u < p.m) { sums.x = sums.x + input[(row + 0u) * p.k + inner] * weight_value; }
+    if (row + 1u < p.m) { sums.y = sums.y + input[(row + 1u) * p.k + inner] * weight_value; }
+    if (row + 2u < p.m) { sums.z = sums.z + input[(row + 2u) * p.k + inner] * weight_value; }
+    if (row + 3u < p.m) { sums.w = sums.w + input[(row + 3u) * p.k + inner] * weight_value; }
   }
-  partial[lid] = sum; workgroupBarrier();
+  partial[lid] = sums.x; partial[64u + lid] = sums.y;
+  partial[128u + lid] = sums.z; partial[192u + lid] = sums.w;
+  workgroupBarrier();
   for (var stride: u32 = 32u; stride > 0u; stride = stride / 2u) {
-    if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+    if (lid < stride) {
+      partial[lid] = partial[lid] + partial[lid + stride];
+      partial[64u + lid] = partial[64u + lid] + partial[64u + lid + stride];
+      partial[128u + lid] = partial[128u + lid] + partial[128u + lid + stride];
+      partial[192u + lid] = partial[192u + lid] + partial[192u + lid + stride];
+    }
     workgroupBarrier();
   }
-  if (lid == 0u) { output[index] = partial[0]; }
+  if (lid == 0u) {
+    if (row + 0u < p.m) { output[(row + 0u) * p.n + column] = partial[0]; }
+    if (row + 1u < p.m) { output[(row + 1u) * p.n + column] = partial[64]; }
+    if (row + 2u < p.m) { output[(row + 2u) * p.n + column] = partial[128]; }
+    if (row + 3u < p.m) { output[(row + 3u) * p.n + column] = partial[192]; }
+  }
 }")
 
 (def q8-0-matmul-wgsl
@@ -1713,22 +1745,38 @@ fn value_at(row: u32, column: u32) -> f32 {
   let quant = select(i32(raw), i32(raw) - 256, raw >= 128u);
   return d * f32(quant);
 }
-var<workgroup> partial: array<f32, 64>;
+var<workgroup> partial: array<f32, 256>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid3: vec3<u32>) {
-  let index = wid.x; let lid = lid3.x;
-  let row = index / p.n; let column = index % p.n;
-  var sum: f32 = 0.0;
+  let tile = wid.x / p.n; let column = wid.x % p.n;
+  let row = tile * 4u; let lid = lid3.x;
+  var sums = vec4<f32>(0.0);
   for (var inner: u32 = lid; inner < p.k; inner = inner + 64u) {
-    sum = sum + input[row * p.k + inner] * value_at(column, inner);
+    let weight_value = value_at(column, inner);
+    if (row + 0u < p.m) { sums.x = sums.x + input[(row + 0u) * p.k + inner] * weight_value; }
+    if (row + 1u < p.m) { sums.y = sums.y + input[(row + 1u) * p.k + inner] * weight_value; }
+    if (row + 2u < p.m) { sums.z = sums.z + input[(row + 2u) * p.k + inner] * weight_value; }
+    if (row + 3u < p.m) { sums.w = sums.w + input[(row + 3u) * p.k + inner] * weight_value; }
   }
-  partial[lid] = sum; workgroupBarrier();
+  partial[lid] = sums.x; partial[64u + lid] = sums.y;
+  partial[128u + lid] = sums.z; partial[192u + lid] = sums.w;
+  workgroupBarrier();
   for (var stride: u32 = 32u; stride > 0u; stride = stride / 2u) {
-    if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+    if (lid < stride) {
+      partial[lid] = partial[lid] + partial[lid + stride];
+      partial[64u + lid] = partial[64u + lid] + partial[64u + lid + stride];
+      partial[128u + lid] = partial[128u + lid] + partial[128u + lid + stride];
+      partial[192u + lid] = partial[192u + lid] + partial[192u + lid + stride];
+    }
     workgroupBarrier();
   }
-  if (lid == 0u) { output[index] = partial[0]; }
+  if (lid == 0u) {
+    if (row + 0u < p.m) { output[(row + 0u) * p.n + column] = partial[0]; }
+    if (row + 1u < p.m) { output[(row + 1u) * p.n + column] = partial[64]; }
+    if (row + 2u < p.m) { output[(row + 2u) * p.n + column] = partial[128]; }
+    if (row + 3u < p.m) { output[(row + 3u) * p.n + column] = partial[192]; }
+  }
 }")
 
 (defn- packed-embedding-wgsl [value-function]

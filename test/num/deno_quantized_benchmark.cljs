@@ -8,7 +8,6 @@
 
 (def k 1024)
 (def n 1024)
-(def iterations 5)
 (def scales [1 2 3 4 49 34 19 60])
 (def mins [9 10 11 12 45 30 51 20])
 (def packed-scales [193 130 67 196, 137 74 203 76, 209 226 51 76])
@@ -26,7 +25,8 @@
                    (repeat 32 (- (* 0.005 (nth scales index) quant)
                                  (* 0.0025 (nth mins index))))))
                (range 8))))
-(def input-values (mapv #(- (* 0.001 (mod % 97)) 0.048) (range k)))
+(defn input-values [m]
+  (mapv #(- (* 0.001 (mod % 97)) 0.048) (range (* m k))))
 
 (defn now [] (.now js/performance))
 
@@ -38,12 +38,14 @@
                 (.then (arr/->vec (operation)) (fn [_] (step (dec remaining))))))]
       (step count))))
 
-(defn -main [& _]
-  (-> (dg/request-device)
+(defn -main [& args]
+  (let [m (if (= "prefill" (first args)) 64 1)
+        iterations (if (= m 64) 3 5)]
+   (-> (dg/request-device)
       (.then
        (fn [request]
          (let [gpu (dg/backend request)
-               input (arr/from-vec gpu input-values [1 k])
+               input (arr/from-vec gpu (input-values m) [m k])
                packed (q/matrix gpu packed-bytes [n k] :q4-k)
                ;; All output rows share this deterministic fixture, so transpose
                ;; into the dense `[k,n]` layout by repeating each K value N times.
@@ -57,7 +59,7 @@
                cold (atom {})
                quant-cold-start (now)]
            (println "Quantized benchmark on" (dg/adapter-description request))
-           (println "decode shape:" [1 k] "x" [k n])
+           (println (if (= m 1) "decode shape:" "prefill shape:") [m k] "x" [k n])
            (-> (arr/->vec (quant-op))
                (.then (fn [quant-values]
                         (swap! cold assoc :quant (- (now) quant-cold-start))
@@ -90,6 +92,6 @@
                                                    (.toFixed (/ dense-ms iterations) 3))))))))))))
       (.catch (fn [error]
                 (println "ERROR:" (or (.-stack error) (str error)))
-                (js/Deno.exit 1)))))
+                (js/Deno.exit 1))))))
 
 (set! *main-cli-fn* -main)

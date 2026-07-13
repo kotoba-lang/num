@@ -296,16 +296,21 @@ clojure -M:deno-quantized-verify && \
 #           packed embedding CPU/Metal parity: passed
 ```
 
-Decode-token GEMM uses one 64-lane workgroup per output, splitting the K axis
-and reducing in workgroup memory. The reproducible 1024×1024 Apple M4 benchmark
-forces readback for every iteration (so it measures completion, not submission):
+Quantized GEMM uses a 64-lane K reduction and a four-row M tile, decoding each
+weight once for up to four activation rows. The reproducible 1024×1024 Apple M4
+benchmark forces readback for every iteration (completion, not submission):
 
 ```sh
 clojure -M:deno-quantized-benchmark && \
   deno run --allow-all target/deno-quantized-benchmark.cjs
 # Q4_K 589,824 bytes vs dense f32 4,194,304 bytes (7.11x smaller)
-# cold: Q4_K 25.593 ms, dense 17.936 ms (pipeline compilation included)
-# warm: Q4_K 15.136 ms/op, dense 16.369 ms/op
+# decode cold: Q4_K 26.882 ms, dense 18.468 ms (compilation included)
+# decode warm: Q4_K 14.680 ms/op, dense 16.691 ms/op
+
+deno run --allow-all target/deno-quantized-benchmark.cjs prefill
+# [64,1024] x [1024,1024]
+# prefill cold: Q4_K 30.586 ms, dense 22.168 ms
+# prefill warm: Q4_K 21.949 ms/op, dense 20.355 ms/op
 ```
 
 These numbers are a deterministic kernel fixture, not a whole-model tokens/sec

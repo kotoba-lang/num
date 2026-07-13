@@ -38,6 +38,8 @@
           :let [shader (get w/shaders op)]]
     (is (re-find #"var<workgroup> partial" shader))
     (is (re-find #"inner = inner \+ 64u" shader))
+    (is (re-find #"tile \* 4u" shader))
+    (is (re-find #"var sums = vec4<f32>" shader))
     (is (re-find #"workgroupBarrier" shader))))
 
 (deftest attention-backward-shader-covers-all-three-gradients
