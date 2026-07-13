@@ -861,6 +861,22 @@
                           (nth source (+ (* plane h width) (* y width) x)))))]
           (arr/from-vec backend output out-shape dtype))))))
 
+(defn scale
+  "Return `input * factor` without mutating `input`. f32 tensor backends first
+  copy device-to-device and then dispatch their in-place BLAS scale kernel."
+  [input factor]
+  (let [shape (:shape input)
+        dtype (array-dtype input)]
+    (when (empty? shape)
+      (throw (ex-info "num.tensor/scale requires a non-scalar tensor"
+                      {:shape shape})))
+    (let [copy (slice-axis input 0 0 (first shape))]
+      (if (= :f32 dtype)
+        (nm/scal! (double factor) copy)
+        (arr/from-vec (:backend input)
+                      (mapv #(* (double factor) %) (arr/->vec copy))
+                      shape dtype)))))
+
 (defn group-norm-nchw
   "PyTorch-compatible GroupNorm for `[N C H W]`. Variance is biased
   (`unbiased=false`), as in `torch.nn.GroupNorm`. Optional affine `weight` and

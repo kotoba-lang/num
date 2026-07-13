@@ -123,6 +123,10 @@
         exp-slice (arr/->vec
                    (t/slice-axis (arr/from-vec cpu-b slice-values [2 4 1 2])
                                  1 1 3))
+        exp-scale (arr/->vec
+                   (t/scale (t/slice-axis
+                             (arr/from-vec cpu-b slice-values [2 4 1 2]) 1 1 3)
+                            0.5))
         pad-values (mapv double (range 1 9))
         exp-pad (arr/->vec
                  (t/pad-right-bottom-nchw
@@ -176,6 +180,7 @@
                                  (t/upsample-nearest2d groupnorm-out 2)] 1)
                  slice-out (t/slice-axis
                             (arr/from-vec gpu slice-values [2 4 1 2]) 1 1 3)
+                 scale-out (t/scale slice-out 0.5)
                  pad-out (t/pad-right-bottom-nchw
                           (arr/from-vec gpu pad-values [1 2 2 2]))
                  bias-add-out (t/add (arr/from-vec gpu bias-input-values [2 3])
@@ -242,6 +247,8 @@
                    (fn [g] (contract/approx-vec? g exp-cat))]
                   ["slice-axis" (->p (arr/->vec slice-out))
                    (fn [g] (contract/approx-vec? g exp-slice))]
+                  ["immutable-tensor-scale" (->p (arr/->vec scale-out))
+                   (fn [g] (contract/approx-vec? g exp-scale))]
                   ["pad-right-bottom-nchw" (->p (arr/->vec pad-out))
                    (fn [g] (contract/approx-vec? g exp-pad))]]]
              (-> (js/Promise.all

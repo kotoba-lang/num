@@ -181,6 +181,8 @@ device-to-device slice dispatches. None requires tensor host readback. A complet
 `GroupNorm → SiLU → upsample → skip cat` chain plus slicing and asymmetric
 padding are verified against the CPU oracle on Apple M4 Metal. None of these
 paths downloads intermediate tensors.
+`scale` provides an immutable device-native scalar multiply by combining a
+device-to-device copy with the backend BLAS scale kernel.
 `silu*` and `group-norm-nchw*` provide the
 corresponding training path; GroupNorm propagates input plus affine weight/bias
 gradients and the composed GroupNorm→SiLU chain is checked against central
