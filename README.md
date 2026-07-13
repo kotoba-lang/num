@@ -131,9 +131,12 @@ batching, multiple input/output channels, bias, scalar or pair
 twin `num.autograd/conv2d-nchw*` propagates gradients to input, weight, and
 bias under the same options; grouped padding+stride gradients are checked
 element-by-element against central finite differences. This removes the
-single-image/single-channel convolution fence for real UNet graphs. It remains
-host-materialized, like the other general N-D operations described below;
-device-native NCHW convolution is still required for production throughput.
+single-image/single-channel convolution fence for real UNet graphs. WGSL
+backends now implement it device-native through the optional `ITensorBackend`
+protocol; the same kernel covers batches, bias, groups/depthwise, stride,
+padding, and dilation. A 2×4×16×16 grouped fixture plus a depthwise+dilated
+fixture pass against the CPU oracle on Apple M4 Metal. Other backends retain
+the portable host implementation.
 
 The same NCHW layer also includes the other structural UNet primitives:
 `silu`, PyTorch-compatible biased-variance `group-norm-nchw`, `cat` for skip
@@ -222,8 +225,8 @@ clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
 This cross-checks the live GPU backend against `num.cpu`'s reference oracle (dispatched
 through `num.core`/`num.array`, i.e. through `IBackend`, the same seam any real caller
 uses) — **verified passing on real Apple M4 Metal hardware while building this**:
-`Deno WgslBackendAsync ≡ CPU oracle: 18 passed, 0 failed` (BLAS, reductions,
-sparse matvec, and unary exp/relu/neg/SiLU).
+`Deno WgslBackendAsync ≡ CPU oracle: 20 passed, 0 failed` (BLAS, reductions,
+sparse matvec, unary exp/relu/neg/SiLU, and full NCHW/depthwise convolution).
 
 ## Status
 
@@ -254,13 +257,14 @@ types, the full op contract) compiles to JS via ClojureScript and runs green on 
 **Apple M4/M1 Metal** three separate ways now: the standalone harness
 (`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
 (`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
-`num.core` Clojure code (`deno-gpu-verify`, 18/18 against the CPU oracle). So num-clj
+`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 20/20 against the CPU
+oracle). So num-clj
 genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
 longer only exercised by a script outside the Clojure dispatch seam.
 
 **Honest gap:** most `num.tensor` N-D ops (broadcast/transpose/axis-reduce/batched-matmul,
 ADR-2607051400 §Phase 1) do not yet dispatch through `num.deno-gpu` or any GPU backend —
 they are host-materialized (round-trip through `arr/->vec`/`arr/from-vec`) regardless of
-which `IBackend` is injected. Metadata-only reshape/squeeze/unsqueeze and the new SiLU
-kernel are exceptions. Extending the WGSL kernel set to N-D broadcast/batched-
+which `IBackend` is injected. Metadata-only reshape/squeeze/unsqueeze, SiLU, and
+NCHW convolution are exceptions. Extending the WGSL kernel set to N-D broadcast/batched-
 matmul dispatch is unimplemented net-new shader work, not attempted in this pass.

@@ -224,6 +224,52 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   y[i] = s;
 }")
 
+(def conv2d-nchw-wgsl
+  "Direct NCHW convolution/cross-correlation. One invocation computes one
+  output element; supports bias, groups/depthwise, stride, padding, dilation."
+  "
+struct Params {
+  n: u32, cin: u32, h: u32, w: u32,
+  cout: u32, cin_group: u32, kh: u32, kw: u32,
+  oh: u32, ow: u32, sh: u32, sw: u32,
+  ph: u32, pw: u32, dh: u32, dw: u32,
+  groups: u32, pad0: u32, pad1: u32, pad2: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  let total = p.n * p.cout * p.oh * p.ow;
+  if (index >= total) { return; }
+  let oj = index % p.ow;
+  let oi = (index / p.ow) % p.oh;
+  let oc = (index / (p.ow * p.oh)) % p.cout;
+  let batch = index / (p.ow * p.oh * p.cout);
+  let outputs_per_group = p.cout / p.groups;
+  let group = oc / outputs_per_group;
+  let input_channel_base = group * p.cin_group;
+  var sum = bias[oc];
+  for (var icg: u32 = 0u; icg < p.cin_group; icg = icg + 1u) {
+    let ic = input_channel_base + icg;
+    for (var ki: u32 = 0u; ki < p.kh; ki = ki + 1u) {
+      let ih = i32(oi * p.sh + ki * p.dh) - i32(p.ph);
+      if (ih < 0 || ih >= i32(p.h)) { continue; }
+      for (var kj: u32 = 0u; kj < p.kw; kj = kj + 1u) {
+        let iw = i32(oj * p.sw + kj * p.dw) - i32(p.pw);
+        if (iw < 0 || iw >= i32(p.w)) { continue; }
+        let x_index = ((batch * p.cin + ic) * p.h + u32(ih)) * p.w + u32(iw);
+        let w_index = ((oc * p.cin_group + icg) * p.kh + ki) * p.kw + kj;
+        sum = sum + input[x_index] * weight[w_index];
+      }
+    }
+  }
+  output[index] = sum;
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -236,6 +282,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :reduce reduce-wgsl
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl
+   :conv2d-nchw conv2d-nchw-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------

@@ -46,3 +46,10 @@
   "Does `x` satisfy IBackend?"
   [x]
   (satisfies? IBackend x))
+
+(defprotocol ITensorBackend
+  "Optional device-native N-D operations. Backends that do not implement this
+  protocol continue to use num.tensor's portable host oracle."
+  (-conv2d-nchw [b input-h weight-h bias-h params]
+    "NCHW cross-correlation. `params` contains validated dimensions/options;
+    returns a newly allocated output handle."))

@@ -210,7 +210,20 @@
            (w/-write-buffer dev ci (wb/u32-tag (seq (:col-idx csr))))
            (w/-write-buffer dev v (seq (:vals csr)))
            (w/-dispatch dev (wb/get-pipeline dev pipes :spmv) [rp ci v xh y] [(wb/ceil-div m 64) 1 1])
-           y)))
+           y))
+
+       p/ITensorBackend
+       (-conv2d-nchw [_ input-h weight-h bias-h
+                      {:keys [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw groups]}]
+         (let [total (* n cout oh ow)
+               output (w/-create-buffer dev total :storage)
+               bias (or bias-h (w/-create-buffer dev cout :storage))
+               params [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw
+                       groups 0 0 0]]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :conv2d-nchw)
+                        [input-h weight-h bias output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div total 64) 1 1])
+           output)))
 
      (defn backend
        "Wrap an already-negotiated `r` (`request-device`'s resolved value) as a

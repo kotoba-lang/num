@@ -44,10 +44,10 @@
   see that namespace's docstring). Calling any op below (including the
   `softmax`/`conv2d`/`attention` this phase adds) against a Deno GPU backend
   throws (`[object Promise] is not ISeqable`), confirmed by direct test.
-  So: every op in this namespace is verified real on the CPU oracle backend
-  (below and `test/num/tensor_test.cljc`); NONE of them are directly runnable
-  on Metal the way the raw IBackend ops are (`num.deno-gpu-verify`, 17/17 on
-  real Apple M4).
+  Most generic operations in this namespace still require that synchronous
+  readback. Device-native exceptions now include metadata-only reshapes, SiLU,
+  and full NCHW convolution through `ITensorBackend`; the latter two are
+  directly verified on Apple M4 Metal (`num.deno-gpu-verify`, 20/20).
 
   PARTIALLY CLOSED (same day): `num.tensor-async` (cljs-only) adds async
   twins of exactly `conv2d`/`attention`'s underlying ops (2-D transpose, 2-D
@@ -445,9 +445,9 @@
 
   This closes the shape/semantics boundary needed by real UNets: batching,
   input/output channels, same-padding, downsampling stride, dilation, grouped
-  and depthwise convolution, and bias. Like the general N-D ops in this
-  namespace it is currently host-materialized; a device-native kernel remains
-  a performance task, not a correctness ambiguity."
+  and depthwise convolution, and bias. Backends implementing
+  `num.protocol/ITensorBackend` execute it device-native; other backends use
+  the portable host oracle below."
   ([input weight] (conv2d-nchw input weight nil {}))
   ([input weight bias] (conv2d-nchw input weight bias {}))
   ([input weight bias {:keys [stride padding dilation groups]
@@ -490,48 +490,58 @@
                                   :dilation [dh dw]})))
              oh (inc (quot (- (+ H (* 2 ph)) effective-kh) sh))
              ow (inc (quot (- (+ W (* 2 pw)) effective-kw) sw))
-             xs (double-array (arr/->vec input))
-               ws (double-array (arr/->vec weight))
-               bs (when bias (double-array (arr/->vec bias)))
-               out (double-array (* N Cout oh ow))
-               outputs-per-group (quot Cout groups)]
-           (dotimes [n N]
-             (dotimes [oc Cout]
-               (let [group (quot oc outputs-per-group)
-                     input-channel-base (* group Cin-per-group)]
-                 (dotimes [oi oh]
-                   (dotimes [oj ow]
-                     (let [sum
-                           (loop [icg 0 sum (if bs (aget bs oc) 0.0)]
-                             (if (< icg Cin-per-group)
-                               (let [ic (+ input-channel-base icg)
-                                     sum
-                                     (loop [ki 0 sum sum]
-                                       (if (< ki kh)
-                                         (let [ih (+ (- (* oi sh) ph) (* ki dh))
-                                               sum
-                                               (if (or (neg? ih) (>= ih H))
+             backend (:backend input)
+             params {:n N :cin Cin :h H :width W :cout Cout
+                     :cin-group Cin-per-group :kh kh :kw kw :oh oh :ow ow
+                     :sh sh :sw sw :ph ph :pw pw :dh dh :dw dw :groups groups}]
+         (if (satisfies? p/ITensorBackend backend)
+           (arr/->NDArray backend
+                          (p/-conv2d-nchw backend (:handle input) (:handle weight)
+                                          (when bias (:handle bias)) params)
+                          [N Cout oh ow])
+           (let [xs (double-array (arr/->vec input))
+                 ws (double-array (arr/->vec weight))
+                 bs (when bias (double-array (arr/->vec bias)))
+                 out (double-array (* N Cout oh ow))
+                 outputs-per-group (quot Cout groups)]
+             (dotimes [n N]
+               (dotimes [oc Cout]
+                 (let [group (quot oc outputs-per-group)
+                       input-channel-base (* group Cin-per-group)]
+                   (dotimes [oi oh]
+                     (dotimes [oj ow]
+                       (let [sum
+                             (loop [icg 0 sum (if bs (aget bs oc) 0.0)]
+                               (if (< icg Cin-per-group)
+                                 (let [ic (+ input-channel-base icg)
+                                       sum
+                                       (loop [ki 0 sum sum]
+                                         (if (< ki kh)
+                                           (let [ih (+ (- (* oi sh) ph) (* ki dh))
                                                  sum
-                                                 (loop [kj 0 sum sum]
-                                                   (if (< kj kw)
-                                                     (let [iw (+ (- (* oj sw) pw) (* kj dw))]
-                                                       (recur (inc kj)
-                                                              (if (or (neg? iw) (>= iw W))
-                                                                sum
-                                                                (+ sum
-                                                                   (* (aget xs (+ (* n Cin H W)
-                                                                                  (* ic H W)
-                                                                                  (* ih W) iw))
-                                                                      (aget ws (+ (* oc Cin-per-group kh kw)
-                                                                                  (* icg kh kw)
-                                                                                  (* ki kw) kj)))))))
-                                                     sum)))]
-                                           (recur (inc ki) sum))
-                                         sum))]
-                                 (recur (inc icg) sum))
-                               sum))]
-                       (aset out (+ (* n Cout oh ow) (* oc oh ow) (* oi ow) oj) sum)))))))
-         (arr/from-vec (:backend input) (vec out) [N Cout oh ow]))))))
+                                                 (if (or (neg? ih) (>= ih H))
+                                                   sum
+                                                   (loop [kj 0 sum sum]
+                                                     (if (< kj kw)
+                                                       (let [iw (+ (- (* oj sw) pw) (* kj dw))]
+                                                         (recur (inc kj)
+                                                                (if (or (neg? iw) (>= iw W))
+                                                                  sum
+                                                                  (+ sum
+                                                                     (* (aget xs (+ (* n Cin H W)
+                                                                                    (* ic H W)
+                                                                                    (* ih W) iw))
+                                                                        (aget ws (+ (* oc Cin-per-group kh kw)
+                                                                                    (* icg kh kw)
+                                                                                    (* ki kw) kj)))))))
+                                                       sum)))]
+                                             (recur (inc ki) sum))
+                                           sum))]
+                                   (recur (inc icg) sum))
+                                 sum))]
+                         (aset out (+ (* n Cout oh ow) (* oc oh ow) (* oi ow) oj)
+                               sum)))))))
+             (arr/from-vec backend (vec out) [N Cout oh ow]))))))))
 
 ;; --- UNet tensor building blocks -----------------------------------------------
 

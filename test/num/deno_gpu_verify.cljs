@@ -21,6 +21,7 @@
   (:require [num.array :as arr]
             [num.core :as nm]
             [num.sparse :as sp]
+            [num.tensor :as t]
             [num.cpu :as cpu]
             [num.contract :as contract]
             [num.deno-gpu :as dg]))
@@ -58,7 +59,24 @@
         exp-matmul (arr/->vec (nm/matmul A B))
         csr (sp/dense->csr 2 3 [1 0 2 0 3 0])
         xs (arr/from-vec cpu-b [1 1 1] [3])
-        exp-spmv (arr/->vec (nm/spmv cpu-b csr xs))]
+        exp-spmv (arr/->vec (nm/spmv cpu-b csr xs))
+        conv-input-values (mapv #(- (* 0.07 %) 0.4) (range (* 2 4 16 16)))
+        conv-weight-values (mapv #(- (* 0.013 (mod % 19)) 0.1)
+                                 (range (* 8 2 3 3)))
+        conv-bias-values (mapv #(- (* 0.02 %) 0.05) (range 8))
+        conv-opts {:padding 1 :stride 2 :groups 2}
+        exp-conv (arr/->vec
+                  (t/conv2d-nchw
+                   (arr/from-vec cpu-b conv-input-values [2 4 16 16])
+                   (arr/from-vec cpu-b conv-weight-values [8 2 3 3])
+                   (arr/from-vec cpu-b conv-bias-values [8]) conv-opts))
+        depth-input-values (mapv #(* 0.1 (inc %)) (range 32))
+        depth-weight-values [0.2 -0.1 0.3 0.4 -0.2 0.5 0.1 -0.3]
+        exp-depthwise (arr/->vec
+                       (t/conv2d-nchw
+                        (arr/from-vec cpu-b depth-input-values [1 2 4 4])
+                        (arr/from-vec cpu-b depth-weight-values [2 1 2 2]) nil
+                        {:dilation 2 :groups 2}))]
     (-> (dg/request-device)
         (.then
          (fn [r]
@@ -76,6 +94,14 @@
                  Bg (arr/from-vec gpu [5 6 7 8] [2 2])
                  xsg (arr/from-vec gpu [1 1 1] [3])
                  cg (arr/from-vec gpu [0 1 -2 3] [4])
+                 conv-out (t/conv2d-nchw
+                           (arr/from-vec gpu conv-input-values [2 4 16 16])
+                           (arr/from-vec gpu conv-weight-values [8 2 3 3])
+                           (arr/from-vec gpu conv-bias-values [8]) conv-opts)
+                 depthwise-out (t/conv2d-nchw
+                                (arr/from-vec gpu depth-input-values [1 2 4 4])
+                                (arr/from-vec gpu depth-weight-values [2 1 2 2]) nil
+                                {:dilation 2 :groups 2})
                  checks
                  [["dot"    (->p (nm/dot xg yg))                              (fn [g] (contract/approx? g exp-dot))]
                   ["nrm2"   (->p (nm/nrm2 (arr/from-vec gpu [3 4] [2])))      (fn [g] (contract/approx? g exp-nrm2))]
@@ -95,7 +121,9 @@
                   ["exp"    (->p (arr/->vec (nm/exp cg)))                     (fn [g] (contract/approx-vec? g exp-exp))]
                   ["relu"   (->p (arr/->vec (nm/relu cg)))                    (fn [g] (contract/approx-vec? g exp-relu))]
                   ["neg"    (->p (arr/->vec (nm/neg cg)))                     (fn [g] (contract/approx-vec? g exp-neg))]
-                  ["silu"   (->p (arr/->vec (nm/silu cg)))                    (fn [g] (contract/approx-vec? g exp-silu))]]]
+                  ["silu"   (->p (arr/->vec (nm/silu cg)))                    (fn [g] (contract/approx-vec? g exp-silu))]
+                  ["conv2d-nchw" (->p (arr/->vec conv-out))                    (fn [g] (contract/approx-vec? g exp-conv))]
+                  ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]]]
              (-> (js/Promise.all
                   (into-array
                    (map (fn [[label prom okfn]]

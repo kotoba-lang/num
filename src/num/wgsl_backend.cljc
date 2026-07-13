@@ -122,7 +122,20 @@
       (w/-write-buffer dev ci (u32-tag (seq (:col-idx csr))))
       (w/-write-buffer dev v (seq (:vals csr)))
       (w/-dispatch dev (get-pipeline dev pipes :spmv) [rp ci v xh y] [(ceil-div m 64) 1 1])
-      y)))
+      y))
+
+  p/ITensorBackend
+  (-conv2d-nchw [_ input-h weight-h bias-h
+                 {:keys [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw groups]}]
+    (let [total (* n cout oh ow)
+          output (w/-create-buffer dev total :storage)
+          bias (or bias-h (w/-create-buffer dev cout :storage))
+          params [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw
+                  groups 0 0 0]]
+      (w/-dispatch dev (get-pipeline dev pipes :conv2d-nchw)
+                   [input-h weight-h bias output (uni dev (u32-tag params))]
+                   [(ceil-div total 64) 1 1])
+      output)))
 
 (defn wgsl-backend
   "Construct a WgslBackend over an injected `IGpuDevice` (native, blocking
