@@ -1224,23 +1224,31 @@
 (defn multi-head-attention
   "Multi-head scaled dot-product attention for `[seq,d]` or `[batch,seq,d]`.
 
-  Q is `[B,seqQ,d_model]`; K/V are `[B,seqK,d_model]` with rank-2 forms
+  Q is `[B,seqQ,d_model]`; K/V are `[B,seqK,kv_model]` with rank-2 forms
   treated as B=1 and returned rank-2 for compatibility. Options:
+  `:kv-heads` enables grouped-query attention (defaults to `num-heads`), where
+  `kv_model = kv_heads * (d_model / num_heads)` and each KV head is shared by
+  `num_heads / kv_heads` adjacent query heads.
   `:causal?` prevents query row q from attending to keys k>q, and
   `:key-padding-mask` is `[B,seqK]` (or `[seqK]` for rank-2 input), where a
   non-zero value marks a key to ignore, matching PyTorch boolean-mask meaning."
   ([Q K V num-heads] (multi-head-attention Q K V num-heads {}))
-  ([Q K V num-heads {:keys [causal? key-padding-mask]
+  ([Q K V num-heads {:keys [causal? key-padding-mask kv-heads]
                       :or {causal? false}}]
    (let [q-shape (:shape Q) k-shape (:shape K) v-shape (:shape V)
          rank (count q-shape) h (long num-heads)
          [batch seq-q d-model] (if (= rank 2) (into [1] q-shape) q-shape)
          [k-batch seq-k k-model] (if (= rank 2) (into [1] k-shape) k-shape)
+         kv-heads (long (or kv-heads h))
+         d-head (when (and (pos? h) (zero? (mod (long d-model) h)))
+                  (quot (long d-model) h))
+         expected-k-model (when d-head (* kv-heads d-head))
          expected-mask-shape (if (= rank 2) [seq-k] [batch seq-k])
          mask-shape (:shape key-padding-mask)]
      (when-not (and (#{2 3} rank) (= rank (count k-shape) (count v-shape))
                     (= k-shape v-shape) (= batch k-batch)
-                    (= d-model k-model) (pos? h)
+                    (= k-model expected-k-model) (pos? h) (pos? kv-heads)
+                    (zero? (mod h kv-heads))
                     (zero? (mod (long d-model) h))
                     (or (nil? key-padding-mask)
                         (= mask-shape expected-mask-shape)
@@ -1248,12 +1256,13 @@
        (throw (ex-info "num.tensor/multi-head-attention: incompatible batch, model, heads, or mask"
                        {:query q-shape :key k-shape :value v-shape
                         :key-padding-mask mask-shape :expected-mask expected-mask-shape
-                        :num-heads h})))
-     (let [backend (:backend Q) d-head (quot (long d-model) h)
+                        :num-heads h :kv-heads kv-heads})))
+     (let [backend (:backend Q)
            mask-backend (when key-padding-mask (:backend key-padding-mask))
            output-shape (if (= rank 2) [seq-q d-model] [batch seq-q d-model])
            params {:batch batch :seq-q seq-q :seq-k seq-k :d-model d-model
-                   :heads h :head-dim d-head :causal? causal?
+                   :kv-d-model k-model :heads h :kv-heads kv-heads
+                   :head-dim d-head :causal? causal?
                    :has-key-padding-mask? (boolean key-padding-mask)
                    :total (* batch seq-q d-model)}]
        (if (and (= backend (:backend K) (:backend V))
@@ -1267,7 +1276,8 @@
                   backend (:handle Q) (:handle K) (:handle V)
                   (when key-padding-mask (:handle key-padding-mask)) params)
                  output-shape) :dtype :f32)
-         (let [q3 (if (= rank 2) (reshape Q [1 seq-q d-model]) Q)
+         (if (= h kv-heads)
+           (let [q3 (if (= rank 2) (reshape Q [1 seq-q d-model]) Q)
                k3 (if (= rank 2) (reshape K [1 seq-k d-model]) K)
                v3 (if (= rank 2) (reshape V [1 seq-k d-model]) V)
                split-heads (fn [x seq-len]
@@ -1284,4 +1294,55 @@
                heads-out (matmul weights vh)
                merged (reshape (transpose heads-out [0 2 1 3])
                                [batch seq-q d-model])]
-           (if (= rank 2) (reshape merged output-shape) merged)))))))
+             (if (= rank 2) (reshape merged output-shape) merged))
+           ;; The generic tensor composition has no strided head-repeat view.
+           ;; Materialize only this non-ITensorBackend fallback; Metal uses the
+           ;; fused device kernel above.
+           (let [qs (vec (arr/->vec Q)) ks (vec (arr/->vec K))
+                 vs (vec (arr/->vec V))
+                 padding (when key-padding-mask
+                           (vec (arr/->vec key-padding-mask)))
+                 group-size (quot h kv-heads)
+                 scale (/ 1.0 (Math/sqrt d-head))
+                 out (double-array (* batch seq-q d-model))]
+             (dotimes [b batch]
+               (dotimes [q seq-q]
+                 (dotimes [head h]
+                   (let [kv-head (quot head group-size)
+                         qb (+ (* (+ (* b seq-q) q) d-model) (* head d-head))
+                         scores (double-array seq-k)]
+                     (dotimes [k seq-k]
+                       (let [masked? (or (and causal? (> k q))
+                                         (and padding
+                                              (not (zero? (nth padding (+ (* b seq-k) k))))))
+                             kb (+ (* (+ (* b seq-k) k) k-model)
+                                   (* kv-head d-head))]
+                         (aset scores k
+                               (if masked? ##-Inf
+                                   (* scale
+                                      (loop [d 0 sum 0.0]
+                                        (if (< d d-head)
+                                          (recur (inc d)
+                                                 (+ sum (* (nth qs (+ qb d))
+                                                           (nth ks (+ kb d)))))
+                                          sum)))))))
+                     (let [maximum (reduce max ##-Inf (vec scores))
+                           denominator (reduce + 0.0
+                                               (map #(if (= ##-Inf %) 0.0
+                                                       (Math/exp (- % maximum)))
+                                                    (vec scores)))]
+                       (dotimes [d d-head]
+                         (aset out (+ qb d)
+                               (if (zero? denominator) 0.0
+                                   (loop [k 0 sum 0.0]
+                                     (if (< k seq-k)
+                                       (let [score (aget scores k)
+                                             weight (if (= ##-Inf score) 0.0
+                                                        (/ (Math/exp (- score maximum))
+                                                           denominator))
+                                             vb (+ (* (+ (* b seq-k) k) k-model)
+                                                   (* kv-head d-head))]
+                                         (recur (inc k)
+                                                (+ sum (* weight (nth vs (+ vb d))))))
+                                       sum))))))))))
+             (arr/from-vec backend (vec out) output-shape (array-dtype Q)))))))))

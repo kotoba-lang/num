@@ -261,6 +261,36 @@
             (str "analytic=" (arr/->vec analytic)
                  " numeric=" (arr/->vec numeric)))))))
 
+(deftest grouped-query-attention-gradients-match-finite-differences
+  (let [qd (arr/from-vec backend [0.2 -0.1 0.3 0.4,
+                                  -0.2 0.1 0.5 -0.3] [2 4])
+        kd (arr/from-vec backend [0.3 -0.4, 0.2 0.6] [2 2])
+        vd (arr/from-vec backend [0.7 -0.2, -0.1 0.5] [2 2])
+        target (arr/from-vec backend (repeat 8 0.0) [2 4])
+        opts {:kv-heads 1}
+        loss-of (fn [q k v]
+                  (let [[loss _]
+                        (ag/with-tape
+                          (ag/mse-loss*
+                           (ag/multi-head-attention* (ag/value q) (ag/value k)
+                                                     (ag/value v) 2 opts)
+                           target))]
+                    (arr/->scalar (:data loss))))
+        [result tape]
+        (ag/with-tape
+          (let [q (ag/value qd) k (ag/value kd) v (ag/value vd)
+                prediction (ag/multi-head-attention* q k v 2 opts)
+                loss (ag/mse-loss* prediction target)]
+            {:q q :k k :v v :loss loss}))]
+    (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+    (doseq [[label value numeric]
+            [[:query (:q result) (numerical-grad #(loss-of % kd vd) qd 1.0e-5)]
+             [:key (:k result) (numerical-grad #(loss-of qd % vd) kd 1.0e-5)]
+             [:value (:v result) (numerical-grad #(loss-of qd kd %) vd 1.0e-5)]]]
+      (is (approx-vec-tol? (arr/->vec @(:grad value)) (arr/->vec numeric) 2.0e-4)
+          (str label " analytic=" (arr/->vec @(:grad value))
+               " numeric=" (arr/->vec numeric))))))
+
 (deftest batched-masked-attention-gradient-matches-finite-differences
   (let [xd (arr/from-vec backend
                          [0.2 -0.1, 0.3 0.4,

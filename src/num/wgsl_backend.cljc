@@ -295,24 +295,25 @@
                    [(ceil-div count 64) 1 1])
       {:gradient output :found-inf found-inf}))
   (-multi-head-attention [_ query-h key-h value-h key-padding-mask-h
-                          {:keys [batch seq-q seq-k d-model heads head-dim total
+                          {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim total
                                   causal? has-key-padding-mask?]}]
     (let [output (w/-create-buffer dev total :storage)
           mask (or key-padding-mask-h
                    (w/-create-buffer dev (* batch seq-k) :storage))]
       (w/-dispatch dev (get-pipeline dev pipes :multi-head-attention)
                    [query-h key-h value-h mask output
-                    (uni dev (u32-tag [batch seq-q seq-k d-model heads
-                                       head-dim total (if causal? 1 0)
-                                       (if has-key-padding-mask? 1 0) 0 0 0]))]
+                    (uni dev (u32-tag [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total
+                                       (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0]))]
                    [(ceil-div total 64) 1 1])
       output))
   (-multi-head-attention-backward [_ query-h key-h value-h key-padding-mask-h
                                    grad-output-h
-                                   {:keys [batch seq-q seq-k d-model heads head-dim
+                                   {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim
                                            causal? has-key-padding-mask?]}]
     (let [total-q (* batch seq-q d-model)
-          total-k (* batch seq-k d-model)
+          total-k (* batch seq-k kv-d-model)
           total (max total-q total-k)
           mask (or key-padding-mask-h
                    (w/-create-buffer dev (* batch seq-k) :storage))
@@ -322,9 +323,10 @@
       (w/-dispatch dev (get-pipeline dev pipes :multi-head-attention-backward)
                    [query-h key-h value-h mask grad-output-h
                     grad-query grad-key grad-value
-                    (uni dev (u32-tag [batch seq-q seq-k d-model heads head-dim
-                                       total-q total-k total (if causal? 1 0)
-                                       (if has-key-padding-mask? 1 0) 0]))]
+                    (uni dev (u32-tag [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total-q total-k total
+                                       (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0 0 0]))]
                    [(ceil-div total 64) 1 1])
       {:query grad-query :key grad-key :value grad-value})))
 

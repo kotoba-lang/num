@@ -369,11 +369,13 @@
              (range (* batch seq-q seq-k)))
        [batch 1 seq-q seq-k]))))
 
+(declare cat* slice-axis*)
+
 (defn multi-head-attention*
   "Differentiable rank-2/rank-3 multi-head attention, including causal and
   key-padding masks. Options match `num.tensor/multi-head-attention`."
   ([Q K V num-heads] (multi-head-attention* Q K V num-heads {}))
-  ([Q K V num-heads {:keys [causal? key-padding-mask] :as opts
+  ([Q K V num-heads {:keys [causal? key-padding-mask kv-heads] :as opts
                       :or {causal? false}}]
    (let [q-data (:data Q) k-data (:data K) v-data (:data V)
          q-shape (:shape q-data) k-shape (:shape k-data)
@@ -381,10 +383,15 @@
          [batch seq-q d-model] (if (= rank 2) (into [1] q-shape) q-shape)
          [k-batch seq-k k-d-model] (if (= rank 2) (into [1] k-shape) k-shape)
          expected-mask (if (= rank 2) [seq-k] [batch seq-k])
-         heads (long num-heads)]
+         heads (long num-heads)
+         kv-heads (long (or kv-heads heads))
+         d-head (when (and (pos? heads) (zero? (mod (long d-model) heads)))
+                  (quot (long d-model) heads))
+         expected-k-model (when d-head (* kv-heads d-head))]
      (when-not (and (#{2 3} rank) (= rank (count k-shape) (count v-shape))
                     (= k-shape v-shape) (= batch k-batch)
-                    (= d-model k-d-model) (pos? heads)
+                    (= k-d-model expected-k-model) (pos? heads) (pos? kv-heads)
+                    (zero? (mod heads kv-heads))
                     (zero? (mod (long d-model) heads))
                     (or (nil? key-padding-mask)
                         (= (:shape key-padding-mask) expected-mask)
@@ -393,9 +400,8 @@
        (throw (ex-info "num.autograd/multi-head-attention*: incompatible dimensions or mask"
                        {:query q-shape :key k-shape :value v-shape
                         :key-padding-mask (:shape key-padding-mask)
-                        :num-heads heads})))
-     (let [d-head (quot (long d-model) heads)
-           backend (:backend q-data)
+                        :num-heads heads :kv-heads kv-heads})))
+     (let [backend (:backend q-data)
            output-shape (if (= rank 2) [seq-q d-model] [batch seq-q d-model])
            fused? (and (= backend (:backend k-data) (:backend v-data))
                        (or (nil? key-padding-mask)
@@ -410,7 +416,8 @@
           (fn [self]
             (when-let [g @(:grad self)]
               (let [params {:batch batch :seq-q seq-q :seq-k seq-k
-                            :d-model d-model :heads heads :head-dim d-head
+                            :d-model d-model :kv-d-model k-d-model
+                            :heads heads :kv-heads kv-heads :head-dim d-head
                             :causal? causal?
                             :has-key-padding-mask? (boolean key-padding-mask)}
                     gradients (p/-multi-head-attention-backward
@@ -425,14 +432,22 @@
                 (accumulate! K (ndarray (:key gradients) k-shape))
                 (accumulate! V (ndarray (:value gradients) (:shape v-data)))))))
          (let [q3 (if (= rank 2) (reshape* Q [1 seq-q d-model]) Q)
-               k3 (if (= rank 2) (reshape* K [1 seq-k d-model]) K)
-               v3 (if (= rank 2) (reshape* V [1 seq-k d-model]) V)
-               split-heads (fn [x seq-len]
-                             (transpose* (reshape* x [batch seq-len heads d-head])
+               k3 (if (= rank 2) (reshape* K [1 seq-k k-d-model]) K)
+               v3 (if (= rank 2) (reshape* V [1 seq-k k-d-model]) V)
+               split-query (fn [x]
+                             (transpose* (reshape* x [batch seq-q heads d-head])
                                          [0 2 1 3]))
-               qh (split-heads q3 seq-q)
-               kh (split-heads k3 seq-k)
-               vh (split-heads v3 seq-k)
+               repeat-kv (fn [x]
+                           (let [split (reshape* x [batch seq-k kv-heads d-head])
+                                 group-size (quot heads kv-heads)
+                                 pieces (mapcat (fn [head]
+                                                  (repeat group-size
+                                                          (slice-axis* split 2 head (inc head))))
+                                                (range kv-heads))]
+                             (transpose* (cat* pieces 2) [0 2 1 3])))
+               qh (split-query q3)
+               kh (repeat-kv k3)
+               vh (repeat-kv v3)
                scores (scale* (/ 1.0 (Math/sqrt d-head))
                               (matmul* qh (transpose* kh [0 1 3 2])))
                mask (attention-mask-nd backend batch seq-q seq-k
@@ -744,6 +759,33 @@
                                    (arr/from-vec (:backend (:data value))
                                                  (vec sliced) shape))
                       (recur (inc value-index) (+ axis-offset axis-size)))))))))))
+
+(defn slice-axis*
+  "Differentiable contiguous slice along one axis. Backward scatters the
+  upstream slice into a zero gradient with the input shape."
+  [value axis start end]
+  (let [input (:data value) shape (:shape input) rank (count shape)
+        axis (long (if (neg? axis) (+ rank axis) axis))
+        start (long start) end (long end)
+        inner (long (arr/nelems (subvec shape (inc axis))))
+        input-axis (long (nth shape axis))
+        output-axis (- end start)
+        outer (long (arr/nelems (subvec shape 0 axis)))]
+    (node (t/slice-axis input axis start end) [value]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [source (vec (arr/->vec g))
+                    scattered (double-array (arr/nelems shape))]
+                (dotimes [outer-index outer]
+                  (let [source-base (* outer-index output-axis inner)
+                        destination-base (+ (* outer-index input-axis inner)
+                                            (* start inner))]
+                    (dotimes [i (* output-axis inner)]
+                      (aset scattered (+ destination-base i)
+                            (nth source (+ source-base i))))))
+                (accumulate! value
+                             (arr/from-vec (:backend input) (vec scattered)
+                                           shape (:dtype input :f32)))))))))
 
 (defn upsample-nearest2d*
   "Differentiable nearest-neighbor NCHW upsampling. Backward sums every

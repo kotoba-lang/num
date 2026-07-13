@@ -535,6 +535,19 @@
     (is (#?(:clj Double/isInfinite :cljs (complement js/isFinite))
          (double (second (arr/->vec (:gradient overflow))))))))
 
+(deftest grouped-query-attention-matches-explicit-kv-head-repeat
+  (let [q (arr/from-vec backend [0.2 -0.1 0.4 0.3
+                                 -0.3 0.5 0.1 -0.2] [2 4])
+        k (arr/from-vec backend [0.6 -0.4, 0.2 0.7] [2 2])
+        v (arr/from-vec backend [1.0 2.0, 3.0 -1.0] [2 2])
+        repeated-k (arr/from-vec backend [0.6 -0.4 0.6 -0.4
+                                          0.2 0.7 0.2 0.7] [2 4])
+        repeated-v (arr/from-vec backend [1.0 2.0 1.0 2.0
+                                          3.0 -1.0 3.0 -1.0] [2 4])]
+    (is (contract/approx-vec?
+         (arr/->vec (t/multi-head-attention q k v 2 {:kv-heads 1}))
+         (arr/->vec (t/multi-head-attention q repeated-k repeated-v 2))))))
+
 (deftest batched-causal-padding-multi-head-attention
   (let [query (arr/from-vec backend (repeat 12 0.0) [2 3 2])
         key (arr/from-vec backend (repeat 12 0.0) [2 3 2])
