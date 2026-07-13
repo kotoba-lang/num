@@ -41,3 +41,9 @@
   (is (string? w/q4-k-gemv-wgsl))
   (is (re-find #"unpack2x16float" w/q4-k-gemv-wgsl))
   (is (re-find #"group_min" w/q4-k-gemv-wgsl)))
+
+(deftest q5-gemv-shaders-restore-fifth-bit
+  (is (re-find #"high_bit" w/q5-0-gemv-wgsl))
+  (is (re-find #"- 16.0" w/q5-0-gemv-wgsl))
+  (is (re-find #"high_bit" w/q5-1-gemv-wgsl))
+  (is (re-find #"dm.y" w/q5-1-gemv-wgsl)))

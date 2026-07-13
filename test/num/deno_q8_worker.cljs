@@ -51,8 +51,10 @@
 (defn- upload-raw! [device pipeline block-size block-elements command]
   (let [id (aget command "id") rows (aget command "rows") cols (aget command "cols")
         blocks (/ cols block-elements) source (decode-base64 (aget command "data"))
+        padded (js/Uint8Array. (* 4 (Math/ceil (/ (.-byteLength source) 4))))
+        _ (.set padded source)
         storage (bit-or (.-STORAGE usage) (.-COPY_DST usage))
-        qbuf (gpu-buffer device (js/Uint32Array. (.-buffer source)) storage)
+        qbuf (gpu-buffer device (js/Uint32Array. (.-buffer padded)) storage)
         sbuf (gpu-buffer device (js/Float32Array. #js [0]) storage)
         params (gpu-buffer device (js/Uint32Array. #js [rows cols blocks 0])
                            (bit-or (.-UNIFORM usage) (.-COPY_DST usage)))]
@@ -156,6 +158,8 @@
         q8-pipeline (pipeline wgsl/q8-0-gemv-wgsl)
         q4-pipeline (pipeline wgsl/q4-0-gemv-wgsl)
         q4k-pipeline (pipeline wgsl/q4-k-gemv-wgsl)
+        q5-pipeline (pipeline wgsl/q5-0-gemv-wgsl)
+        q5-1-pipeline (pipeline wgsl/q5-1-gemv-wgsl)
         lines (.createInterface readline #js {:input (.-stdin js/process)})]
     (.on lines "line"
          (fn [line]
@@ -165,6 +169,8 @@
                  "upload-q8" (upload! device q8-pipeline 32 command)
                  "upload-q4" (upload! device q4-pipeline 16 command)
                  "upload-q4k" (upload-raw! device q4k-pipeline 144 256 command)
+                 "upload-q5" (upload-raw! device q5-pipeline 22 32 command)
+                 "upload-q5-1" (upload-raw! device q5-1-pipeline 24 32 command)
                  "gemv" (.catch (gemv! device command)
                                  #(reply {:ok false :error (.-message %)}))
                  "gemv-many" (.catch (gemv-many! device command)
