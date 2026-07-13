@@ -307,12 +307,13 @@
            buffer))
        (-quantized-matmul [_ input-h weight-h
                            {:keys [quant-type m k n blocks-per-row]}]
-         (when-not (#{:q4-k :q6-k :q8-0} quant-type)
+         (when-not (#{:q5-0 :q4-k :q6-k :q8-0} quant-type)
            (throw (ex-info "unsupported WebGPU quantized matmul"
                            {:quant-type quant-type})))
          (let [output (w/-create-buffer dev (* m n) :storage)]
            (w/-dispatch dev (wb/get-pipeline
-                             dev pipes ({:q4-k :q4-k-matmul
+                             dev pipes ({:q5-0 :q5-0-matmul
+                                        :q4-k :q4-k-matmul
                                         :q6-k :q6-k-matmul
                                         :q8-0 :q8-0-matmul} quant-type))
                         [input-h weight-h output
@@ -321,7 +322,8 @@
            output))
        (-quantized-embedding [_ indices-h table-h
                               {:keys [quant-type rows dim count blocks-per-row total]}]
-         (let [pipeline ({:q4-k :q4-k-embedding :q6-k :q6-k-embedding
+         (let [pipeline ({:q5-0 :q5-0-embedding
+                          :q4-k :q4-k-embedding :q6-k :q6-k-embedding
                           :q8-0 :q8-0-embedding} quant-type)]
            (when-not pipeline
              (throw (ex-info "unsupported WebGPU quantized embedding"

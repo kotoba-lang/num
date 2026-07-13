@@ -304,19 +304,20 @@ deno run --allow-all target/deno-q8-verify.cjs
 #           Metal    [73.75999451 95.43997955]
 ```
 
-`num.quantized/matrix` additionally stores complete GGML Q4_K, Q6_K, and Q8_0
-blocks at their original 4.5/6.5625/8.5 bits per weight and exposes them as
+`num.quantized/matrix` additionally stores complete GGML Q5_0, Q4_K, Q6_K, and
+Q8_0 blocks at their original 5.5/4.5/6.5625/8.5 bits per weight and exposes them as
 `[in,out]` matrices. `num.quantized/matmul` decodes their packed fp16
 super-scales, subblock scales/mins, and quant bits inside the compute kernel
 while accumulating f32; it supports multi-row activations and never creates a
 dense weight buffer. `num.quantized/table` performs device-native token lookup
-from the same three formats, and `as-matrix` creates a zero-copy tied output-head
+from the same four formats, and `as-matrix` creates a zero-copy tied output-head
 view over the exact same packed buffer.
 
 ```sh
 clojure -M:deno-quantized-verify && \
   deno run --allow-all target/deno-quantized-verify.cjs
-# Apple M4: Q4_K CPU/Metal parity: passed
+# Apple M4: Q5_0 CPU/Metal parity: passed
+#           Q4_K CPU/Metal parity: passed
 #           Q6_K CPU/Metal parity: passed
 #           Q8_0 CPU/Metal parity: passed
 #           packed embedding CPU/Metal parity: passed

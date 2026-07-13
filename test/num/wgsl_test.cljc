@@ -94,6 +94,8 @@
 (deftest q5-gemv-shaders-restore-fifth-bit
   (is (re-find #"high_bit" w/q5-0-gemv-wgsl))
   (is (re-find #"- 16.0" w/q5-0-gemv-wgsl))
+  (is (re-find #"block_index \* 22u" w/q5-0-matmul-wgsl))
+  (is (re-find #"high << 4u" w/q5-0-embedding-wgsl))
   (is (re-find #"high_bit" w/q5-1-gemv-wgsl))
   (is (re-find #"dm.y" w/q5-1-gemv-wgsl)))
 

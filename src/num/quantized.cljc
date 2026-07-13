@@ -7,7 +7,8 @@
 (defrecord QuantizedTable [backend handle shape quant-type byte-count block-size])
 
 (def ^:private layouts
-  {:q4-k {:block-size 256 :bytes-per-block 144}
+  {:q5-0 {:block-size 32 :bytes-per-block 22}
+   :q4-k {:block-size 256 :bytes-per-block 144}
    :q6-k {:block-size 256 :bytes-per-block 210}
    :q8-0 {:block-size 32 :bytes-per-block 34}})
 

@@ -37,6 +37,27 @@
 (defn- q8-block [d]
   (vec (concat (half-bytes d) (map #(bit-and % 0xff) (range -16 16)))))
 
+(defn- q5-block [d]
+  ;; High bits set at positions 0 and 31; low nibble 0 for the first half and
+  ;; 15 for the second half.
+  (vec (concat (half-bytes d) [1 0 0 128] (repeat 16 0xf0))))
+
+(defn- q5-dense-row [d]
+  (vec (concat [0.0] (repeat 15 (* d -16.0))
+               (repeat 15 (* d -1.0)) [(* d 15.0)])))
+
+(deftest q5-zero-matmul-stays-packed
+  (let [backend (cpu/cpu-backend)
+        bytes (vec (concat (q5-block 0.5) (q5-block -0.25)))
+        weight (q/matrix backend bytes [2 32] :q5-0)
+        input (arr/from-vec backend (repeat 32 1.0) [1 32])]
+    (is (= 44 (:byte-count weight)))
+    (is (= 32 (:block-size weight)))
+    (is (contract/approx-vec?
+         [(reduce + (q5-dense-row 0.5))
+          (reduce + (q5-dense-row -0.25))]
+         (arr/->vec (q/matmul input weight))))))
+
 (deftest q4-k-matmul-matches-dense-oracle-without-expanding-weight
   (let [backend (cpu/cpu-backend)
         bytes (vec (concat (block 0.5 0.25) (block -0.125 0.5)))
@@ -71,7 +92,9 @@
   (let [backend (cpu/cpu-backend)
         indices (arr/from-vec backend [1 0 1] [3])
         fixtures
-        [[:q4-k (vec (concat (block 0.5 0.25) (block -0.125 0.5)))
+        [[:q5-0 (vec (concat (q5-block 0.5) (q5-block -0.25)))
+          [(q5-dense-row 0.5) (q5-dense-row -0.25)]]
+         [:q4-k (vec (concat (block 0.5 0.25) (block -0.125 0.5)))
           [(dense-row 0.5 0.25) (dense-row -0.125 0.5)]]
          [:q6-k (vec (concat (q6-block 0.25) (q6-block -0.125)))
           [(q6-dense-row 0.25) (q6-dense-row -0.125)]]

@@ -45,6 +45,15 @@
   (q/matmul (arr/from-vec backend (take (* 5 32) inputs) [5 32])
             (q/matrix backend q8-bytes [2 32] :q8-0)))
 
+(defn q5-block [d]
+  (vec (concat (half-bytes d) [1 0 0 128] (repeat 16 0xf0))))
+
+(def q5-bytes (vec (concat (q5-block 0.5) (q5-block -0.25))))
+
+(defn run-q5 [backend]
+  (q/matmul (arr/from-vec backend (take (* 5 32) inputs) [5 32])
+            (q/matrix backend q5-bytes [2 32] :q5-0)))
+
 (defn run-embedding [backend bytes shape quant-type]
   (q/embedding (arr/from-vec backend [1 0 1] [3])
                (q/table backend bytes shape quant-type)))
@@ -54,11 +63,13 @@
 
 (defn -main [& _]
   (let [cpu (cpu/cpu-backend)
+        q5-expected (arr/->vec (run-q5 cpu))
         q4-expected (arr/->vec (run-q4 cpu))
         q6-expected (arr/->vec (run-q6 cpu))
         q8-expected (arr/->vec (run-q8 cpu))
         embedding-expected
-        [(arr/->vec (run-embedding cpu packed-bytes [2 256] :q4-k))
+        [(arr/->vec (run-embedding cpu q5-bytes [2 32] :q5-0))
+         (arr/->vec (run-embedding cpu packed-bytes [2 256] :q4-k))
          (arr/->vec (run-embedding cpu q6-bytes [2 256] :q6-k))
          (arr/->vec (run-embedding cpu q8-bytes [2 32] :q8-0))]]
     (-> (dg/request-device)
@@ -66,22 +77,27 @@
                  (println "Packed Q4_K matmul on" (dg/adapter-description request))
                  (let [gpu (dg/backend request)]
                    (js/Promise.all
-                    #js [(arr/->vec (run-q4 gpu))
+                    #js [(arr/->vec (run-q5 gpu))
+                         (arr/->vec (run-q4 gpu))
                          (arr/->vec (run-q6 gpu))
                          (arr/->vec (run-q8 gpu))
+                         (arr/->vec (run-embedding gpu q5-bytes [2 32] :q5-0))
                          (arr/->vec (run-embedding gpu packed-bytes [2 256] :q4-k))
                          (arr/->vec (run-embedding gpu q6-bytes [2 256] :q6-k))
                          (arr/->vec (run-embedding gpu q8-bytes [2 32] :q8-0))]))))
         (.then (fn [actual]
-                 (let [q4-ok? (close? (aget actual 0) q4-expected)
-                       q6-ok? (close? (aget actual 1) q6-expected)
-                       q8-ok? (close? (aget actual 2) q8-expected)
+                 (let [q5-ok? (close? (aget actual 0) q5-expected)
+                       q4-ok? (close? (aget actual 1) q4-expected)
+                       q6-ok? (close? (aget actual 2) q6-expected)
+                       q8-ok? (close? (aget actual 3) q8-expected)
                        embedding-ok? (every? true?
                                              (map-indexed
                                               (fn [index expected]
-                                                (close? (aget actual (+ index 3)) expected))
+                                                (close? (aget actual (+ index 4)) expected))
                                               embedding-expected))
-                       ok? (and q4-ok? q6-ok? q8-ok? embedding-ok?)]
+                       ok? (and q5-ok? q4-ok? q6-ok? q8-ok? embedding-ok?)]
+                   (println (str "Q5_0 CPU/Metal parity: "
+                                 (if q5-ok? "passed" "failed")))
                    (println (str "Q4_K CPU/Metal parity: "
                                  (if q4-ok? "passed" "failed")))
                    (println (str "Q6_K CPU/Metal parity: "
@@ -91,9 +107,10 @@
                    (println (str "packed embedding CPU/Metal parity: "
                                  (if embedding-ok? "passed" "failed")))
                    (when-not ok?
-                     (println "q4 expected=" q4-expected "actual=" (aget actual 0))
-                     (println "q6 expected=" q6-expected "actual=" (aget actual 1))
-                     (println "q8 expected=" q8-expected "actual=" (aget actual 2)))
+                     (println "q5 expected=" q5-expected "actual=" (aget actual 0))
+                     (println "q4 expected=" q4-expected "actual=" (aget actual 1))
+                     (println "q6 expected=" q6-expected "actual=" (aget actual 2))
+                     (println "q8 expected=" q8-expected "actual=" (aget actual 3)))
                    (js/Deno.exit (if ok? 0 1)))))
         (.catch (fn [error]
                   (println "ERROR:" (or (.-stack error) (str error)))

@@ -1922,6 +1922,30 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   }
 }")
 
+(def q5-0-matmul-wgsl
+  "Dense f32 activations times original packed GGML Q5_0 blocks."
+  (str/replace
+   q8-0-matmul-wgsl
+   "fn value_at(row: u32, column: u32) -> f32 {
+  let block_index = row * p.blocks_per_row + column / 32u;
+  let block = block_index * 34u;
+  let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
+  let d = unpack2x16float(d_bits).x;
+  let raw = byte_at(block + 2u + column % 32u);
+  let quant = select(i32(raw), i32(raw) - 256, raw >= 128u);
+  return d * f32(quant);
+}"
+   "fn value_at(row: u32, column: u32) -> f32 {
+  let block_index = row * p.blocks_per_row + column / 32u;
+  let block = block_index * 22u; let local = column % 32u;
+  let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
+  let packed = byte_at(block + 6u + local % 16u);
+  let low = select(packed & 15u, packed >> 4u, local >= 16u);
+  let high = (byte_at(block + 2u + local / 8u) >> (local % 8u)) & 1u;
+  let quant = i32(low | (high << 4u)) - 16;
+  return unpack2x16float(d_bits).x * f32(quant);
+}"))
+
 (defn- packed-embedding-wgsl [value-function]
   (str
    "struct Params { rows: u32, dim: u32, count: u32, blocks_per_row: u32,
@@ -1995,6 +2019,19 @@ fn value_at(row: u32, column: u32) -> f32 {
   let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
   let raw = byte_at(block + 2u + column % 32u);
   let quant = select(i32(raw), i32(raw) - 256, raw >= 128u);
+  return unpack2x16float(d_bits).x * f32(quant);
+}"))
+
+(def q5-0-embedding-wgsl
+  (packed-embedding-wgsl
+   "fn value_at(row: u32, column: u32) -> f32 {
+  let block = (row * p.blocks_per_row + column / 32u) * 22u;
+  let local = column % 32u;
+  let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
+  let packed = byte_at(block + 6u + local % 16u);
+  let low = select(packed & 15u, packed >> 4u, local >= 16u);
+  let high = (byte_at(block + 2u + local / 8u) >> (local % 8u)) & 1u;
+  let quant = i32(low | (high << 4u)) - 16;
   return unpack2x16float(d_bits).x * f32(quant);
 }"))
 
@@ -2223,9 +2260,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :rms-norm rms-norm-wgsl
    :rotary-embedding rotary-embedding-wgsl
    :copy-into copy-into-wgsl
+   :q5-0-matmul q5-0-matmul-wgsl
    :q4-k-matmul q4-k-matmul-wgsl
    :q6-k-matmul q6-k-matmul-wgsl
    :q8-0-matmul q8-0-matmul-wgsl
+   :q5-0-embedding q5-0-embedding-wgsl
    :q4-k-embedding q4-k-embedding-wgsl
    :q6-k-embedding q6-k-embedding-wgsl
    :q8-0-embedding q8-0-embedding-wgsl
