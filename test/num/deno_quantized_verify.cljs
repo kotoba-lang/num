@@ -46,6 +46,10 @@
   (q/matmul (arr/from-vec backend (repeat 32 1.0) [1 32])
             (q/matrix backend q8-bytes [2 32] :q8-0)))
 
+(defn run-embedding [backend bytes shape quant-type]
+  (q/embedding (arr/from-vec backend [1 0 1] [3])
+               (q/table backend bytes shape quant-type)))
+
 (defn close? [left right]
   (every? #(< (js/Math.abs %) 2.0e-3) (map - left right)))
 
@@ -53,7 +57,11 @@
   (let [cpu (cpu/cpu-backend)
         q4-expected (arr/->vec (run-q4 cpu))
         q6-expected (arr/->vec (run-q6 cpu))
-        q8-expected (arr/->vec (run-q8 cpu))]
+        q8-expected (arr/->vec (run-q8 cpu))
+        embedding-expected
+        [(arr/->vec (run-embedding cpu packed-bytes [2 256] :q4-k))
+         (arr/->vec (run-embedding cpu q6-bytes [2 256] :q6-k))
+         (arr/->vec (run-embedding cpu q8-bytes [2 32] :q8-0))]]
     (-> (dg/request-device)
         (.then (fn [request]
                  (println "Packed Q4_K matmul on" (dg/adapter-description request))
@@ -61,18 +69,28 @@
                    (js/Promise.all
                     #js [(arr/->vec (run-q4 gpu))
                          (arr/->vec (run-q6 gpu))
-                         (arr/->vec (run-q8 gpu))]))))
+                         (arr/->vec (run-q8 gpu))
+                         (arr/->vec (run-embedding gpu packed-bytes [2 256] :q4-k))
+                         (arr/->vec (run-embedding gpu q6-bytes [2 256] :q6-k))
+                         (arr/->vec (run-embedding gpu q8-bytes [2 32] :q8-0))]))))
         (.then (fn [actual]
                  (let [q4-ok? (close? (aget actual 0) q4-expected)
                        q6-ok? (close? (aget actual 1) q6-expected)
                        q8-ok? (close? (aget actual 2) q8-expected)
-                       ok? (and q4-ok? q6-ok? q8-ok?)]
+                       embedding-ok? (every? true?
+                                             (map-indexed
+                                              (fn [index expected]
+                                                (close? (aget actual (+ index 3)) expected))
+                                              embedding-expected))
+                       ok? (and q4-ok? q6-ok? q8-ok? embedding-ok?)]
                    (println (str "Q4_K CPU/Metal parity: "
                                  (if q4-ok? "passed" "failed")))
                    (println (str "Q6_K CPU/Metal parity: "
                                  (if q6-ok? "passed" "failed")))
                    (println (str "Q8_0 CPU/Metal parity: "
                                  (if q8-ok? "passed" "failed")))
+                   (println (str "packed embedding CPU/Metal parity: "
+                                 (if embedding-ok? "passed" "failed")))
                    (when-not ok?
                      (println "q4 expected=" q4-expected "actual=" (aget actual 0))
                      (println "q6 expected=" q6-expected "actual=" (aget actual 1))

@@ -72,7 +72,9 @@
   (-quantized-from-host [b bytes params]
     "Upload unsigned packed bytes and return an opaque quantized handle.")
   (-quantized-matmul [b input-h weight-h params]
-    "Multiply f32 `[m,k]` input by a packed logical `[k,n]` weight."))
+    "Multiply f32 `[m,k]` input by a packed logical `[k,n]` weight.")
+  (-quantized-embedding [b indices-h table-h params]
+    "Gather packed quantized table rows into a dense f32 output."))
 
 (defprotocol IDTypeTensorOps
   "Optional N-D compute operations over physical typed storage."

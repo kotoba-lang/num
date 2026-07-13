@@ -1710,6 +1710,82 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = sum;
 }")
 
+(defn- packed-embedding-wgsl [value-function]
+  (str
+   "struct Params { rows: u32, dim: u32, count: u32, blocks_per_row: u32,
+                    total: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> indices: array<f32>;
+@group(0) @binding(1) var<storage, read> table: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+fn byte_at(offset: u32) -> u32 {
+  return (table[offset / 4u] >> ((offset % 4u) * 8u)) & 255u;
+}
+" value-function "
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.total) { return; }
+  let position = index / p.dim; let feature = index % p.dim;
+  let raw_row = indices[position];
+  if (raw_row < 0.0 || raw_row >= f32(p.rows) || raw_row != floor(raw_row)) {
+    output[index] = 0.0; return;
+  }
+  output[index] = value_at(u32(raw_row), feature);
+}"))
+
+(def q4-k-embedding-wgsl
+  (packed-embedding-wgsl
+   "fn scale_min(block: u32, index: u32) -> vec2<u32> {
+  let base = block + 4u;
+  if (index < 4u) {
+    return vec2<u32>(byte_at(base + index) & 63u,
+                     byte_at(base + index + 4u) & 63u);
+  }
+  return vec2<u32>((byte_at(base + index + 4u) & 15u) |
+                   ((byte_at(base + index - 4u) >> 6u) << 4u),
+                   (byte_at(base + index + 4u) >> 4u) |
+                   ((byte_at(base + index) >> 6u) << 4u));
+}
+fn value_at(row: u32, column: u32) -> f32 {
+  let block = (row * p.blocks_per_row + column / 256u) * 144u;
+  let dm = unpack2x16float(table[block / 4u]);
+  let local = column % 256u; let subblock = local / 32u;
+  let sm = scale_min(block, subblock);
+  let packed = byte_at(block + 16u + (subblock / 2u) * 32u + local % 32u);
+  let quant = select(packed & 15u, packed >> 4u, subblock % 2u == 1u);
+  return dm.x * f32(sm.x) * f32(quant) - dm.y * f32(sm.y);
+}"))
+
+(def q6-k-embedding-wgsl
+  (packed-embedding-wgsl
+   "fn signed_byte(offset: u32) -> i32 {
+  let raw = byte_at(offset);
+  return select(i32(raw), i32(raw) - 256, raw >= 128u);
+}
+fn value_at(row: u32, column: u32) -> f32 {
+  let block = (row * p.blocks_per_row + column / 256u) * 210u;
+  let local = column % 256u; let half = local / 128u;
+  let position = local % 128u; let group = position / 32u;
+  let lane = position % 32u;
+  let low = byte_at(block + half * 64u + lane + select(0u, 32u, group % 2u == 1u));
+  let high = byte_at(block + 128u + half * 32u + lane);
+  let low_bits = select(low & 15u, low >> 4u, group >= 2u);
+  let quant = i32(low_bits | (((high >> (group * 2u)) & 3u) << 4u)) - 32;
+  let scale = signed_byte(block + 192u + half * 8u + lane / 16u + group * 2u);
+  let d_bits = byte_at(block + 208u) | (byte_at(block + 209u) << 8u);
+  return unpack2x16float(d_bits).x * f32(scale * quant);
+}"))
+
+(def q8-0-embedding-wgsl
+  (packed-embedding-wgsl
+   "fn value_at(row: u32, column: u32) -> f32 {
+  let block = (row * p.blocks_per_row + column / 32u) * 34u;
+  let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
+  let raw = byte_at(block + 2u + column % 32u);
+  let quant = select(i32(raw), i32(raw) - 256, raw >= 128u);
+  return unpack2x16float(d_bits).x * f32(quant);
+}"))
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -1732,6 +1808,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :q4-k-matmul q4-k-matmul-wgsl
    :q6-k-matmul q6-k-matmul-wgsl
    :q8-0-matmul q8-0-matmul-wgsl
+   :q4-k-embedding q4-k-embedding-wgsl
+   :q6-k-embedding q6-k-embedding-wgsl
+   :q8-0-embedding q8-0-embedding-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl

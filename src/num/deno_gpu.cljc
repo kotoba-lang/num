@@ -276,6 +276,20 @@
                          (wb/uni dev (wb/u32-tag [m k n blocks-per-row]))]
                         [(wb/ceil-div (* m n) 64) 1 1])
            output))
+       (-quantized-embedding [_ indices-h table-h
+                              {:keys [quant-type rows dim count blocks-per-row total]}]
+         (let [pipeline ({:q4-k :q4-k-embedding :q6-k :q6-k-embedding
+                          :q8-0 :q8-0-embedding} quant-type)]
+           (when-not pipeline
+             (throw (ex-info "unsupported WebGPU quantized embedding"
+                             {:quant-type quant-type})))
+           (let [output (w/-create-buffer dev total :storage)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes pipeline)
+                          [indices-h table-h output
+                           (wb/uni dev (wb/u32-tag
+                                        [rows dim count blocks-per-row total 0 0 0]))]
+                          [(wb/ceil-div total 64) 1 1])
+             output)))
 
        p/IMutableBufferOps
        (-copy-into! [_ destination source offset n dtype*]

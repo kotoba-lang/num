@@ -283,7 +283,9 @@ blocks at their original 4.5/6.5625/8.5 bits per weight and exposes them as
 `[in,out]` matrices. `num.quantized/matmul` decodes their packed fp16
 super-scales, subblock scales/mins, and quant bits inside the compute kernel
 while accumulating f32; it supports multi-row activations and never creates a
-dense weight buffer.
+dense weight buffer. `num.quantized/table` performs device-native token lookup
+from the same three formats, and `as-matrix` creates a zero-copy tied output-head
+view over the exact same packed buffer.
 
 ```sh
 clojure -M:deno-quantized-verify && \
@@ -291,6 +293,7 @@ clojure -M:deno-quantized-verify && \
 # Apple M4: Q4_K CPU/Metal parity: passed
 #           Q6_K CPU/Metal parity: passed
 #           Q8_0 CPU/Metal parity: passed
+#           packed embedding CPU/Metal parity: passed
 ```
 
 `num.deno-gpu` promotes `verify/metal_contract.js`'s raw JS harness into a REAL

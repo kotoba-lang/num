@@ -214,6 +214,20 @@
                                      (value-at bytes column k inner))))
                     sum)))))
       output))
+  (-quantized-embedding [_ indices table {:keys [quant-type rows dim count]}]
+    (let [^doubles indices indices bytes (:bytes table)
+          value-at (case quant-type
+                     :q4-k q4-k-value :q6-k q6-k-value :q8-0 q8-0-value)
+          output (double-array (* count dim))]
+      (dotimes [position count]
+        (let [raw (aget indices position) row (long raw)]
+          (when-not (and (= raw (double row)) (<= 0 row) (< row rows))
+            (throw (ex-info "quantized embedding index out of range"
+                            {:index raw :rows rows :position position})))
+          (dotimes [feature dim]
+            (aset output (+ (* position dim) feature)
+                  (value-at bytes row dim feature)))))
+      output))
 
   p/IDTypeStorage
   (-alloc-dtype [_ n dtype*]

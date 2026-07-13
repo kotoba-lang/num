@@ -67,6 +67,26 @@
     (is (= 32 (:block-size weight)))
     (is (contract/approx-vec? expected (arr/->vec (q/matmul input weight))))))
 
+(deftest packed-embedding-gathers-rows-and-shares-tied-matrix-buffer
+  (let [backend (cpu/cpu-backend)
+        indices (arr/from-vec backend [1 0 1] [3])
+        fixtures
+        [[:q4-k (vec (concat (block 0.5 0.25) (block -0.125 0.5)))
+          [(dense-row 0.5 0.25) (dense-row -0.125 0.5)]]
+         [:q6-k (vec (concat (q6-block 0.25) (q6-block -0.125)))
+          [(q6-dense-row 0.25) (q6-dense-row -0.125)]]
+         [:q8-0 (vec (concat (q8-block 0.25) (q8-block -0.5)))
+          [(mapv #(* 0.25 %) (range -16 16))
+           (mapv #(* -0.5 %) (range -16 16))]]]]
+    (doseq [[quant-type bytes rows] fixtures]
+      (let [table (q/table backend bytes [2 (count (first rows))] quant-type)
+            tied (q/as-matrix table)
+            expected (vec (mapcat #(nth rows %) [1 0 1]))]
+        (is (identical? (:handle table) (:handle tied)))
+        (is (= [(count (first rows)) 2] (:shape tied)))
+        (is (contract/approx-vec? expected
+                                  (arr/->vec (q/embedding indices table))))))))
+
 (deftest q6-k-matmul-matches-dense-oracle-without-expanding-weight
   (let [backend (cpu/cpu-backend)
         bytes (vec (concat (q6-block 0.25) (q6-block -0.125)))
