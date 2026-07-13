@@ -1855,6 +1855,38 @@ fn value_at(row: u32, column: u32) -> f32 {
   return unpack2x16float(d_bits).x * f32(quant);
 }"))
 
+(def rgb-image-to-nchw-wgsl
+  "Fused NHWC→NCHW layout and [0,1]→[-1,1] range conversion."
+  "
+struct Params { height: u32, width: u32, total: u32, pad0: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.total) { return; }
+  let plane = p.height * p.width; let spatial = index % plane;
+  let channel = (index / plane) % 3u; let batch = index / (3u * plane);
+  let source = (batch * plane + spatial) * 3u + channel;
+  output[index] = 2.0 * input[source] - 1.0;
+}")
+
+(def nchw-to-rgb-image-wgsl
+  "Fused NCHW→NHWC layout and [-1,1]→clamped [0,1] conversion."
+  "
+struct Params { height: u32, width: u32, total: u32, pad0: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.total) { return; }
+  let plane = p.height * p.width; let channel = index % 3u;
+  let spatial = (index / 3u) % plane; let batch = index / (3u * plane);
+  let source = (batch * 3u + channel) * plane + spatial;
+  output[index] = clamp(0.5 * (input[source] + 1.0), 0.0, 1.0);
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -1880,6 +1912,8 @@ fn value_at(row: u32, column: u32) -> f32 {
    :q4-k-embedding q4-k-embedding-wgsl
    :q6-k-embedding q6-k-embedding-wgsl
    :q8-0-embedding q8-0-embedding-wgsl
+   :rgb-image-to-nchw rgb-image-to-nchw-wgsl
+   :nchw-to-rgb-image nchw-to-rgb-image-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl

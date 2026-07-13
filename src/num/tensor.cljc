@@ -727,6 +727,61 @@
   [input]
   (nm/silu input))
 
+(defn rgb-image-to-nchw
+  "Convert contiguous `[batch,height,width,3]` RGB `[0,1]` to
+  `[batch,3,height,width]` in `[-1,1]`, device-native when available."
+  [input]
+  (let [[batch height width channels :as shape] (:shape input)
+        backend (:backend input) total (arr/nelems shape)
+        output-shape [batch channels height width]]
+    (when-not (and (= 4 (count shape)) (= 3 channels))
+      (throw (ex-info "rgb-image-to-nchw requires NHWC RGB" {:shape shape})))
+    (if (and (= :f32 (array-dtype input)) (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray backend
+                            (p/-rgb-image-to-nchw
+                             backend (:handle input)
+                             {:batch batch :height height :width width :total total})
+                            output-shape) :dtype :f32)
+      (let [source (vec (arr/->vec input))]
+        (arr/from-vec
+         backend
+         (mapv (fn [index]
+                 (let [spatial (mod index (* height width))
+                       channel (mod (quot index (* height width)) 3)
+                       b (quot index (* 3 height width))
+                       input-index (+ (* b height width 3) (* spatial 3) channel)]
+                   (- (* 2.0 (nth source input-index)) 1.0)))
+               (range total))
+         output-shape (array-dtype input))))))
+
+(defn nchw-to-rgb-image
+  "Convert contiguous `[batch,3,height,width]` model output to clamped
+  `[batch,height,width,3]` RGB `[0,1]`, device-native when available."
+  [input]
+  (let [[batch channels height width :as shape] (:shape input)
+        backend (:backend input) total (arr/nelems shape)
+        output-shape [batch height width channels]]
+    (when-not (and (= 4 (count shape)) (= 3 channels))
+      (throw (ex-info "nchw-to-rgb-image requires NCHW RGB" {:shape shape})))
+    (if (and (= :f32 (array-dtype input)) (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray backend
+                            (p/-nchw-to-rgb-image
+                             backend (:handle input)
+                             {:batch batch :height height :width width :total total})
+                            output-shape) :dtype :f32)
+      (let [source (vec (arr/->vec input))]
+        (arr/from-vec
+         backend
+         (mapv (fn [index]
+                 (let [channel (mod index 3)
+                       spatial (mod (quot index 3) (* height width))
+                       b (quot index (* height width 3))
+                       input-index (+ (* b 3 height width)
+                                      (* channel height width) spatial)]
+                   (max 0.0 (min 1.0 (* 0.5 (+ 1.0 (nth source input-index)))))))
+               (range total))
+         output-shape (array-dtype input))))))
+
 (defn cat
   "Concatenate equal-rank tensors along `axis` (PyTorch `torch.cat` shape
   semantics). All non-concatenated dimensions must match. ITensorBackend

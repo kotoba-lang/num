@@ -16,6 +16,7 @@
                 :group-norm-nchw :group-norm-silu-nchw
                 :upsample-nearest2d :cat-copy
                 :slice-axis :pad-right-bottom-nchw
+                :rgb-image-to-nchw :nchw-to-rgb-image
                 :add-last-axis-bias :multi-head-attention
                 :multi-head-attention-backward :transpose-2d :bias-gradient
                 :mse-loss :mse-gradient :sgd-step :adamw-step
@@ -32,6 +33,12 @@
     (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"var sum: f32" (:gemm-f16 w/shaders)))))
+
+(deftest image-boundary-shaders-fuse-layout-and-range-conversion
+  (is (re-find #"let source" (:rgb-image-to-nchw w/shaders)))
+  (is (re-find #"2\.0 \* input\[source\] - 1\.0"
+               (:rgb-image-to-nchw w/shaders)))
+  (is (re-find #"clamp" (:nchw-to-rgb-image w/shaders))))
 
 (deftest quantized-matmul-parallelizes-k-with-workgroup-reduction
   (doseq [op [:q4-k-matmul :q6-k-matmul :q8-0-matmul]

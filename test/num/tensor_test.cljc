@@ -24,7 +24,27 @@
     (is (= [3 4] (t/broadcast-shapes [3 1] [1 4])))
     (is (= [2 3 4] (t/broadcast-shapes [3 4] [2 1 4]))))
   (testing "incompatible non-1 sizes error"
-    (is (thrown? #?(:clj Exception :cljs js/Error) (t/broadcast-shapes [2 3] [2 4])))))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/broadcast-shapes [2 3] [2 4])))))
+
+(deftest rgb-image-layout-and-range-conversions
+  (let [nhwc (arr/from-vec backend
+                           [0.0 0.25 0.5, 0.75 1.0 0.1,
+                            0.2 0.4 0.6, 0.8 0.9 1.0]
+                           [2 1 2 3])
+        nchw (t/rgb-image-to-nchw nhwc)
+        restored (t/nchw-to-rgb-image nchw)]
+    (is (= [2 3 1 2] (:shape nchw)))
+    (is (contract/approx-vec?
+         [-1.0 0.5, -0.5 1.0, 0.0 -0.8,
+          -0.6 0.6, -0.2 0.8, 0.2 1.0]
+         (arr/->vec nchw)))
+    (is (= [2 1 2 3] (:shape restored)))
+    (is (contract/approx-vec? (arr/->vec nhwc) (arr/->vec restored)))
+    (is (= [0.0 1.0 0.5]
+           (arr/->vec
+            (t/nchw-to-rgb-image
+             (arr/from-vec backend [-2.0 2.0 0.0] [1 3 1 1])))))))
 
 (deftest broadcast-to-scalar-plus-vector
   (testing "a 0-D scalar broadcasts to every element of a vector"

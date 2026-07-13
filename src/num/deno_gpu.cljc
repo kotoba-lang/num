@@ -494,6 +494,20 @@
                          (wb/uni dev [(double direction)])]
                         [(wb/ceil-div total 64) 1 1])
            output))
+       (-rgb-image-to-nchw [_ input-h {:keys [height width total]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rgb-image-to-nchw)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-nchw-to-rgb-image [_ input-h {:keys [height width total]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :nchw-to-rgb-image)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
        (-upsample-nearest2d [_ input-h
                              {:keys [n c h width oh ow scale-h scale-w]}]
          (let [total (* n c oh ow)

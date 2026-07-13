@@ -98,6 +98,10 @@
     "RMS-normalize contiguous rows over their final dimension.")
   (-rotary-embedding [b input-h params]
     "Apply head-wise Llama rotary position embedding.")
+  (-rgb-image-to-nchw [b input-h params]
+    "Convert NHWC RGB [0,1] into NCHW model input [-1,1].")
+  (-nchw-to-rgb-image [b input-h params]
+    "Convert NCHW RGB model output [-1,1] into clamped NHWC [0,1].")
   (-upsample-nearest2d [b input-h params]
     "Integer nearest-neighbor NCHW upsampling; returns a new handle.")
   (-cat [b input-handles params]
