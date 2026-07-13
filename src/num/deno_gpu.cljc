@@ -901,6 +901,43 @@
                         [(wb/ceil-div model 64) 1 1])
            (assoc (arr/->NDArray backend output (:shape query)) :dtype :f32))))
 
+     (defn paged-gqa-attention-batch
+       "Batched one-token GQA over shared physical pools. Each query row uses
+       its own block-table row and sequence length."
+       [query key-pool value-pool block-tables lengths heads kv-heads]
+       (let [[batch model] (:shape query)
+             [table-batch max-blocks] (:shape block-tables)
+             [_blocks block-size kv-width] (:shape key-pool)
+             head-dim (quot model heads)
+             backend (:backend query)
+             total (* batch model)]
+         (when-not (and (= 2 (count (:shape query)))
+                        (= (:shape key-pool) (:shape value-pool))
+                        (= batch table-batch)
+                        (= [batch] (:shape lengths))
+                        (pos? batch) (pos? max-blocks)
+                        (pos? heads) (pos? kv-heads)
+                        (zero? (mod heads kv-heads))
+                        (zero? (mod model heads))
+                        (= kv-width (* kv-heads head-dim)))
+           (throw (ex-info "invalid batched paged GQA attention shapes"
+                           {:query (:shape query) :pool (:shape key-pool)
+                            :block-tables (:shape block-tables)
+                            :lengths (:shape lengths) :heads heads
+                            :kv-heads kv-heads})))
+         (let [dev (.-dev backend)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-gqa-attention-batch)
+                        [(:handle query) (:handle key-pool) (:handle value-pool)
+                         (:handle block-tables) (:handle lengths) output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch max-blocks block-size kv-width
+                                       heads kv-heads head-dim model total 0 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           (assoc (arr/->NDArray backend output (:shape query)) :dtype :f32))))
+
      (defn gpu-backend
        "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.
        Mirrors num.cpu/cpu-backend's explicit-construction pattern (num has no
@@ -924,4 +961,5 @@
      (defn paged-kv-write! [& _] (throw (ex-info "num.deno-gpu/paged-kv-write! requires a cljs/Deno host." {})))
      (defn paged-kv-copy-block! [& _] (throw (ex-info "num.deno-gpu/paged-kv-copy-block! requires a cljs/Deno host." {})))
      (defn paged-gqa-attention [& _] (throw (ex-info "num.deno-gpu/paged-gqa-attention requires a cljs/Deno host." {})))
+     (defn paged-gqa-attention-batch [& _] (throw (ex-info "num.deno-gpu/paged-gqa-attention-batch requires a cljs/Deno host." {})))
      (defn gpu-backend [] (throw (ex-info "num.deno-gpu/gpu-backend requires a cljs/Deno host." {})))))

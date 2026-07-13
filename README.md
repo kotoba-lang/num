@@ -248,6 +248,13 @@ deno run --allow-all target/deno-paged-kv-verify.cjs
 # paged GPU storage release: passed
 ```
 
+`paged-gqa-attention-batch` extends the same physical pools to one fused
+multi-request dispatch. Query rows carry independent sequence lengths and padded
+block-table rows, so ragged decode does not require padding K/V payloads or
+materializing contiguous caches. The live verifier evaluates the length-3
+`[2,0]` request and a length-2 fork `[1,_]` together and matches both CPU GQA
+oracles.
+
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
 flat contiguous buffer. Except for the native last-axis bias and fused attention

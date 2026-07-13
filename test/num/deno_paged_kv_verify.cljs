@@ -60,17 +60,29 @@
                  _ (gpu/paged-kv-write! key-pool value-pool child-k child-v 1 1)
                  child-table (arr/from-vec backend [1] [1])
                  child-output (gpu/paged-gqa-attention
-                               query* key-pool value-pool child-table 2 2 1)]
+                               query* key-pool value-pool child-table 2 2 1)
+                 batch-query (arr/from-vec backend (vec (concat query query)) [2 4])
+                 batch-tables (arr/from-vec backend [2 0 1 0] [2 2])
+                 batch-lengths (arr/from-vec backend [3 2] [2])
+                 batch-output
+                 (gpu/paged-gqa-attention-batch
+                  batch-query key-pool value-pool batch-tables batch-lengths 2 1)]
              (-> (js/Promise.all
-                  #js [(arr/->vec output) (arr/->vec child-output)])
+                  #js [(arr/->vec output) (arr/->vec child-output)
+                       (arr/->vec batch-output)])
                  (.then
                   (fn [reads]
                     (let [actual (vec (aget reads 0))
                           actual-child (vec (aget reads 1))
+                          actual-batch (vec (aget reads 2))
                           parity? (approx? expected actual)
                           cow? (approx? expected-child actual-child)
+                          batch? (approx? (vec (concat expected expected-child))
+                                          actual-batch)
                           arrays (concat [key-pool value-pool query* table output
-                                          child-k child-v child-table child-output]
+                                          child-k child-v child-table child-output
+                                          batch-query batch-tables batch-lengths
+                                          batch-output]
                                          (mapcat identity token-arrays))]
                       (arr/release-all! arrays)
                       (let [after (gpu/backend-stats backend)
@@ -84,9 +96,11 @@
                                  (if parity? "passed" "failed"))
                         (println "prefix COW block-copy parity:"
                                  (if cow? "passed" "failed"))
+                        (println "ragged batched paged GQA parity:"
+                                 (if batch? "passed" "failed"))
                         (println "paged GPU storage release:"
                                  (if released? "passed" "failed"))
-                        (when-not (and parity? cow? released?)
+                        (when-not (and parity? cow? batch? released?)
                           (.exit js/Deno 1))))))))))
         (.catch (fn [error] (js/console.error error) (.exit js/Deno 1))))))
 

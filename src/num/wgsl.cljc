@@ -2149,6 +2149,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[component] = weighted / denominator;
 }")
 
+(def paged-gqa-attention-batch-wgsl
+  "Batched one-token GQA with independent lengths and physical block tables."
+  "
+struct Params {
+  batch: u32, max_blocks: u32, block_size: u32, kv_width: u32,
+  heads: u32, kv_heads: u32, head_dim: u32, model: u32,
+  total: u32, pad0: u32, pad1: u32, pad2: u32,
+}
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key_pool: array<f32>;
+@group(0) @binding(2) var<storage, read> value_pool: array<f32>;
+@group(0) @binding(3) var<storage, read> block_tables: array<f32>;
+@group(0) @binding(4) var<storage, read> lengths: array<f32>;
+@group(0) @binding(5) var<storage, read_write> output: array<f32>;
+@group(0) @binding(6) var<uniform> p: Params;
+fn pool_index(batch: u32, token: u32, component: u32) -> u32 {
+  let logical_block = token / p.block_size;
+  let offset = token % p.block_size;
+  let physical = u32(block_tables[batch * p.max_blocks + logical_block]);
+  return ((physical * p.block_size + offset) * p.kv_width) + component;
+}
+fn score(batch: u32, head: u32, token: u32) -> f32 {
+  let kv_head = head / (p.heads / p.kv_heads);
+  var dot: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    dot = dot + query[batch * p.model + head * p.head_dim + d] *
+                key_pool[pool_index(batch, token,
+                                    kv_head * p.head_dim + d)];
+  }
+  return dot * inverseSqrt(f32(p.head_dim));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.total) { return; }
+  let batch = index / p.model;
+  let component = index % p.model;
+  let head = component / p.head_dim;
+  let local = component % p.head_dim;
+  let kv_head = head / (p.heads / p.kv_heads);
+  let length = u32(lengths[batch]);
+  var maximum: f32 = -3.402823e38;
+  for (var token: u32 = 0u; token < length; token = token + 1u) {
+    maximum = max(maximum, score(batch, head, token));
+  }
+  var denominator: f32 = 0.0;
+  var weighted: f32 = 0.0;
+  for (var token: u32 = 0u; token < length; token = token + 1u) {
+    let weight = exp(score(batch, head, token) - maximum);
+    denominator = denominator + weight;
+    weighted = weighted + weight *
+      value_pool[pool_index(batch, token, kv_head * p.head_dim + local)];
+  }
+  output[index] = weighted / denominator;
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -2181,6 +2236,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :paged-kv-write paged-kv-write-wgsl
    :paged-kv-copy-block paged-kv-copy-block-wgsl
    :paged-gqa-attention paged-gqa-attention-wgsl
+   :paged-gqa-attention-batch paged-gqa-attention-batch-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
