@@ -59,3 +59,10 @@
   (is (re-find #"inverseSqrt" w/causal-gqa-attention-wgsl))
   (is (re-find #"maximum" w/causal-gqa-attention-wgsl))
   (is (re-find #"kv_head" w/causal-gqa-attention-wgsl)))
+
+(deftest gpu-training-primitives-cover-forward-backward-and-update
+  (is (re-find #"output\[col \* dims.x \+ row\]" w/transpose-2d-wgsl))
+  (is (re-find #"prediction\[i\] - expected\[i\]" w/mse-gradient-wgsl))
+  (is (re-find #"preactivation\[i\] > 0.0" w/relu-backward-wgsl))
+  (is (re-find #"for \(var row" w/bias-gradient-wgsl))
+  (is (re-find #"learning_rate \* gradient" w/sgd-update-wgsl)))

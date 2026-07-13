@@ -549,6 +549,87 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = result / denominator;
 }")
 
+(def transpose-2d-wgsl
+  "Out-of-place row-major matrix transpose used by GPU backpropagation."
+  "
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec2<u32>;
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let col = gid.x; let row = gid.y;
+  if (row < dims.x && col < dims.y) {
+    output[col * dims.x + row] = input[row * dims.y + col];
+  }
+}")
+
+(def add-bias-rows-wgsl
+  "Add one shared bias vector to every matrix row."
+  "
+@group(0) @binding(0) var<storage, read_write> matrix: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec2<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= dims.x * dims.y) { return; }
+  matrix[i] = matrix[i] + bias[i % dims.y];
+}")
+
+(def mse-gradient-wgsl
+  "Elementwise derivative 2*(prediction-target)/N for mean squared error."
+  "
+@group(0) @binding(0) var<storage, read> prediction: array<f32>;
+@group(0) @binding(1) var<storage, read> expected: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gradient: array<f32>;
+@group(0) @binding(3) var<uniform> count: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= count) { return; }
+  gradient[i] = 2.0 * (prediction[i] - expected[i]) / f32(count);
+}")
+
+(def relu-backward-wgsl
+  "ReLU vector-Jacobian product using saved pre-activation values."
+  "
+@group(0) @binding(0) var<storage, read> upstream: array<f32>;
+@group(0) @binding(1) var<storage, read> preactivation: array<f32>;
+@group(0) @binding(2) var<storage, read_write> gradient: array<f32>;
+@group(0) @binding(3) var<uniform> count: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= count) { return; }
+  gradient[i] = select(0.0, upstream[i], preactivation[i] > 0.0);
+}")
+
+(def bias-gradient-wgsl
+  "Sum a matrix gradient over rows into its shared bias gradient."
+  "
+@group(0) @binding(0) var<storage, read> gradient: array<f32>;
+@group(0) @binding(1) var<storage, read_write> bias_gradient: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec2<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let col = gid.x; if (col >= dims.y) { return; }
+  var sum: f32 = 0.0;
+  for (var row: u32 = 0u; row < dims.x; row = row + 1u) {
+    sum = sum + gradient[row * dims.y + col];
+  }
+  bias_gradient[col] = sum;
+}")
+
+(def sgd-update-wgsl
+  "In-place SGD parameter update."
+  "
+@group(0) @binding(0) var<storage, read_write> parameter: array<f32>;
+@group(0) @binding(1) var<storage, read> gradient: array<f32>;
+struct Params { learning_rate: f32, count: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.count) { return; }
+  parameter[i] = parameter[i] - p.learning_rate * gradient[i];
+}")
+
 (def conv2d-nchw-wgsl
   "Direct NCHW convolution/cross-correlation. One invocation computes one
   output element; supports bias, groups/depthwise, stride, padding, dilation."
