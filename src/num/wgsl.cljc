@@ -163,7 +163,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }")
 
 (def ewise1-wgsl
-  "UNARY elementwise z = op(x); op ∈ {0:exp 1:relu 2:neg} via a uniform. Same
+  "UNARY elementwise z = op(x); op ∈ {0:exp 1:relu 2:neg 3:silu} via a uniform. Same
   shape as ewise-wgsl, one input instead of two — the primitive softmax/attention
   need that the level-1/level-2/level-3 BLAS set doesn't provide."
   "
@@ -176,7 +176,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (i >= arrayLength(&z)) { return; }
   let a = x[i]; var r: f32 = 0.0;
   switch op { case 0u { r = exp(a); } case 1u { r = max(a, 0.0); }
-              case 2u { r = -a; } default { r = 0.0; } }
+              case 2u { r = -a; }
+              case 3u { r = a / (1.0 + exp(-a)); }
+              default { r = 0.0; } }
   z[i] = r;
 }")
 

@@ -44,7 +44,11 @@
 
   (-ewise1 [_ op xh n]
     (let [^doubles x xh n (long n) z (double-array n)
-          f (case op :exp #(Math/exp %) :relu #(max % 0.0) :neg -)]
+          f (case op
+              :exp #(Math/exp %)
+              :relu #(max % 0.0)
+              :neg -
+              :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v))))))]
       (dotimes [i n] (aset z i (double (f (aget x i)))))
       z))
 

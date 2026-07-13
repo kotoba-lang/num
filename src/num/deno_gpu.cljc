@@ -173,7 +173,7 @@
        (-ewise1 [_ op xh n]
          (let [z (w/-create-buffer dev n :storage)]
            (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1)
-                        [xh z (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2} op)]))]
+                        [xh z (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3} op)]))]
                         [(wb/ceil-div n 64) 1 1])
            z))
 

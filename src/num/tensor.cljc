@@ -536,10 +536,10 @@
 ;; --- UNet tensor building blocks -----------------------------------------------
 
 (defn silu
-  "Elementwise SiLU/Swish: `x * sigmoid(x)`."
+  "Elementwise SiLU/Swish: `x * sigmoid(x)`, dispatched as one backend unary
+  kernel (device-native on WGSL/Metal; no host readback)."
   [input]
-  (let [one (arr/from-vec (:backend input) [1.0] [])]
-    (div input (add one (nm/exp (nm/neg input))))))
+  (nm/silu input))
 
 (defn cat
   "Concatenate equal-rank tensors along `axis` (PyTorch `torch.cat` shape
