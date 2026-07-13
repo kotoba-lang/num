@@ -94,6 +94,13 @@
         d (dtype/f16-bits->f32 (packed-u16 bytes (+ block-offset 208)))]
     (* d scale quant)))
 
+(defn- q8-0-value [bytes row cols column]
+  (let [block-index (+ (* row (quot cols 32)) (quot column 32))
+        block-offset (* block-index 34)
+        d (dtype/f16-bits->f32 (packed-u16 bytes block-offset))
+        quant (signed-byte (nth bytes (+ block-offset 2 (mod column 32))))]
+    (* d quant)))
+
 (deftype CpuBackend []
   p/IBackend
   (-backend-name [_] :cpu)
@@ -192,10 +199,11 @@
   (-quantized-from-host [_ bytes params]
     {:bytes (mapv #(bit-and 0xff %) bytes) :params params})
   (-quantized-matmul [_ input weight {:keys [quant-type m k n]}]
-    (when-not (#{:q4-k :q6-k} quant-type)
+    (when-not (#{:q4-k :q6-k :q8-0} quant-type)
       (throw (ex-info "unsupported CPU quantized matmul" {:quant-type quant-type})))
     (let [^doubles input input bytes (:bytes weight) output (double-array (* m n))
-          value-at (case quant-type :q4-k q4-k-value :q6-k q6-k-value)]
+          value-at (case quant-type
+                     :q4-k q4-k-value :q6-k q6-k-value :q8-0 q8-0-value)]
       (dotimes [row m]
         (dotimes [column n]
           (aset output (+ (* row n) column)

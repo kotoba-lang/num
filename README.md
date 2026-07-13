@@ -278,8 +278,8 @@ deno run --allow-all target/deno-q8-verify.cjs
 #           Metal    [73.75999451 95.43997955]
 ```
 
-`num.quantized/matrix` additionally stores complete GGML Q4_K and Q6_K blocks
-at their original 4.5/6.5625 bits per weight and exposes them logically as
+`num.quantized/matrix` additionally stores complete GGML Q4_K, Q6_K, and Q8_0
+blocks at their original 4.5/6.5625/8.5 bits per weight and exposes them as
 `[in,out]` matrices. `num.quantized/matmul` decodes their packed fp16
 super-scales, subblock scales/mins, and quant bits inside the compute kernel
 while accumulating f32; it supports multi-row activations and never creates a
@@ -290,6 +290,7 @@ clojure -M:deno-quantized-verify && \
   deno run --allow-all target/deno-quantized-verify.cjs
 # Apple M4: Q4_K CPU/Metal parity: passed
 #           Q6_K CPU/Metal parity: passed
+#           Q8_0 CPU/Metal parity: passed
 ```
 
 `num.deno-gpu` promotes `verify/metal_contract.js`'s raw JS harness into a REAL

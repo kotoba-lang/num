@@ -152,12 +152,13 @@
       buffer))
   (-quantized-matmul [_ input-h weight-h
                       {:keys [quant-type m k n blocks-per-row]}]
-    (when-not (#{:q4-k :q6-k} quant-type)
+    (when-not (#{:q4-k :q6-k :q8-0} quant-type)
       (throw (ex-info "unsupported WGSL quantized matmul" {:quant-type quant-type})))
     (let [output (w/-create-buffer dev (* m n) :storage)]
       (w/-dispatch dev (get-pipeline dev pipes
                                      ({:q4-k :q4-k-matmul
-                                       :q6-k :q6-k-matmul} quant-type))
+                                       :q6-k :q6-k-matmul
+                                       :q8-0 :q8-0-matmul} quant-type))
                    [input-h weight-h output
                     (uni dev (u32-tag [m k n blocks-per-row]))]
                    [(ceil-div (* m n) 64) 1 1])
