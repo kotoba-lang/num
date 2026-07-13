@@ -186,9 +186,18 @@ finite differences. `cat*` and `upsample-nearest2d*` complete the skip-path
 training graph; a branched upsample+channel-concat+SiLU loss matches central
 finite differences for both source tensors.
 
+Transformer forward execution now has two further device-native operations:
+rank-1 last-axis bias broadcasting and fused rank-2 multi-head attention. The
+attention kernel accepts different query/key sequence lengths, performs stable
+per-head softmax, and emits concatenated heads without materializing transpose,
+batched-matmul, or probability tensors on the host. Both kernels match the CPU
+oracle on Apple M4 Metal and allow learned Q/K/V/output projection attention to
+remain GPU-resident through its complete forward pass.
+
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
-flat contiguous buffer. So `broadcast-to`/`transpose`/axis-reductions/`matmul` here read
+flat contiguous buffer. Except for the native last-axis bias and fused attention
+specializations above, general `broadcast-to`/`transpose`/axis-reductions/`matmul` read
 operands back via `arr/->vec`, compute with plain `double-array` loops (same style as
 `num.cpu`'s reference loops), and re-upload via `arr/from-vec` — correct on ANY backend
 today, but a host round-trip. `reshape`/`squeeze`/`unsqueeze` are the exception: for a
@@ -298,9 +307,10 @@ precision, fusion, and full-model throughput still require separate benchmarks.
 This cross-checks the live GPU backend against `num.cpu`'s reference oracle (dispatched
 through `num.core`/`num.array`, i.e. through `IBackend`, the same seam any real caller
 uses) — **verified passing on real Apple M4 Metal hardware while building this**:
-`Deno WgslBackendAsync ≡ CPU oracle: 24 passed, 0 failed` (BLAS, reductions,
+`Deno WgslBackendAsync ≡ CPU oracle: 26 passed, 0 failed` (BLAS, reductions,
 sparse matvec, unary exp/relu/neg/SiLU, full NCHW/depthwise convolution, and
-affine/non-affine GroupNorm, upsampling, and skip concatenation).
+affine/non-affine GroupNorm, upsampling, skip concatenation, bias broadcasting,
+and fused multi-head attention).
 
 ## Status
 

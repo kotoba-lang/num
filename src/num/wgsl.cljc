@@ -563,6 +563,57 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }")
 
+(def add-last-axis-bias-wgsl
+  "Broadcast a rank-1 bias over contiguous rows."
+  "
+struct Params { total: u32, width: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.total) { return; }
+  output[i] = input[i] + bias[i % p.width];
+}")
+
+(def multi-head-attention-wgsl
+  "Fused rank-2 Q/K/V multi-head attention with stable online softmax passes."
+  "
+struct Params { seq_q: u32, seq_k: u32, model: u32, heads: u32,
+                head_dim: u32, total: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key: array<f32>;
+@group(0) @binding(2) var<storage, read> value: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn score(row: u32, head: u32, token: u32) -> f32 {
+  let qbase = row * p.model + head * p.head_dim;
+  let kbase = token * p.model + head * p.head_dim;
+  var sum: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    sum = sum + query[qbase + d] * key[kbase + d];
+  }
+  return sum * inverseSqrt(f32(p.head_dim));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.total) { return; }
+  let row = i / p.model; let component = i % p.model;
+  let head = component / p.head_dim;
+  var maximum: f32 = -3.402823e38;
+  for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
+    maximum = max(maximum, score(row, head, token));
+  }
+  var denominator: f32 = 0.0; var result: f32 = 0.0;
+  for (var token: u32 = 0u; token < p.seq_k; token = token + 1u) {
+    let weight = exp(score(row, head, token) - maximum);
+    denominator = denominator + weight;
+    result = result + weight * value[token * p.model + component];
+  }
+  output[i] = result / denominator;
+}")
+
 (def add-bias-rows-wgsl
   "Add one shared bias vector to every matrix row."
   "
@@ -985,6 +1036,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :group-norm-nchw group-norm-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
+   :add-last-axis-bias add-last-axis-bias-wgsl
+   :multi-head-attention multi-head-attention-wgsl
    :ewise-f16 ewise-f16-wgsl
    :ewise1-f16 ewise1-f16-wgsl
    :gemm-f16 gemm-f16-wgsl

@@ -365,6 +365,22 @@
                           [input-h output
                            (wb/uni dev (wb/u32-tag [total block output-block axis-offset]))]
                           [(wb/ceil-div total 64) 1 1]))
+           output))
+       (-add-last-axis-bias [_ input-h bias-h {:keys [total width]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :add-last-axis-bias)
+                        [input-h bias-h output
+                         (wb/uni dev (wb/u32-tag [total width 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-multi-head-attention [_ query-h key-h value-h
+                               {:keys [seq-q seq-k d-model heads head-dim total]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention)
+                        [query-h key-h value-h output
+                         (wb/uni dev (wb/u32-tag [seq-q seq-k d-model heads
+                                                  head-dim total 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
            output)))
 
      (defn backend

@@ -77,4 +77,8 @@
   (-upsample-nearest2d [b input-h params]
     "Integer nearest-neighbor NCHW upsampling; returns a new handle.")
   (-cat [b input-handles params]
-    "Concatenate contiguous tensors along an arbitrary axis; returns a new handle."))
+    "Concatenate contiguous tensors along an arbitrary axis; returns a new handle.")
+  (-add-last-axis-bias [b input-h bias-h params]
+    "Broadcast-add a rank-1 bias over every contiguous last-axis row.")
+  (-multi-head-attention [b query-h key-h value-h params]
+    "Fused unmasked scaled dot-product attention over rank-2 Q/K/V."))

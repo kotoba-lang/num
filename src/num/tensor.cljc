@@ -171,7 +171,23 @@
         _ (require-same-dtype! "num.tensor elementwise" [x' y'])]
     ((case op :add nm/add :sub nm/sub :mul nm/mul :div nm/div) x' y')))
 
-(defn add "Broadcasting x + y." [x y] (ewise-bc :add x y))
+(defn add "Broadcasting x + y." [x y]
+  (let [[input bias] (cond
+                       (and (> (count (:shape x)) 1)
+                            (= (:shape y) [(last (:shape x))])) [x y]
+                       (and (> (count (:shape y)) 1)
+                            (= (:shape x) [(last (:shape y))])) [y x]
+                       :else [nil nil])
+        backend (:backend input)]
+    (if (and input (= :f32 (array-dtype input)) (= backend (:backend bias))
+             (satisfies? p/ITensorBackend backend))
+      (assoc (arr/->NDArray
+              backend
+              (p/-add-last-axis-bias
+               backend (:handle input) (:handle bias)
+               {:total (arr/nelems (:shape input)) :width (last (:shape input))})
+              (:shape input)) :dtype :f32)
+      (ewise-bc :add x y))))
 (defn sub "Broadcasting x - y." [x y] (ewise-bc :sub x y))
 (defn mul "Broadcasting elementwise x * y (Hadamard, not matmul)." [x y] (ewise-bc :mul x y))
 (defn div "Broadcasting elementwise x / y." [x y] (ewise-bc :div x y))
@@ -781,10 +797,25 @@
   scores tensor)."
   [Q K V num-heads]
   (let [[seqQ d-model] (:shape Q) [seqK _] (:shape K) h (long num-heads)]
-    (when-not (zero? (mod (long d-model) h))
+    (when-not (and (= 2 (count (:shape Q)) (count (:shape K)) (count (:shape V)))
+                   (= (:shape K) (:shape V))
+                   (= d-model (last (:shape K))) (pos? h)
+                   (zero? (mod (long d-model) h)))
       (throw (ex-info "num.tensor/multi-head-attention: num-heads must evenly divide d_model"
-                       {:d-model d-model :num-heads h})))
-    (let [d-head (/ (long d-model) h)
+                       {:query (:shape Q) :key (:shape K) :value (:shape V)
+                        :d-model d-model :num-heads h})))
+    (let [backend (:backend Q) d-head (/ (long d-model) h)]
+      (if (and (= backend (:backend K) (:backend V))
+               (= :f32 (array-dtype Q) (array-dtype K) (array-dtype V))
+               (satisfies? p/ITensorBackend backend))
+        (assoc (arr/->NDArray
+                backend
+                (p/-multi-head-attention
+                 backend (:handle Q) (:handle K) (:handle V)
+                 {:seq-q seqQ :seq-k seqK :d-model d-model :heads h
+                  :head-dim d-head :total (* seqQ d-model)})
+                [seqQ d-model]) :dtype :f32)
+        (let [
           split-heads (fn [x seq-len] (transpose (reshape x [seq-len h d-head]) [1 0 2]))
           Qh (split-heads Q seqQ) Kh (split-heads K seqK) Vh (split-heads V seqK)
           scores (matmul Qh (transpose Kh [0 2 1]))
@@ -792,4 +823,4 @@
           weights (softmax scaled)
           heads-out (matmul weights Vh)
           merged (transpose heads-out [1 0 2])]
-      (reshape merged [seqQ d-model]))))
+          (reshape merged [seqQ d-model]))))))
