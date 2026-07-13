@@ -62,15 +62,23 @@
 
 ;; --- ops -------------------------------------------------------------------
 
+(defn- swap-last-two
+  "Transpose the matrix dimensions while preserving any batch dimensions."
+  [a]
+  (let [rank (count (:shape a))
+        perm (vec (concat (range (- rank 2)) [(dec rank) (- rank 2)]))]
+    (t/transpose a perm)))
+
 (defn matmul*
-  "z = x @ W. dL/dx = dL/dz @ W^T; dL/dW = x^T @ dL/dz."
+  "z = x @ W, including batched matrix multiplication. Gradients transpose
+  only the final two (matrix) axes and preserve all leading batch axes."
   [x W]
-  (node (nm/matmul (:data x) (:data W))
+  (node (t/matmul (:data x) (:data W))
         [x W]
         (fn [self]
           (when-let [g @(:grad self)]
-            (accumulate! x (nm/matmul g (t/transpose (:data W))))
-            (accumulate! W (nm/matmul (t/transpose (:data x)) g))))))
+            (accumulate! x (t/matmul g (swap-last-two (:data W))))
+            (accumulate! W (t/matmul (swap-last-two (:data x)) g))))))
 
 (defn add-bias*
   "z = x + b, b broadcast over x's leading (batch) axis. dL/dx = dL/dz;
@@ -216,15 +224,21 @@
 ;; --- attention (2026-07-13 "raise the maturity" loop) -----------------------
 
 (defn transpose*
-  "z = transpose(x) (2-D full reversal, like num.tensor/transpose with no
-  perm). dL/dx = transpose(dL/dz) — a full-reversal transpose is its own
-  adjoint (transposing twice is the identity)."
-  [x]
-  (node (t/transpose (:data x))
-        [x]
-        (fn [self]
-          (when-let [g @(:grad self)]
-            (accumulate! x (t/transpose g))))))
+  "Permute tensor axes with a differentiable transpose. With no permutation,
+  reverses all axes like `num.tensor/transpose`. Backward applies the inverse
+  permutation, so arbitrary-rank head splitting/merging remains differentiable."
+  ([x]
+   (transpose* x (vec (reverse (range (count (:shape (:data x))))))))
+  ([x perm]
+   (let [perm (mapv long perm)
+         inverse (reduce-kv (fn [out destination source]
+                              (assoc out source destination))
+                            (vec (repeat (count perm) 0)) perm)]
+     (node (t/transpose (:data x) perm)
+           [x]
+           (fn [self]
+             (when-let [g @(:grad self)]
+               (accumulate! x (t/transpose g inverse))))))))
 
 (defn- copy-nd [a] (arr/from-vec (:backend a) (arr/->vec a) (:shape a)))
 
@@ -255,6 +269,34 @@
         scaled (scale* (/ 1.0 (Math/sqrt d)) scores)
         weights (softmax* scaled)]
     (matmul* weights V)))
+
+(defn multi-head-attention*
+  "Differentiable multi-head scaled dot-product attention matching
+  `num.tensor/multi-head-attention`. Q is `[seqQ d-model]`, K/V are
+  `[seqK d-model]`; `num-heads` evenly divides d-model."
+  [Q K V num-heads]
+  (let [[seq-q d-model] (:shape (:data Q))
+        [seq-k k-d-model] (:shape (:data K))
+        [_ v-d-model] (:shape (:data V))
+        heads (long num-heads)]
+    (when-not (and (pos? heads)
+                   (= d-model k-d-model v-d-model)
+                   (zero? (mod (long d-model) heads)))
+      (throw (ex-info "num.autograd/multi-head-attention*: incompatible dimensions"
+                      {:q-shape (:shape (:data Q))
+                       :k-shape (:shape (:data K))
+                       :v-shape (:shape (:data V))
+                       :num-heads heads})))
+    (let [d-head (quot (long d-model) heads)
+          split-heads (fn [x seq-len]
+                        (transpose* (reshape* x [seq-len heads d-head]) [1 0 2]))
+          qh (split-heads Q seq-q)
+          kh (split-heads K seq-k)
+          vh (split-heads V seq-k)
+          scores (matmul* qh (transpose* kh [0 2 1]))
+          weights (softmax* (scale* (/ 1.0 (Math/sqrt d-head)) scores))
+          heads-out (matmul* weights vh)]
+      (reshape* (transpose* heads-out [1 0 2]) [seq-q d-model]))))
 (defn- pair-option [value]
   (mapv long (if (sequential? value) value [value value])))
 
