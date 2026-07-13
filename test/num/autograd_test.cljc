@@ -453,6 +453,30 @@
                                (arr/->vec numeric) 1.0e-4)
               label))))))
 
+(deftest rotary-embedding-gradient-matches-finite-differences
+  (testing "batched two-head RoPE VJP is the inverse orthogonal rotation"
+    (let [xd (arr/from-vec backend
+                           [0.2 -0.4 0.7 1.1, -0.3 0.8 1.4 -0.9,
+                            0.1 0.5 -0.2 0.6, 0.9 -0.7 0.3 -0.1]
+                           [2 2 4])
+          target (arr/from-vec backend (repeat 16 0.15) [2 2 4])
+          opts {:theta 10000.0 :position-offset 3}
+          loss-of (fn [input]
+                    (let [[loss _]
+                          (ag/with-tape
+                            (ag/mse-loss*
+                             (ag/rotary-embedding* (ag/value input) 2 opts) target))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd)
+                  loss (ag/mse-loss* (ag/rotary-embedding* x 2 opts) target)]
+              {:loss loss :x x}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (let [numeric (numerical-grad loss-of xd 1.0e-5)]
+        (is (approx-vec-tol? (arr/->vec @(:grad (:x result)))
+                             (arr/->vec numeric) 1.0e-4))))))
+
 (deftest upsample-cat-skip-gradients-match-finite-differences
   (testing "a branched UNet-style upsample + channel skip concatenation graph
             propagates gradients into both source tensors"

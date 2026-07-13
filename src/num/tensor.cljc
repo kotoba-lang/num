@@ -1077,6 +1077,67 @@
                     (range rows))
             shape dtype)))))))
 
+(defn rotary-embedding
+  "Apply Llama-style rotary position embedding independently inside each
+  attention head. Accepts `[sequence embed]` or `[batch sequence embed]`.
+  Options: `:theta` (default 10000), `:position-offset`, and internal
+  `:inverse?` for the exact transpose/VJP rotation."
+  ([input num-heads] (rotary-embedding input num-heads {}))
+  ([input num-heads {:keys [theta position-offset inverse?]
+                     :or {theta 10000.0 position-offset 0 inverse? false}}]
+   (let [shape (vec (:shape input)) rank (count shape)
+         [batch sequence embed] (case rank
+                                  2 [1 (first shape) (second shape)]
+                                  3 shape
+                                  nil)
+         heads (long num-heads)]
+     (when-not (and batch (pos? batch) (pos? sequence) (pos? embed)
+                    (pos? heads) (zero? (mod embed heads))
+                    (even? (quot embed heads))
+                    (pos? theta) (not (neg? position-offset)))
+       (throw (ex-info "rotary embedding requires rank 2/3, divisible heads, and even head dim"
+                       {:shape shape :heads heads :theta theta
+                        :position-offset position-offset})))
+     (let [head-dim (quot embed heads)
+           backend (:backend input) dtype (array-dtype input)
+           params {:batch batch :sequence sequence :embed embed :heads heads
+                   :head-dim head-dim :position-offset (long position-offset)
+                   :theta (double theta) :direction (if inverse? -1.0 1.0)}]
+       (cond
+         (and (= dtype :f32) (satisfies? p/ITensorBackend backend))
+         (assoc (arr/->NDArray backend
+                               (p/-rotary-embedding backend (:handle input) params)
+                               shape) :dtype :f32)
+
+         (and (not= dtype :f32) (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray backend
+                               (p/-rotary-embedding-dtype backend (:handle input)
+                                                          params dtype)
+                               shape) :dtype dtype)
+
+         :else
+         (let [xs (vec (arr/->vec input)) half (quot head-dim 2)
+               direction (:direction params)]
+           (arr/from-vec
+            backend
+            (mapv (fn [i]
+                    (let [feature (mod i embed)
+                          local (mod feature head-dim)
+                          second-half? (>= local half)
+                          frequency-index (if second-half? (- local half) local)
+                          pair-local (if second-half? (- local half) (+ local half))
+                          pair (+ (- i local) pair-local)
+                          position (+ (mod (quot i embed) sequence) position-offset)
+                          angle (* direction position
+                                   (Math/pow theta (/ (* -2.0 frequency-index)
+                                                      head-dim)))
+                          c (Math/cos angle) s (Math/sin angle)]
+                      (if second-half?
+                        (+ (* (nth xs i) c) (* (nth xs pair) s))
+                        (- (* (nth xs i) c) (* (nth xs pair) s)))))
+                  (range (arr/nelems shape)))
+            shape dtype)))))))
+
 (defn upsample-nearest2d
   "Nearest-neighbor NCHW upsampling by an integer scalar or `[scale-h scale-w]`.
   ITensorBackend implementations execute it device-native."

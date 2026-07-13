@@ -678,6 +678,18 @@
                               (arr/from-vec (:backend weight-data) (vec dw)
                                             (:shape weight-data))))))))))
 
+(defn rotary-embedding*
+  "Differentiable RoPE. Since each pair is an orthogonal rotation, its VJP is
+  the same kernel with the angle sign reversed."
+  ([x num-heads] (rotary-embedding* x num-heads {}))
+  ([x num-heads opts]
+   (node (t/rotary-embedding (:data x) num-heads opts) [x]
+         (fn [self]
+           (when-let [g @(:grad self)]
+             (accumulate! x
+                          (t/rotary-embedding g num-heads
+                                              (assoc opts :inverse? true))))))))
+
 (defn cat*
   "Differentiable `num.tensor/cat`. Backward slices the upstream gradient
   along the concatenation axis and accumulates one contiguous gradient per

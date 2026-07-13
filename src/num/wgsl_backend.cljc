@@ -178,6 +178,17 @@
                     (uni dev [(double eps)])]
                    [rows 1 1])
       output))
+  (-rotary-embedding [_ input-h {:keys [batch sequence embed heads head-dim
+                                         position-offset theta direction]}]
+    (let [total (* batch sequence embed)
+          output (w/-create-buffer dev total :storage)]
+      (w/-dispatch dev (get-pipeline dev pipes :rotary-embedding)
+                   [input-h output
+                    (uni dev (u32-tag [batch sequence embed heads head-dim
+                                       position-offset 0 0]))
+                    (uni dev [(double theta)]) (uni dev [(double direction)])]
+                   [(ceil-div total 64) 1 1])
+      output))
   (-upsample-nearest2d [_ input-h {:keys [n c h width oh ow scale-h scale-w]}]
     (let [total (* n c oh ow)
           output (w/-create-buffer dev total :storage)

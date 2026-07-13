@@ -40,6 +40,8 @@
         rms-weight-values [0.9 1.1]
         cpu-rmsnorm (tensor/rms-norm-last
                      cpu-a (arr/from-vec cpu-backend rms-weight-values [2] :f16))
+        rope-opts {:position-offset 2}
+        cpu-rope (tensor/rotary-embedding cpu-a 1 rope-opts)
         expected [(arr/->vec (num/add cpu-a cpu-b))
                   (arr/->vec (num/silu cpu-a))
                   (arr/->vec (num/sigmoid cpu-a))
@@ -50,7 +52,8 @@
                   (arr/->vec cpu-norm)
                   (arr/->vec cpu-layernorm)
                   (arr/->vec cpu-embedding)
-                  (arr/->vec cpu-rmsnorm)]]
+                  (arr/->vec cpu-rmsnorm)
+                  (arr/->vec cpu-rope)]]
     (-> (gpu/request-device)
         (.then
          (fn [device-result]
@@ -76,16 +79,17 @@
                             (arr/from-vec backend embedding-weights [3 2] :f16))
                  rmsnorm (tensor/rms-norm-last
                           a (arr/from-vec backend rms-weight-values [2] :f16))
+                 rope (tensor/rotary-embedding a 1 rope-opts)
                  outputs [(num/add a b) (num/silu a) (num/sigmoid a) (num/tanh a)
                           (num/gelu a)
-                          (num/matmul a b) conv norm layernorm embedding rmsnorm]]
+                          (num/matmul a b) conv norm layernorm embedding rmsnorm rope]]
              (println "adapter:" (or (gpu/adapter-description device-result) "unknown"))
              (println "f16 physical bytes:" (.-size (:handle a)))
              (.then
               (js/Promise.all (into-array (map arr/->vec (into [a] outputs))))
               (fn [actual]
                 (let [input-values (vec (aget actual 0))
-                      actual-values (mapv #(vec (aget actual %)) (range 1 12))
+                      actual-values (mapv #(vec (aget actual %)) (range 1 13))
                       _ (println "uploaded:" input-values)
                       checks [(= 8 (.-size (:handle a)))
                               (approx-vec? (nth expected 0) (nth actual-values 0) 0.002)
@@ -98,7 +102,8 @@
                               (approx-vec? (nth expected 7) (nth actual-values 7) 0.03)
                               (approx-vec? (nth expected 8) (nth actual-values 8) 0.01)
                               (approx-vec? (nth expected 9) (nth actual-values 9) 0.002)
-                              (approx-vec? (nth expected 10) (nth actual-values 10) 0.01)]
+                              (approx-vec? (nth expected 10) (nth actual-values 10) 0.01)
+                              (approx-vec? (nth expected 11) (nth actual-values 11) 0.002)]
                       passed (count (filter true? checks))]
                   (println (str "Metal f16: " passed "/" (count checks) " passed"))
                   (when-not (= passed (count checks))

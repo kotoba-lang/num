@@ -356,6 +356,22 @@
                          (wb/uni dev [(double eps)])]
                         [rows 1 1])
            output))
+       (-rotary-embedding-dtype
+         [_ input-h {:keys [batch sequence embed heads head-dim position-offset
+                            theta direction]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RoPE supports f16 only" {:dtype dtype*})))
+         (let [total (* batch sequence embed)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rotary-embedding-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch sequence embed heads head-dim
+                                       position-offset 0 0]))
+                         (wb/uni dev [(double theta)])
+                         (wb/uni dev [(double direction)])]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
 
        p/ITensorBackend
        (-conv2d-nchw [_ input-h weight-h bias-h
@@ -407,6 +423,20 @@
                          (wb/uni dev (wb/u32-tag [rows dim 0 0]))
                          (wb/uni dev [(double eps)])]
                         [rows 1 1])
+           output))
+       (-rotary-embedding
+         [_ input-h {:keys [batch sequence embed heads head-dim position-offset
+                            theta direction]}]
+         (let [total (* batch sequence embed)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rotary-embedding)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch sequence embed heads head-dim
+                                       position-offset 0 0]))
+                         (wb/uni dev [(double theta)])
+                         (wb/uni dev [(double direction)])]
+                        [(wb/ceil-div total 64) 1 1])
            output))
        (-upsample-nearest2d [_ input-h
                              {:keys [n c h width oh ow scale-h scale-w]}]

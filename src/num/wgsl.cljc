@@ -1489,6 +1489,70 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   }
 }")
 
+(def rotary-embedding-wgsl
+  "Llama half-rotation RoPE over `[batch, sequence, embedding]`."
+  "
+struct Params { batch: u32, sequence: u32, embed: u32, heads: u32,
+                head_dim: u32, position_offset: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@group(0) @binding(3) var<uniform> theta: f32;
+@group(0) @binding(4) var<uniform> direction: f32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; let total = p.batch * p.sequence * p.embed;
+  if (i >= total) { return; }
+  let feature = i % p.embed;
+  let local = feature % p.head_dim;
+  let half = p.head_dim / 2u;
+  let pair_local = select(local + half, local - half, local >= half);
+  let pair = i - local + pair_local;
+  let frequency_index = select(local, local - half, local >= half);
+  let position = (i / p.embed) % p.sequence + p.position_offset;
+  let angle = direction * f32(position) *
+              pow(theta, -2.0 * f32(frequency_index) / f32(p.head_dim));
+  let c = cos(angle); let s = sin(angle);
+  output[i] = select(input[i] * c - input[pair] * s,
+                     input[i] * c + input[pair] * s, local >= half);
+}")
+
+(def rotary-embedding-f16-wgsl
+  "Packed f16 RoPE with f32 trigonometric evaluation."
+  "
+struct Params { batch: u32, sequence: u32, embed: u32, heads: u32,
+                head_dim: u32, position_offset: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@group(0) @binding(3) var<uniform> theta: f32;
+@group(0) @binding(4) var<uniform> direction: f32;
+fn load(i: u32) -> f32 {
+  let pair = unpack2x16float(input[i / 2u]);
+  return select(pair.x, pair.y, i % 2u == 1u);
+}
+fn rotate(i: u32) -> f32 {
+  let feature = i % p.embed; let local = feature % p.head_dim;
+  let half = p.head_dim / 2u;
+  let pair_local = select(local + half, local - half, local >= half);
+  let pair = i - local + pair_local;
+  let frequency_index = select(local, local - half, local >= half);
+  let position = (i / p.embed) % p.sequence + p.position_offset;
+  let angle = direction * f32(position) *
+              pow(theta, -2.0 * f32(frequency_index) / f32(p.head_dim));
+  let c = cos(angle); let s = sin(angle);
+  return select(load(i) * c - load(pair) * s,
+                load(i) * c + load(pair) * s, local >= half);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x; let base = word * 2u;
+  let total = p.batch * p.sequence * p.embed;
+  if (base >= total) { return; }
+  let second = select(rotate(base + 1u), 0.0, base + 1u >= total);
+  output[word] = pack2x16float(vec2<f32>(rotate(base), second));
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -1506,6 +1570,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
    :group-norm-nchw group-norm-nchw-wgsl
    :embedding embedding-wgsl
    :rms-norm rms-norm-wgsl
+   :rotary-embedding rotary-embedding-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
@@ -1528,6 +1593,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
    :group-norm-nchw-f16 group-norm-nchw-f16-wgsl
    :embedding-f16 embedding-f16-wgsl
    :rms-norm-f16 rms-norm-f16-wgsl
+   :rotary-embedding-f16 rotary-embedding-f16-wgsl
    :spmv   spmv-csr-wgsl})
 
 ;; ---------------------------------------------------------------------------

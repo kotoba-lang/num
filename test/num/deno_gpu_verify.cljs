@@ -75,6 +75,12 @@
                      (t/rms-norm-last c
                                       (arr/from-vec cpu-b rms-weight-values [4])
                                       1.0e-5))
+        rope-values [0.2 -0.4 0.7 1.1, -0.3 0.8 1.4 -0.9,
+                     0.1 0.5 -0.2 0.6, 0.9 -0.7 0.3 -0.1]
+        rope-opts {:theta 10000.0 :position-offset 3}
+        exp-rope (arr/->vec
+                  (t/rotary-embedding
+                   (arr/from-vec cpu-b rope-values [2 2 4]) 2 rope-opts))
         A (arr/from-vec cpu-b [1 2 3 4] [2 2])
         xv (arr/from-vec cpu-b [1 1] [2])
         B (arr/from-vec cpu-b [5 6 7 8] [2 2])
@@ -240,6 +246,9 @@
                  rmsnorm-out
                  (t/rms-norm-last cg
                                   (arr/from-vec gpu rms-weight-values [4]) 1.0e-5)
+                 rope-out
+                 (t/rotary-embedding
+                  (arr/from-vec gpu rope-values [2 2 4]) 2 rope-opts)
                  bias-add-out (t/add (arr/from-vec gpu bias-input-values [2 3])
                                      (arr/from-vec gpu bias-values [3]))
                  mha-out (t/multi-head-attention
@@ -309,6 +318,8 @@
                    (fn [g] (contract/approx-vec? g exp-embedding))]
                   ["rmsnorm-last" (->p (arr/->vec rmsnorm-out))
                    (fn [g] (contract/approx-vec? g exp-rmsnorm))]
+                  ["rotary-embedding" (->p (arr/->vec rope-out))
+                   (fn [g] (contract/approx-vec? g exp-rope))]
                   ["conv2d-nchw" (->p (arr/->vec conv-out))                    (fn [g] (contract/approx-vec? g exp-conv))]
                   ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]
                   ["conv2d-output-channel-4" (->p (arr/->vec oc4-out))
