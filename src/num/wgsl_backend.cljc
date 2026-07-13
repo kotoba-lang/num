@@ -161,7 +161,7 @@
                                        :q8-0 :q8-0-matmul} quant-type))
                    [input-h weight-h output
                     (uni dev (u32-tag [m k n blocks-per-row]))]
-                   [(ceil-div (* m n) 64) 1 1])
+                   [(* m n) 1 1])
       output))
   (-quantized-embedding [_ indices-h table-h
                          {:keys [quant-type rows dim count blocks-per-row total]}]

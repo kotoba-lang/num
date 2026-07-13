@@ -19,7 +19,9 @@
                 :add-last-axis-bias :multi-head-attention
                 :multi-head-attention-backward :transpose-2d :bias-gradient
                 :mse-loss :mse-gradient :sgd-step :adamw-step
-                :unscale-gradient :spmv]]
+                :unscale-gradient :spmv
+                :q4-k-matmul :q6-k-matmul :q8-0-matmul
+                :q4-k-embedding :q6-k-embedding :q8-0-embedding]]
       (is (string? (get w/shaders op)) (str "missing shader: " op))
       (is (re-find #"@compute" (get w/shaders op)) (str op " is not a compute shader"))))
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"
@@ -30,6 +32,13 @@
     (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"var sum: f32" (:gemm-f16 w/shaders)))))
+
+(deftest quantized-matmul-parallelizes-k-with-workgroup-reduction
+  (doseq [op [:q4-k-matmul :q6-k-matmul :q8-0-matmul]
+          :let [shader (get w/shaders op)]]
+    (is (re-find #"var<workgroup> partial" shader))
+    (is (re-find #"inner = inner \+ 64u" shader))
+    (is (re-find #"workgroupBarrier" shader))))
 
 (deftest attention-backward-shader-covers-all-three-gradients
   (let [shader (:multi-head-attention-backward w/shaders)]

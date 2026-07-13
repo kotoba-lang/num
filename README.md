@@ -296,6 +296,22 @@ clojure -M:deno-quantized-verify && \
 #           packed embedding CPU/Metal parity: passed
 ```
 
+Decode-token GEMM uses one 64-lane workgroup per output, splitting the K axis
+and reducing in workgroup memory. The reproducible 1024×1024 Apple M4 benchmark
+forces readback for every iteration (so it measures completion, not submission):
+
+```sh
+clojure -M:deno-quantized-benchmark && \
+  deno run --allow-all target/deno-quantized-benchmark.cjs
+# Q4_K 589,824 bytes vs dense f32 4,194,304 bytes (7.11x smaller)
+# cold: Q4_K 25.593 ms, dense 17.936 ms (pipeline compilation included)
+# warm: Q4_K 15.136 ms/op, dense 16.369 ms/op
+```
+
+These numbers are a deterministic kernel fixture, not a whole-model tokens/sec
+claim; full model loading, sampling, and long-context cache traffic remain
+separate costs.
+
 `num.deno-gpu` promotes `verify/metal_contract.js`'s raw JS harness into a REAL
 `num.wgsl/IGpuDevice` + `num.protocol/IBackend` implementation — `num.core`'s ops
 (`axpy!`/`scal!`/`add`/`sub`/`mul`/`div`/`sum`/`amax`/`amin`/`dot`/`nrm2`/`matvec`/

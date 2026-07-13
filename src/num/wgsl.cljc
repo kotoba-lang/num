@@ -1627,15 +1627,22 @@ fn value_at(row: u32, column: u32) -> f32 {
   let quant = select(packed & 15u, packed >> 4u, subblock % 2u == 1u);
   return dm.x * f32(sm.x) * f32(quant) - dm.y * f32(sm.y);
 }
+var<workgroup> partial: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let index = gid.x; if (index >= p.m * p.n) { return; }
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid3: vec3<u32>) {
+  let index = wid.x; let lid = lid3.x;
   let row = index / p.n; let column = index % p.n;
   var sum: f32 = 0.0;
-  for (var inner: u32 = 0u; inner < p.k; inner = inner + 1u) {
+  for (var inner: u32 = lid; inner < p.k; inner = inner + 64u) {
     sum = sum + input[row * p.k + inner] * value_at(column, inner);
   }
-  output[index] = sum;
+  partial[lid] = sum; workgroupBarrier();
+  for (var stride: u32 = 32u; stride > 0u; stride = stride / 2u) {
+    if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+    workgroupBarrier();
+  }
+  if (lid == 0u) { output[index] = partial[0]; }
 }")
 
 (def q6-k-matmul-wgsl
@@ -1668,15 +1675,22 @@ fn value_at(row: u32, column: u32) -> f32 {
   let d = unpack2x16float(d_bits).x;
   return d * f32(scale * quant);
 }
+var<workgroup> partial: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let index = gid.x; if (index >= p.m * p.n) { return; }
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid3: vec3<u32>) {
+  let index = wid.x; let lid = lid3.x;
   let row = index / p.n; let column = index % p.n;
   var sum: f32 = 0.0;
-  for (var inner: u32 = 0u; inner < p.k; inner = inner + 1u) {
+  for (var inner: u32 = lid; inner < p.k; inner = inner + 64u) {
     sum = sum + input[row * p.k + inner] * value_at(column, inner);
   }
-  output[index] = sum;
+  partial[lid] = sum; workgroupBarrier();
+  for (var stride: u32 = 32u; stride > 0u; stride = stride / 2u) {
+    if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+    workgroupBarrier();
+  }
+  if (lid == 0u) { output[index] = partial[0]; }
 }")
 
 (def q8-0-matmul-wgsl
@@ -1699,15 +1713,22 @@ fn value_at(row: u32, column: u32) -> f32 {
   let quant = select(i32(raw), i32(raw) - 256, raw >= 128u);
   return d * f32(quant);
 }
+var<workgroup> partial: array<f32, 64>;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let index = gid.x; if (index >= p.m * p.n) { return; }
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid3: vec3<u32>) {
+  let index = wid.x; let lid = lid3.x;
   let row = index / p.n; let column = index % p.n;
   var sum: f32 = 0.0;
-  for (var inner: u32 = 0u; inner < p.k; inner = inner + 1u) {
+  for (var inner: u32 = lid; inner < p.k; inner = inner + 64u) {
     sum = sum + input[row * p.k + inner] * value_at(column, inner);
   }
-  output[index] = sum;
+  partial[lid] = sum; workgroupBarrier();
+  for (var stride: u32 = 32u; stride > 0u; stride = stride / 2u) {
+    if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+    workgroupBarrier();
+  }
+  if (lid == 0u) { output[index] = partial[0]; }
 }")
 
 (defn- packed-embedding-wgsl [value-function]
