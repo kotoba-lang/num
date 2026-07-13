@@ -75,11 +75,13 @@
                 v (project :vw :vb)
                 attention (ag/multi-head-attention* q k v 2)
                 out (ag/add-bias* (ag/matmul* attention (:ow params))
-                                  (:ob params))]
-            {:x x :params params :out out}))]
-    (ag/backward! (:out graph)
-                  (arr/from-vec backend grad-output-values [2 4]) tape)
-    (merge {:projected-out (:data (:out graph))
+                                  (:ob params))
+                target (arr/from-vec backend grad-output-values [2 4])
+                loss (ag/mse-loss* out target)]
+            {:x x :params params :out out :loss loss}))]
+    (ag/backward! (:loss graph) (arr/from-vec backend [1.0] []) tape)
+    (merge {:projected-loss (:data (:loss graph))
+            :projected-out (:data (:out graph))
             :projected-input @(:grad (:x graph))}
            (into {}
                  (map (fn [[param-name parameter]]

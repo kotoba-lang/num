@@ -130,18 +130,44 @@
   `target` is a plain NDArray, not a Value — nothing needs its gradient.
   dL/dpred = 2*(pred - target) / N."
   [pred target]
-  (let [diff (t/sub (:data pred) target)
-        n (double (arr/nelems (:shape diff)))
-        loss-val (if (= :f32 (or (:dtype diff) :f32))
-                   (/ (nm/sum (nm/mul diff diff)) n)
-                   (/ (reduce + (map #(* % %) (arr/->vec diff))) n))]
-    (node (arr/from-vec (:backend (:data pred)) [loss-val] [])
-          [pred]
-          (fn [self]
-            (when-let [g @(:grad self)]
-              (let [scale (* 2.0 (arr/->scalar g) (/ 1.0 n))
-                    diff-copy (arr/from-vec (:backend diff) (arr/->vec diff) (:shape diff))]
-                (accumulate! pred (nm/scal! scale diff-copy))))))))
+  (let [prediction (:data pred)
+        backend (:backend prediction)
+        shape (:shape prediction)
+        count (arr/nelems shape)]
+    (when-not (= shape (:shape target))
+      (throw (ex-info "num.autograd/mse-loss*: target shape must match prediction"
+                      {:prediction shape :target (:shape target)})))
+    (if (and (= backend (:backend target))
+             (= :f32 (:dtype prediction :f32) (:dtype target :f32))
+             (satisfies? p/ITensorBackend backend))
+      (node (assoc (arr/->NDArray
+                    backend
+                    (p/-mse-loss backend (:handle prediction) (:handle target)
+                                 {:count count})
+                    []) :dtype :f32)
+            [pred]
+            (fn [self]
+              (when-let [g @(:grad self)]
+                (accumulate!
+                 pred
+                 (assoc (arr/->NDArray
+                         backend
+                         (p/-mse-gradient backend (:handle prediction)
+                                          (:handle target) (:handle g)
+                                          {:count count})
+                         shape) :dtype :f32)))))
+      (let [diff (t/sub prediction target)
+            n (double count)
+            loss-val (if (= :f32 (or (:dtype diff) :f32))
+                       (/ (nm/sum (nm/mul diff diff)) n)
+                       (/ (reduce + (map #(* % %) (arr/->vec diff))) n))]
+        (node (arr/from-vec backend [loss-val] [])
+              [pred]
+              (fn [self]
+                (when-let [g @(:grad self)]
+                  (let [scale (* 2.0 (arr/->scalar g) (/ 1.0 n))
+                        diff-copy (arr/from-vec backend (arr/->vec diff) shape)]
+                    (accumulate! pred (nm/scal! scale diff-copy))))))))))
 
 ;; --- conv2d (2026-07-13 "raise the maturity" loop) --------------------------
 ;; num.tensor/conv2d bundles im2col + matmul + reshape into one opaque

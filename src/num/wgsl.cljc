@@ -717,17 +717,46 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   matrix[i] = matrix[i] + bias[i % dims.y];
 }")
 
-(def mse-gradient-wgsl
-  "Elementwise derivative 2*(prediction-target)/N for mean squared error."
+(def mse-loss-wgsl
+  "Mean squared error reduced into one device-resident scalar."
   "
 @group(0) @binding(0) var<storage, read> prediction: array<f32>;
 @group(0) @binding(1) var<storage, read> expected: array<f32>;
-@group(0) @binding(2) var<storage, read_write> gradient: array<f32>;
+@group(0) @binding(2) var<storage, read_write> loss: array<f32>;
 @group(0) @binding(3) var<uniform> count: u32;
+var<workgroup> partial: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid3: vec3<u32>) {
+  let lid = lid3.x;
+  var sum: f32 = 0.0;
+  for (var i: u32 = lid; i < count; i = i + 64u) {
+    let difference = prediction[i] - expected[i];
+    sum = sum + difference * difference;
+  }
+  partial[lid] = sum;
+  workgroupBarrier();
+  var stride: u32 = 32u;
+  loop {
+    if (stride == 0u) { break; }
+    if (lid < stride) { partial[lid] = partial[lid] + partial[lid + stride]; }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+  if (lid == 0u) { loss[0] = partial[0] / f32(count); }
+}")
+
+(def mse-gradient-wgsl
+  "MSE vector-Jacobian product, including the upstream scalar seed."
+  "
+@group(0) @binding(0) var<storage, read> prediction: array<f32>;
+@group(0) @binding(1) var<storage, read> expected: array<f32>;
+@group(0) @binding(2) var<storage, read> upstream: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gradient: array<f32>;
+@group(0) @binding(4) var<uniform> count: u32;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x; if (i >= count) { return; }
-  gradient[i] = 2.0 * (prediction[i] - expected[i]) / f32(count);
+  gradient[i] = upstream[0] * 2.0 * (prediction[i] - expected[i]) / f32(count);
 }")
 
 (def relu-backward-wgsl
@@ -1130,6 +1159,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :add-last-axis-bias add-last-axis-bias-wgsl
    :transpose-2d transpose-2d-wgsl
    :bias-gradient bias-gradient-wgsl
+   :mse-loss mse-loss-wgsl
+   :mse-gradient mse-gradient-wgsl
    :multi-head-attention multi-head-attention-wgsl
    :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl

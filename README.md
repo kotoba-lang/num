@@ -199,8 +199,10 @@ recomputes the stable softmax on-device and returns gradients for Q, K, and V;
 forward plus all three gradients against the independently decomposed CPU autograd
 graph on real Apple M4 Metal. A second graph adds learned Q/K/V/output matrices and
 all four biases, exercising device-native GEMM, 2-D transpose, row reduction, fused
-attention backward, and shared-input gradient accumulation. Together, output and
-all gradients pass 14/14 checks without intermediate host readback.
+attention backward, shared-input gradient accumulation, and a device-resident MSE
+loss reduction/VJP. Together, loss, output, and all gradients pass 15/15 checks
+without intermediate host readback. Only the final loss/verification values are
+downloaded.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque

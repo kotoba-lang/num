@@ -387,6 +387,20 @@
                          (wb/uni dev (wb/u32-tag [rows cols]))]
                         [(wb/ceil-div cols 64) 1 1])
            output))
+       (-mse-loss [_ prediction-h target-h {:keys [count]}]
+         (let [loss (w/-create-buffer dev 1 :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :mse-loss)
+                        [prediction-h target-h loss
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [1 1 1])
+           loss))
+       (-mse-gradient [_ prediction-h target-h upstream-h {:keys [count]}]
+         (let [gradient (w/-create-buffer dev count :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :mse-gradient)
+                        [prediction-h target-h upstream-h gradient
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [(wb/ceil-div count 64) 1 1])
+           gradient))
        (-multi-head-attention [_ query-h key-h value-h
                                {:keys [seq-q seq-k d-model heads head-dim total]}]
          (let [output (w/-create-buffer dev total :storage)]

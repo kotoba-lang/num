@@ -84,6 +84,10 @@
     "Out-of-place transpose of a contiguous f32 matrix.")
   (-sum-rows [b input-h params]
     "Reduce a contiguous f32 matrix over its row axis.")
+  (-mse-loss [b prediction-h target-h params]
+    "Mean squared error as a device-resident scalar handle.")
+  (-mse-gradient [b prediction-h target-h upstream-h params]
+    "MSE vector-Jacobian product as a device-resident tensor handle.")
   (-multi-head-attention [b query-h key-h value-h params]
     "Fused unmasked scaled dot-product attention over rank-2 Q/K/V.")
   (-multi-head-attention-backward [b query-h key-h value-h grad-output-h params]
