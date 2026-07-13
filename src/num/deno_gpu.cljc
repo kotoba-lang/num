@@ -822,6 +822,85 @@
          (arr/release! packed)
          (assoc (arr/->NDArray backend output (vec shape)) :dtype :f32)))
 
+     (defn paged-kv-write!
+       "Write one K/V token into `[physical-block,offset]` without host readback."
+       [key-pool value-pool key value block offset]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             backend (:backend key-pool)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (= kv-width (arr/nelems (:shape key)))
+                        (= kv-width (arr/nelems (:shape value)))
+                        (<= 0 block) (< block blocks)
+                        (<= 0 offset) (< offset block-size))
+           (throw (ex-info "invalid paged KV write shapes or address"
+                           {:pool (:shape key-pool) :key (:shape key)
+                            :value (:shape value) :block block :offset offset})))
+         (let [dev (.-dev backend)]
+           (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :paged-kv-write)
+                        [(:handle key) (:handle value)
+                         (:handle key-pool) (:handle value-pool)
+                         (wb/uni dev (wb/u32-tag
+                                      [block offset block-size kv-width]))]
+                        [(wb/ceil-div kv-width 64) 1 1]))
+         nil))
+
+     (defn paged-kv-copy-block!
+       "Copy `tokens` used positions from one physical block to another."
+       [key-pool value-pool source destination tokens]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             backend (:backend key-pool)
+             total (* tokens kv-width)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (<= 0 source) (< source blocks)
+                        (<= 0 destination) (< destination blocks)
+                        (not= source destination)
+                        (pos? tokens) (<= tokens block-size))
+           (throw (ex-info "invalid paged KV block copy"
+                           {:pool (:shape key-pool) :source source
+                            :destination destination :tokens tokens})))
+         (let [dev (.-dev backend)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-kv-copy-block)
+                        [(:handle key-pool) (:handle value-pool)
+                         (wb/uni dev (wb/u32-tag
+                                      [source destination tokens block-size
+                                       kv-width total 0 0]))]
+                        [(wb/ceil-div total 64) 1 1]))
+         nil))
+
+     (defn paged-gqa-attention
+       "One-token GQA decode over physical K/V pools and a logical block table."
+       [query key-pool value-pool block-table length heads kv-heads]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             model (arr/nelems (:shape query))
+             head-dim (quot model heads)
+             required-blocks (quot (+ length block-size -1) block-size)
+             backend (:backend query)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (pos? length) (<= length (* blocks block-size))
+                        (pos? heads) (pos? kv-heads)
+                        (zero? (mod heads kv-heads))
+                        (zero? (mod model heads))
+                        (= kv-width (* kv-heads head-dim))
+                        (<= required-blocks (arr/nelems (:shape block-table))))
+           (throw (ex-info "invalid paged GQA attention shapes"
+                           {:query (:shape query) :pool (:shape key-pool)
+                            :block-table (:shape block-table) :length length
+                            :heads heads :kv-heads kv-heads})))
+         (let [dev (.-dev backend)
+               output (w/-create-buffer dev model :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-gqa-attention)
+                        [(:handle query) (:handle key-pool) (:handle value-pool)
+                         (:handle block-table) output
+                         (wb/uni dev (wb/u32-tag
+                                      [length block-size kv-width heads kv-heads
+                                       head-dim model 0]))]
+                        [(wb/ceil-div model 64) 1 1])
+           (assoc (arr/->NDArray backend output (:shape query)) :dtype :f32))))
+
      (defn gpu-backend
        "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.
        Mirrors num.cpu/cpu-backend's explicit-construction pattern (num has no
@@ -842,4 +921,7 @@
      (defn cast-f16-to-f32 [& _] (throw (ex-info "num.deno-gpu/cast-f16-to-f32 requires a cljs/Deno host." {})))
      (defn upload-f16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-f16-as-f32-byte-view requires a cljs/Deno host." {})))
      (defn upload-bf16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-bf16-as-f32-byte-view requires a cljs/Deno host." {})))
+     (defn paged-kv-write! [& _] (throw (ex-info "num.deno-gpu/paged-kv-write! requires a cljs/Deno host." {})))
+     (defn paged-kv-copy-block! [& _] (throw (ex-info "num.deno-gpu/paged-kv-copy-block! requires a cljs/Deno host." {})))
+     (defn paged-gqa-attention [& _] (throw (ex-info "num.deno-gpu/paged-gqa-attention requires a cljs/Deno host." {})))
      (defn gpu-backend [] (throw (ex-info "num.deno-gpu/gpu-backend requires a cljs/Deno host." {})))))

@@ -229,6 +229,25 @@ eight updated projection tensors plus batched causal+padding output/Q/K/V gradie
 pass 27/27 checks without intermediate host
 readback. Only final verification values are downloaded.
 
+Autoregressive serving can keep K/V in a bounded physical block pool instead
+of one contiguous allocation per sequence. `num.deno-gpu/paged-kv-write!`
+writes one projected token directly to a `[block,offset]` slot;
+`paged-kv-copy-block!` copies only the used prefix when a shared partial block
+becomes copy-on-write; and `paged-gqa-attention` resolves a logical f32 block
+table inside the Metal kernel while performing stable one-token grouped-query
+attention. A live Apple M4 verifier uses the deliberately non-contiguous table
+`[2,0]`, compares its result with ordinary CPU GQA, forks a one-token prefix
+into another physical block, writes a divergent token, checks that result
+independently, and returns every tracked GPU buffer to baseline:
+
+```sh
+clojure -M:deno-paged-kv-verify
+deno run --allow-all target/deno-paged-kv-verify.cjs
+# non-contiguous paged GQA parity: passed
+# prefix COW block-copy parity: passed
+# paged GPU storage release: passed
+```
+
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
 flat contiguous buffer. Except for the native last-axis bias and fused attention

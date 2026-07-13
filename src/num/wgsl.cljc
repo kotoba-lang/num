@@ -2060,6 +2060,95 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[i] = bitcast<f32>(bits);
 }")
 
+(def paged-kv-write-wgsl
+  "Write one projected K/V token into a physical paged-cache slot."
+  "
+struct Params {
+  block: u32, offset: u32, block_size: u32, kv_width: u32,
+}
+@group(0) @binding(0) var<storage, read> key: array<f32>;
+@group(0) @binding(1) var<storage, read> value: array<f32>;
+@group(0) @binding(2) var<storage, read_write> key_pool: array<f32>;
+@group(0) @binding(3) var<storage, read_write> value_pool: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.kv_width) { return; }
+  let destination = ((p.block * p.block_size + p.offset) * p.kv_width) + i;
+  key_pool[destination] = key[i];
+  value_pool[destination] = value[i];
+}")
+
+(def paged-kv-copy-block-wgsl
+  "Copy the used prefix of one physical K/V block for prefix COW."
+  "
+struct Params {
+  source: u32, destination: u32, tokens: u32, block_size: u32,
+  kv_width: u32, total: u32, pad0: u32, pad1: u32,
+}
+@group(0) @binding(0) var<storage, read_write> key_pool: array<f32>;
+@group(0) @binding(1) var<storage, read_write> value_pool: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.total) { return; }
+  let source_index = p.source * p.block_size * p.kv_width + i;
+  let destination_index = p.destination * p.block_size * p.kv_width + i;
+  key_pool[destination_index] = key_pool[source_index];
+  value_pool[destination_index] = value_pool[source_index];
+}")
+
+(def paged-gqa-attention-wgsl
+  "One-token grouped-query attention reading K/V through a physical block table."
+  "
+struct Params {
+  length: u32, block_size: u32, kv_width: u32, heads: u32,
+  kv_heads: u32, head_dim: u32, model: u32, pad0: u32,
+}
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key_pool: array<f32>;
+@group(0) @binding(2) var<storage, read> value_pool: array<f32>;
+// Block IDs are numerically exact f32 values, allowing the ordinary NDArray
+// upload path while the kernel casts each entry to an address index.
+@group(0) @binding(3) var<storage, read> block_table: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> p: Params;
+fn pool_index(token: u32, component: u32) -> u32 {
+  let logical_block = token / p.block_size;
+  let offset = token % p.block_size;
+  let physical_block = u32(block_table[logical_block]);
+  return ((physical_block * p.block_size + offset) * p.kv_width) + component;
+}
+fn score(head: u32, token: u32) -> f32 {
+  let kv_head = head / (p.heads / p.kv_heads);
+  var dot: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    dot = dot + query[head * p.head_dim + d] *
+                key_pool[pool_index(token, kv_head * p.head_dim + d)];
+  }
+  return dot * inverseSqrt(f32(p.head_dim));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let component = gid.x; if (component >= p.model) { return; }
+  let head = component / p.head_dim;
+  let local = component % p.head_dim;
+  let kv_head = head / (p.heads / p.kv_heads);
+  var maximum: f32 = -3.402823e38;
+  for (var token: u32 = 0u; token < p.length; token = token + 1u) {
+    maximum = max(maximum, score(head, token));
+  }
+  var denominator: f32 = 0.0;
+  var weighted: f32 = 0.0;
+  for (var token: u32 = 0u; token < p.length; token = token + 1u) {
+    let weight = exp(score(head, token) - maximum);
+    denominator = denominator + weight;
+    weighted = weighted + weight *
+      value_pool[pool_index(token, kv_head * p.head_dim + local)];
+  }
+  output[component] = weighted / denominator;
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -2089,6 +2178,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :nchw-to-rgb-image nchw-to-rgb-image-wgsl
    :f16-to-f32 f16-to-f32-wgsl
    :bf16-to-f32 bf16-to-f32-wgsl
+   :paged-kv-write paged-kv-write-wgsl
+   :paged-kv-copy-block paged-kv-copy-block-wgsl
+   :paged-gqa-attention paged-gqa-attention-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
    :cat-copy cat-copy-wgsl
