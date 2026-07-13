@@ -57,7 +57,7 @@
     (let [xd (arr/from-vec backend [-2.0 -0.4 0.0 0.7 2.0] [5])
           target (arr/from-vec backend [0.1 -0.2 0.3 0.4 -0.1] [5])]
       (doseq [[label activation]
-              [["sigmoid" ag/sigmoid*] ["tanh" ag/tanh*]]]
+              [["sigmoid" ag/sigmoid*] ["tanh" ag/tanh*] ["gelu" ag/gelu*]]]
         (let [loss-of (fn [input]
                         (let [[loss _]
                               (ag/with-tape

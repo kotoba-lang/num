@@ -216,7 +216,8 @@
                                dev (wb/u32-tag
                                     [({:exp 0 :relu 1 :neg 2 :silu 3
                                        :sigmoid 4 :tanh 5
-                                       :sigmoid-gradient 6 :tanh-gradient 7} op)]))]
+                                       :sigmoid-gradient 6 :tanh-gradient 7
+                                       :gelu 8 :gelu-gradient 9} op)]))]
                         [(wb/ceil-div n 64) 1 1])
            z))
 
@@ -284,7 +285,8 @@
                         [xh output
                          (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3
                                                    :sigmoid 4 :tanh 5
-                                                   :sigmoid-gradient 6 :tanh-gradient 7} op)
+                                                   :sigmoid-gradient 6 :tanh-gradient 7
+                                                   :gelu 8 :gelu-gradient 9} op)
                                                   n 0 0]))]
                         [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
            output))

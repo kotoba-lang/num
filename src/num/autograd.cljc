@@ -131,6 +131,16 @@
             (when-let [g @(:grad self)]
               (accumulate! x (nm/mul g (nm/tanh-gradient y))))))))
 
+(defn gelu*
+  "Differentiable PyTorch-default GELU. The derivative uses the saved input
+  and remains backend-native on GPU backends."
+  [x]
+  (node (nm/gelu (:data x)) [x]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x
+                         (nm/mul g (nm/gelu-gradient (:data x))))))))
+
 (defn softmax*
   "y = softmax(x) along the last axis. Standard softmax-Jacobian-vector
   product: dL/dx_i = y_i * (dL/dy_i - sum_j(dL/dy_j * y_j)) (per row)."

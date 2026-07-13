@@ -177,6 +177,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   shape as ewise-wgsl, one input instead of two — the primitive softmax/attention
   need that the level-1/level-2/level-3 BLAS set doesn't provide."
   "
+fn erf_approx(x: f32) -> f32 {
+  let s = select(1.0, -1.0, x < 0.0);
+  let a = abs(x);
+  let t = 1.0 / (1.0 + 0.3275911 * a);
+  let p = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 +
+          t * (-1.453152027 + t * 1.061405429))));
+  return s * (1.0 - p * exp(-a * a));
+}
+fn gelu_exact(x: f32) -> f32 {
+  return 0.5 * x * (1.0 + erf_approx(x * 0.7071067811865476));
+}
+fn gelu_exact_grad(x: f32) -> f32 {
+  return 0.5 * (1.0 + erf_approx(x * 0.7071067811865476)) +
+         x * 0.3989422804014327 * exp(-0.5 * x * x);
+}
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> z: array<f32>;
 @group(0) @binding(2) var<uniform>             op: u32;
@@ -192,6 +207,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
               case 5u { r = tanh(a); }
               case 6u { r = a * (1.0 - a); }
               case 7u { r = 1.0 - a * a; }
+              case 8u { r = gelu_exact(a); }
+              case 9u { r = gelu_exact_grad(a); }
               default { r = 0.0; } }
   z[i] = r;
 }")
@@ -1168,6 +1185,14 @@ struct Params { op: u32, n: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(0) var<storage, read> x: array<u32>;
 @group(0) @binding(1) var<storage, read_write> z: array<u32>;
 @group(0) @binding(2) var<uniform> p: Params;
+fn erf_approx(x: f32) -> f32 {
+  let s = select(1.0, -1.0, x < 0.0);
+  let a = abs(x);
+  let t = 1.0 / (1.0 + 0.3275911 * a);
+  let q = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 +
+          t * (-1.453152027 + t * 1.061405429))));
+  return s * (1.0 - q * exp(-a * a));
+}
 fn apply(v: f32) -> f32 {
   if (p.op == 0u) { return exp(v); }
   if (p.op == 1u) { return max(v, 0.0); }
@@ -1176,7 +1201,12 @@ fn apply(v: f32) -> f32 {
   if (p.op == 4u) { return 1.0 / (1.0 + exp(-v)); }
   if (p.op == 5u) { return tanh(v); }
   if (p.op == 6u) { return v * (1.0 - v); }
-  return 1.0 - v * v;
+  if (p.op == 7u) { return 1.0 - v * v; }
+  if (p.op == 8u) {
+    return 0.5 * v * (1.0 + erf_approx(v * 0.7071067811865476));
+  }
+  return 0.5 * (1.0 + erf_approx(v * 0.7071067811865476)) +
+         v * 0.3989422804014327 * exp(-0.5 * v * v);
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

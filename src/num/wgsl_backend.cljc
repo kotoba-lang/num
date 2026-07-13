@@ -92,7 +92,8 @@
                    [xh z (uni dev (u32-tag
                                    [({:exp 0 :relu 1 :neg 2 :silu 3
                                       :sigmoid 4 :tanh 5
-                                      :sigmoid-gradient 6 :tanh-gradient 7} op)]))]
+                                      :sigmoid-gradient 6 :tanh-gradient 7
+                                      :gelu 8 :gelu-gradient 9} op)]))]
                    [(ceil-div n 64) 1 1])
       z))
 

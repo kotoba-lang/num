@@ -56,6 +56,8 @@
         exp-tanh (arr/->vec (nm/tanh c))
         exp-sigmoid-gradient (arr/->vec (nm/sigmoid-gradient (nm/sigmoid c)))
         exp-tanh-gradient (arr/->vec (nm/tanh-gradient (nm/tanh c)))
+        exp-gelu (arr/->vec (nm/gelu c))
+        exp-gelu-gradient (arr/->vec (nm/gelu-gradient c))
         A (arr/from-vec cpu-b [1 2 3 4] [2 2])
         xv (arr/from-vec cpu-b [1 1] [2])
         B (arr/from-vec cpu-b [5 6 7 8] [2 2])
@@ -269,6 +271,10 @@
                    (fn [g] (contract/approx-vec? g exp-sigmoid-gradient))]
                   ["tanh-gradient" (->p (arr/->vec (nm/tanh-gradient (nm/tanh cg))))
                    (fn [g] (contract/approx-vec? g exp-tanh-gradient))]
+                  ["gelu" (->p (arr/->vec (nm/gelu cg)))
+                   (fn [g] (contract/approx-vec? g exp-gelu))]
+                  ["gelu-gradient" (->p (arr/->vec (nm/gelu-gradient cg)))
+                   (fn [g] (contract/approx-vec? g exp-gelu-gradient))]
                   ["conv2d-nchw" (->p (arr/->vec conv-out))                    (fn [g] (contract/approx-vec? g exp-conv))]
                   ["conv2d-depthwise" (->p (arr/->vec depthwise-out))          (fn [g] (contract/approx-vec? g exp-depthwise))]
                   ["conv2d-output-channel-4" (->p (arr/->vec oc4-out))

@@ -28,6 +28,26 @@
      :data #?(:clj (short-array encoded)
               :cljs (js/Int16Array. (into-array encoded)))}))
 
+(defn- erf-approx [x]
+  ;; Abramowitz-Stegun 7.1.26, max absolute error about 1.5e-7. Portable
+  ;; arithmetic keeps the JVM and JavaScript reference backends identical.
+  (let [sign (if (neg? x) -1.0 1.0)
+        a (Math/abs (double x))
+        t (/ 1.0 (+ 1.0 (* 0.3275911 a)))
+        h1 (+ -1.453152027 (* t 1.061405429))
+        h2 (+ 1.421413741 (* t h1))
+        h3 (+ -0.284496736 (* t h2))
+        h4 (+ 0.254829592 (* t h3))
+        poly (* t h4)]
+    (* sign (- 1.0 (* poly (Math/exp (- (* a a))))))))
+
+(defn- gelu-value [x]
+  (* 0.5 x (+ 1.0 (erf-approx (/ x 1.4142135623730951)))))
+
+(defn- gelu-gradient-value [x]
+  (+ (* 0.5 (+ 1.0 (erf-approx (/ x 1.4142135623730951))))
+     (* x 0.3989422804014327 (Math/exp (* -0.5 x x)))))
+
 (deftype CpuBackend []
   p/IBackend
   (-backend-name [_] :cpu)
@@ -68,8 +88,10 @@
               :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v)))))
               :sigmoid (fn [v] (/ 1.0 (+ 1.0 (Math/exp (- v)))))
               :tanh #(Math/tanh %)
+              :gelu gelu-value
               :sigmoid-gradient (fn [y] (* y (- 1.0 y)))
-              :tanh-gradient (fn [y] (- 1.0 (* y y))))]
+              :tanh-gradient (fn [y] (- 1.0 (* y y)))
+              :gelu-gradient gelu-gradient-value)]
       (dotimes [i n] (aset z i (double (f (aget x i)))))
       z))
 
@@ -147,8 +169,10 @@
               :silu (fn [v] (/ v (+ 1.0 (Math/exp (- v)))))
               :sigmoid (fn [v] (/ 1.0 (+ 1.0 (Math/exp (- v)))))
               :tanh #(Math/tanh %)
+              :gelu gelu-value
               :sigmoid-gradient (fn [y] (* y (- 1.0 y)))
-              :tanh-gradient (fn [y] (- 1.0 (* y y))))]
+              :tanh-gradient (fn [y] (- 1.0 (* y y)))
+              :gelu-gradient gelu-gradient-value)]
       (typed-handle dtype* (mapv f (take n (typed-values xh))))))
   (-gemm-dtype [_ Ah m k Bh n dtype*]
     (let [A (typed-values Ah) B (typed-values Bh)]
