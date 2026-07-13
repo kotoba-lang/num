@@ -477,6 +477,31 @@
         (is (approx-vec-tol? (arr/->vec @(:grad (:x result)))
                              (arr/->vec numeric) 1.0e-4))))))
 
+(deftest branched-residual-product-gradients-match-finite-differences
+  (testing "a value reused by residual and gated-product branches accumulates both VJPs"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1] [2 2])
+          yd (arr/from-vec backend [0.8 1.1 -0.7 1.3] [2 2])
+          target (arr/from-vec backend [0.1 -0.2 0.3 0.4] [2 2])
+          loss-of (fn [xd' yd']
+                    (let [[loss _]
+                          (ag/with-tape
+                            (let [x (ag/value xd') y (ag/value yd')]
+                              (ag/mse-loss* (ag/add* x (ag/mul* x y)) target)))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) y (ag/value yd)
+                  loss (ag/mse-loss* (ag/add* x (ag/mul* x y)) target)]
+              {:loss loss :x x :y y}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[key data other]
+              [[:x xd yd] [:y yd xd]]]
+        (let [numeric (numerical-grad
+                       #(if (= key :x) (loss-of % other) (loss-of other %))
+                       data 1.0e-5)]
+          (is (approx-vec-tol? (arr/->vec @(:grad (get result key)))
+                               (arr/->vec numeric) 1.0e-4)))))))
+
 (deftest upsample-cat-skip-gradients-match-finite-differences
   (testing "a branched UNet-style upsample + channel skip concatenation graph
             propagates gradients into both source tensors"

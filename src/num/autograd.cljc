@@ -17,10 +17,9 @@
   gradient and replays the tape in REVERSE (creation) order, each node's
   backward-fn reading its own accumulated upstream gradient and pushing
   gradient contributions into its parents' `:grad` atoms. This is correct
-  for the acyclic, single-path sequential graphs a `torch.model/sequential`
-  produces — it does NOT handle branching/shared-subgraph reuse (a value
-  used by two different downstream ops) or control flow, which a general
-  autograd needs and this one deliberately does not attempt."
+  for acyclic tensor graphs, including residual/shared-subgraph branches whose
+  contributions are summed by `accumulate!`. Dynamic control flow and higher-
+  order differentiation remain outside this minimal engine."
   (:require [num.array :as arr]
             [num.core :as nm]
             [num.protocol :as p]
@@ -92,6 +91,24 @@
           (when-let [g @(:grad self)]
             (accumulate! x g)
             (accumulate! b (t/sum g 0))))))
+
+(defn add*
+  "Elementwise addition of equal-shaped Values, including residual branches."
+  [x y]
+  (node (nm/add (:data x) (:data y)) [x y]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x g)
+            (accumulate! y g)))))
+
+(defn mul*
+  "Elementwise multiplication of equal-shaped Values."
+  [x y]
+  (node (nm/mul (:data x) (:data y)) [x y]
+        (fn [self]
+          (when-let [g @(:grad self)]
+            (accumulate! x (nm/mul g (:data y)))
+            (accumulate! y (nm/mul g (:data x)))))))
 
 (defn- relu-grad
   "Elementwise derivative of relu at `x-data`: 1.0 where x>0, else 0.0 (the
