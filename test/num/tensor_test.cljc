@@ -322,6 +322,39 @@
                  (t/conv2d (arr/from-vec backend [1 2 3 4] [2 2])
                            (arr/from-vec backend (range 9) [3 3]))))))
 
+(deftest conv2d-mc-matches-hand-computed
+  (testing "2 input channels, 1 output channel — hand-computed independently
+            of t/conv2d-mc. Channel 0 = [[1 2 3][4 5 6][7 8 9]], channel 1 =
+            all-ones. Kernel channel-0-weights = top-left-pick [[1 0][0 0]],
+            channel-1-weights = sum-all [[1 1][1 1]] (so every output adds a
+            constant +4 on top of channel 0's top-left-pick values):
+            out[0][0]=1+4=5  out[0][1]=2+4=6
+            out[1][0]=4+4=8  out[1][1]=5+4=9"
+    (let [a (arr/from-vec backend (concat (range 1 10) (repeat 9 1)) [2 3 3])
+          k (arr/from-vec backend [1 0 0 0  1 1 1 1] [1 2 2 2])
+          out (t/conv2d-mc a k)]
+      (is (= [1 2 2] (:shape out)))
+      (is (= [5.0 6.0 8.0 9.0] (arr/->vec out)))))
+  (testing "2 output channels — the transpose/reshape back to [C_out oh ow]
+            is exercised (not just a degenerate C_out=1 case). Output
+            channel 1 ignores channel 1 entirely and reads channel 0's
+            bottom-right patch value *2: out[0][0]=5*2=10 out[0][1]=6*2=12
+            out[1][0]=8*2=16 out[1][1]=9*2=18"
+    (let [a (arr/from-vec backend (concat (range 1 10) (repeat 9 1)) [2 3 3])
+          k (arr/from-vec backend [1 0 0 0  1 1 1 1
+                                    0 0 0 2  0 0 0 0] [2 2 2 2])
+          out (t/conv2d-mc a k)]
+      (is (= [2 2 2] (:shape out)))
+      (is (= [5.0 6.0 8.0 9.0 10.0 12.0 16.0 18.0] (arr/->vec out)))))
+  (testing "kernel in-channels mismatch throws"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/conv2d-mc (arr/from-vec backend (range 18) [2 3 3])
+                              (arr/from-vec backend (range 4) [1 1 2 2])))))
+  (testing "kernel larger than input throws"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (t/conv2d-mc (arr/from-vec backend (range 8) [2 2 2])
+                              (arr/from-vec backend (range 12) [1 2 3 3]))))))
+
 (deftest attention-matches-hand-computed
   (testing "zero queries (no signal) produce uniform attention over any K/V"
     (let [Q (arr/from-vec backend [0 0] [2 1])

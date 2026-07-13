@@ -380,6 +380,51 @@
             kflat (reshape kernel [(* kh kw) 1])]
         (reshape (matmul P kflat) [oh ow])))))
 
+;; --- conv2d-mc (multi-channel, 2026-07-13 "raise the maturity" loop) -----------
+
+(defn conv2d-mc
+  "Multi-channel 2-D 'valid' convolution (no padding, stride 1), SINGLE
+  image (no batch dim): `a` is `[C_in H W]`, `kernel` is
+  `[C_out C_in kh kw]` → NDArray `[C_out H-kh+1 W-kw+1]`.
+
+  Generalizes `conv2d` (single-channel) the same im2col+matmul way: each
+  output spatial position's receptive field is flattened ACROSS ALL input
+  channels into one patches-matrix row; the kernel flattens per output
+  channel the same way (`[C_out C_in kh kw]` reshaped to
+  `[C_out C_in*kh*kw]` is zero-copy — the layout already matches row-major).
+  The actual multiply-accumulate still runs through `matmul` (already
+  verified real on Metal). Real diffusion UNets need MANY channels
+  (a first conv is typically 3-4 in, 320+ out) — `conv2d`'s single-channel
+  restriction was the most toy-like limit from ADR-2607131500 Phase 1; this
+  closes it. Still NOT attempted here: batching (multiple images) and
+  padding/stride — `conv2d-mc` is one image, valid-only, stride 1, same as
+  `conv2d`'s own remaining scope fence."
+  [a kernel]
+  (let [[Cin H W] (:shape a) [Cout Cin2 kh kw] (:shape kernel)]
+    (when (not= (long Cin) (long Cin2))
+      (throw (ex-info "num.tensor/conv2d-mc: kernel in-channels ≠ input channels"
+                       {:input-channels Cin :kernel-in-channels Cin2})))
+    (let [oh (inc (- (long H) (long kh))) ow (inc (- (long W) (long kw)))]
+      (when (or (< oh 1) (< ow 1))
+        (throw (ex-info "num.tensor/conv2d-mc: kernel larger than input"
+                         {:input [H W] :kernel [kh kw]})))
+      (let [xs (double-array (arr/->vec a))
+            Cin (long Cin) H (long H) W (long W) kh (long kh) kw (long kw)
+            patch-size (* Cin kh kw)
+            patches (double-array (* oh ow patch-size))]
+        (dotimes [oi oh]
+          (dotimes [oj ow]
+            (let [row (+ (* oi ow) oj)]
+              (dotimes [c Cin]
+                (dotimes [ki kh]
+                  (dotimes [kj kw]
+                    (aset patches (+ (* row patch-size) (* c kh kw) (* ki kw) kj)
+                          (aget xs (+ (* c H W) (* (+ oi ki) W) (+ oj kj))))))))))
+        (let [P (arr/from-vec (:backend a) (vec patches) [(* oh ow) patch-size])
+              Kflat-T (transpose (reshape kernel [Cout patch-size]))  ; [patch-size Cout]
+              out (matmul P Kflat-T)]                                ; [oh*ow Cout]
+          (reshape (transpose out) [Cout oh ow]))))))
+
 ;; --- attention (ADR-2607131500 Phase 1) -----------------------------------------
 
 (defn attention
