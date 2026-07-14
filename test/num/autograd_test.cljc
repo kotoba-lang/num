@@ -357,6 +357,19 @@
               (str label " analytic=" (arr/->vec analytic)
                    " numeric=" (arr/->vec numeric))))))))
 
+(deftest differentiable-cast-restores-input-gradient-dtype
+  (let [input-data (arr/from-vec backend [0.25 -0.5 1.0] [3] :f16)
+        [result tape]
+        (ag/with-tape
+          (let [input (ag/value input-data)
+                output (ag/cast* input :f32)]
+            {:input input :output output}))
+        seed (arr/from-vec backend [1.0 2.0 3.0] [3])]
+    (ag/backward! (:output result) seed tape)
+    (is (= :f32 (:dtype (:data (:output result)))))
+    (is (= :f16 (:dtype @(:grad (:input result)))))
+    (is (= [1.0 2.0 3.0] (arr/->vec @(:grad (:input result)))))))
+
 (deftest groupnorm-silu-gradients-match-finite-differences
   (testing "UNet normalization+activation differentiates NCHW input and both
             affine parameters, including GroupNorm's coupled group reduction"

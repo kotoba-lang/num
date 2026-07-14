@@ -62,6 +62,20 @@
 
 ;; --- ops -------------------------------------------------------------------
 
+(defn cast*
+  "Differentiable physical dtype conversion. Forward materializes `dtype`;
+  backward converts the upstream gradient to the input's storage dtype before
+  accumulation, preserving graph connectivity across autocast boundaries."
+  [x dtype]
+  (let [input-dtype (or (:dtype (:data x)) :f32)]
+    (if (= input-dtype dtype)
+      x
+      (node (arr/cast (:data x) dtype)
+            [x]
+            (fn [self]
+              (when-let [g @(:grad self)]
+                (accumulate! x (arr/cast g input-dtype))))))))
+
 (defn- swap-last-two
   "Transpose the matrix dimensions while preserving any batch dimensions."
   [a]
@@ -213,8 +227,9 @@
               (fn [self]
                 (when-let [g @(:grad self)]
                   (let [scale (* 2.0 (arr/->scalar g) (/ 1.0 n))
-                        diff-copy (arr/from-vec backend (arr/->vec diff) shape)]
-                    (accumulate! pred (nm/scal! scale diff-copy))))))))))
+                        diff-copy (arr/from-vec backend (arr/->vec diff) shape
+                                                (or (:dtype diff) :f32))]
+                    (accumulate! pred (t/scale diff-copy scale))))))))))
 
 ;; --- conv2d (2026-07-13 "raise the maturity" loop) --------------------------
 ;; num.tensor/conv2d bundles im2col + matmul + reshape into one opaque

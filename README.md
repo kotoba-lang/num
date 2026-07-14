@@ -195,6 +195,11 @@ multi-head attention also have packed-F16 paths. Attention evaluates dot
 products, scaling, and stable softmax in f32 registers and stores the result in
 physical F16; the current typed kernel supports causal/unmasked execution while
 the f32 kernel retains key-padding-mask support.
+`num.autograd/cast*` records physical dtype conversion on the reverse-mode tape;
+its VJP converts the upstream gradient back to the input dtype. Typed MSE
+backward likewise preserves prediction storage and uses immutable typed scale,
+allowing stable f32 subgraphs to sit inside an F16 training graph without
+severing gradients.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet
