@@ -179,15 +179,27 @@
                             (= (:shape x) [(last (:shape y))])) [y x]
                        :else [nil nil])
         backend (:backend input)]
-    (if (and input (= :f32 (array-dtype input)) (= backend (:backend bias))
-             (satisfies? p/ITensorBackend backend))
+    (cond
+      (and input (= :f32 (array-dtype input)) (= backend (:backend bias))
+           (satisfies? p/ITensorBackend backend))
       (assoc (arr/->NDArray
               backend
               (p/-add-last-axis-bias
                backend (:handle input) (:handle bias)
                {:total (arr/nelems (:shape input)) :width (last (:shape input))})
               (:shape input)) :dtype :f32)
-      (ewise-bc :add x y))))
+      (and input (not= :f32 (array-dtype input)) (= backend (:backend bias))
+           (= (array-dtype input) (array-dtype bias))
+           (satisfies? p/IDTypeTensorOps backend))
+      (assoc (arr/->NDArray
+              backend
+              (p/-add-last-axis-bias-dtype
+               backend (:handle input) (:handle bias)
+               {:total (arr/nelems (:shape input)) :width (last (:shape input))}
+               (array-dtype input))
+              (:shape input))
+             :dtype (array-dtype input))
+      :else (ewise-bc :add x y))))
 (defn sub "Broadcasting x - y." [x y] (ewise-bc :sub x y))
 (defn mul "Broadcasting elementwise x * y (Hadamard, not matmul)." [x y] (ewise-bc :mul x y))
 (defn div "Broadcasting elementwise x / y." [x y] (ewise-bc :div x y))
@@ -358,8 +370,9 @@
                         {:shape shape :perm perm})))
      (let [out-shape (mapv shape perm)
            backend (:backend a)]
-       (if (and (<= 1 r 4) (= :f32 (array-dtype a))
-                (satisfies? p/ITensorBackend backend))
+       (cond
+         (and (<= 1 r 4) (= :f32 (array-dtype a))
+              (satisfies? p/ITensorBackend backend))
          (assoc
           (arr/->NDArray
            backend
@@ -373,6 +386,20 @@
                                :perm perm}))
            out-shape)
           :dtype :f32)
+
+         (and (<= 1 r 4) (not= :f32 (array-dtype a))
+              (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray
+                 backend
+                 (p/-transpose-dtype
+                  backend (:handle a)
+                  {:rank r :total (arr/nelems out-shape)
+                   :input-shape shape :output-shape out-shape :perm perm}
+                  (array-dtype a))
+                 out-shape)
+                :dtype (array-dtype a))
+
+         :else
          (let [in-strides (row-major-strides shape)
                out-strides (row-major-strides out-shape)
                xs (double-array (arr/->vec a))
@@ -385,7 +412,7 @@
                                   (vec (repeat r 0))
                                   (map-indexed vector perm))]
                (aset out oi (aget xs (ravel in-idx in-strides)))))
-           (arr/from-vec backend (vec out) out-shape)))))))
+           (arr/from-vec backend (vec out) out-shape (array-dtype a))))))))
 
 ;; --- axis-parameterized reductions ---------------------------------------------
 
@@ -1384,7 +1411,8 @@
                    :head-dim d-head :causal? causal?
                    :has-key-padding-mask? (boolean key-padding-mask)
                    :total (* batch seq-q d-model)}]
-       (if (and (= backend (:backend K) (:backend V))
+       (cond
+         (and (= backend (:backend K) (:backend V))
                 (or (nil? key-padding-mask) (= backend mask-backend))
                 (= :f32 (array-dtype Q) (array-dtype K) (array-dtype V))
                 (or (nil? key-padding-mask) (= :f32 (array-dtype key-padding-mask)))
@@ -1395,6 +1423,21 @@
                   backend (:handle Q) (:handle K) (:handle V)
                   (when key-padding-mask (:handle key-padding-mask)) params)
                  output-shape) :dtype :f32)
+
+         (and (= backend (:backend K) (:backend V))
+              (nil? key-padding-mask)
+              (= (array-dtype Q) (array-dtype K) (array-dtype V))
+              (not= :f32 (array-dtype Q))
+              (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray
+                 backend
+                 (p/-multi-head-attention-dtype
+                  backend (:handle Q) (:handle K) (:handle V) params
+                  (array-dtype Q))
+                 output-shape)
+                :dtype (array-dtype Q))
+
+         :else
          (if (= h kv-heads)
            (let [q3 (if (= rank 2) (reshape Q [1 seq-q d-model]) Q)
                k3 (if (= rank 2) (reshape K [1 seq-k d-model]) K)

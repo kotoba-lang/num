@@ -15,6 +15,8 @@
                 :group-norm-nchw-f16-reference
                 :upsample-nearest2d-f16 :slice-axis-f16
                 :nchw-to-rgb-image-f16 :scale-f16
+                :transpose-nd-f16 :multi-head-attention-f16
+                :add-last-axis-bias-f16
                 :conv2d-nchw :conv2d-nchw-oc4
                 :group-norm-nchw :group-norm-silu-nchw
                 :upsample-nearest2d :cat-copy

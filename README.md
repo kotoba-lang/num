@@ -190,6 +190,11 @@ offsets; uploads pad only the final storage word without changing tensor shape.
 Immutable scalar scaling stays packed F16, while the terminal NCHW F16 to NHWC
 f32 RGB conversion performs layout, range conversion, and unpacking in one
 dispatch instead of allocating a full intermediate f32 tensor.
+Rank-1 through rank-4 transpose, last-axis bias broadcasting, and fused
+multi-head attention also have packed-F16 paths. Attention evaluates dot
+products, scaling, and stable softmax in f32 registers and stores the result in
+physical F16; the current typed kernel supports causal/unmasked execution while
+the f32 kernel retains key-padding-mask support.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet

@@ -55,6 +55,11 @@
         cpu-upsample (tensor/upsample-nearest2d
                       (arr/from-vec cpu-backend [1 2 3] [1 1 1 3] :f16) [2 2])
         cpu-scaled (tensor/scale cpu-odd 0.25)
+        attention-values [0.1 0.2 0.3 0.4, -0.2 0.1 0.5 -0.3]
+        cpu-attention (tensor/multi-head-attention
+                       (arr/from-vec cpu-backend attention-values [1 2 4])
+                       (arr/from-vec cpu-backend attention-values [1 2 4])
+                       (arr/from-vec cpu-backend [1 2 3 4, 5 6 7 8] [1 2 4]) 1)
         expected [(arr/->vec (num/add cpu-a cpu-b))
                   (arr/->vec (num/silu cpu-a))
                   (arr/->vec (num/sigmoid cpu-a))
@@ -72,7 +77,10 @@
                   (arr/->vec cpu-slice)
                   (arr/->vec cpu-upsample)
                   (arr/->vec cpu-scaled)
-                  [0.0 0.5 1.0]]]
+                  [0.0 0.5 1.0]
+                  [1.0 3.0 2.0 4.0]
+                  (arr/->vec cpu-attention)
+                  [1.5 1.5 3.5 3.5]]]
     (-> (gpu/request-device)
         (.then
          (fn [device-result]
@@ -116,17 +124,24 @@
                  scaled (tensor/scale odd 0.25)
                  rgb (tensor/nchw-to-rgb-image
                       (arr/from-vec backend [-1 0 1] [1 3 1 1] :f16))
+                 transposed (tensor/transpose a [1 0])
+                 attention (tensor/multi-head-attention
+                            (arr/from-vec backend attention-values [1 2 4] :f16)
+                            (arr/from-vec backend attention-values [1 2 4] :f16)
+                            (arr/from-vec backend [1 2 3 4, 5 6 7 8] [1 2 4] :f16) 1)
+                 biased (tensor/add a (arr/from-vec backend [0.5 -0.5] [2] :f16))
                  outputs [(num/add a b) (num/silu a) (num/sigmoid a) (num/tanh a)
                           (num/gelu a)
                           (num/matmul a b) conv norm norm-silu layernorm embedding rmsnorm rope
-                          copy-destination sliced upsampled scaled rgb cast-f32 cast-back]]
+                          copy-destination sliced upsampled scaled rgb transposed attention biased
+                          cast-f32 cast-back]]
              (println "adapter:" (or (gpu/adapter-description device-result) "unknown"))
              (println "f16 physical bytes:" (.-size (:handle a)))
              (.then
               (js/Promise.all (into-array (map arr/->vec (into [a] outputs))))
               (fn [actual]
                 (let [input-values (vec (aget actual 0))
-                      actual-values (mapv #(vec (aget actual %)) (range 1 21))
+                      actual-values (mapv #(vec (aget actual %)) (range 1 24))
                       _ (println "uploaded:" input-values)
                       checks [(= 8 (.-size (:handle a)))
                               (approx-vec? (nth expected 0) (nth actual-values 0) 0.002)
@@ -147,10 +162,13 @@
                               (approx-vec? (nth expected 15) (nth actual-values 15) 0.002)
                               (approx-vec? (nth expected 16) (nth actual-values 16) 0.002)
                               (approx-vec? (nth expected 17) (nth actual-values 17) 0.002)
+                              (approx-vec? (nth expected 18) (nth actual-values 18) 0.002)
+                              (approx-vec? (nth expected 19) (nth actual-values 19) 0.02)
+                              (approx-vec? (nth expected 20) (nth actual-values 20) 0.002)
                               (approx-vec? [1.0 2.0 3.0 4.0]
-                                           (nth actual-values 18) 0.0001)
+                                           (nth actual-values 21) 0.0001)
                               (approx-vec? [1.0 2.0 3.0 4.0]
-                                           (nth actual-values 19) 0.002)]
+                                           (nth actual-values 22) 0.002)]
                       passed (count (filter true? checks))]
                   (println (str "Metal f16: " passed "/" (count checks) " passed"))
                   (when-not (= passed (count checks))

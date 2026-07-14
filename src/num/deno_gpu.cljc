@@ -515,6 +515,43 @@
                          (wb/uni dev (wb/u32-tag [height width total 0]))]
                         [(wb/ceil-div total 64) 1 1])
            output))
+       (-transpose-dtype [_ input-h
+                          {:keys [rank total input-shape output-shape perm]}
+                          dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU transpose supports f16 only" {:dtype dtype*})))
+         (let [pad4 #(vec (take 4 (concat % (repeat 0))))
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               params (concat [rank total 0 0] (pad4 input-shape)
+                              (pad4 output-shape) (pad4 perm))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-nd-f16)
+                        [input-h output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-multi-head-attention-dtype
+         [_ query-h key-h value-h
+          {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim total
+                  causal?]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU attention supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention-f16)
+                        [query-h key-h value-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total
+                                       (if causal? 1 0) 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-add-last-axis-bias-dtype [_ input-h bias-h {:keys [total width]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU bias add supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :add-last-axis-bias-f16)
+                        [input-h bias-h output
+                         (wb/uni dev (wb/u32-tag [total width 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
        (-embedding-dtype [_ indices-h weight-h {:keys [tokens rows dim]} dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "typed GPU embedding supports f16 only" {:dtype dtype*})))

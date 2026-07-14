@@ -622,6 +622,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[output_index] = input[input_index];
 }")
 
+(def transpose-nd-f16-wgsl
+  "Generic packed-F16 rank-1 through rank-4 axis permutation."
+  "
+struct Params {
+  info: vec4<u32>, input_shape: vec4<u32>, output_shape: vec4<u32>, perm: vec4<u32>
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+fn load(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn source(output_index: u32) -> u32 {
+  let rank = p.info.x;
+  var remaining = output_index; var output_coord = vec4<u32>(0u);
+  var axis = rank;
+  loop {
+    if (axis == 0u) { break; } axis = axis - 1u;
+    output_coord[axis] = remaining % p.output_shape[axis];
+    remaining = remaining / p.output_shape[axis];
+  }
+  var input_coord = vec4<u32>(0u); var i = 0u;
+  loop {
+    if (i >= rank) { break; }
+    input_coord[p.perm[i]] = output_coord[i]; i = i + 1u;
+  }
+  var input_index = 0u; i = 0u;
+  loop {
+    if (i >= rank) { break; }
+    input_index = input_index * p.input_shape[i] + input_coord[i]; i = i + 1u;
+  }
+  return input_index;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u; if (first >= p.info.y) { return; }
+  var second = 0.0;
+  if (first + 1u < p.info.y) { second = load(source(first + 1u)); }
+  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+}")
+
 (def batched-matmul-wgsl
   "Batched matmul with up to two NumPy-broadcast leading dimensions."
   "
@@ -675,6 +717,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[i] = input[i] + bias[i % p.width];
 }")
 
+(def add-last-axis-bias-f16-wgsl
+  "Packed-F16 last-axis bias broadcasting, one invocation per output pair."
+  "
+struct Params { total: u32, width: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> bias: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+@group(0) @binding(3) var<uniform> p: Params;
+fn load(buffer: u32, index: u32) -> f32 {
+  var pair = vec2<f32>(0.0);
+  if (buffer == 0u) { pair = unpack2x16float(input[index / 2u]); }
+  else { pair = unpack2x16float(bias[index / 2u]); }
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u; if (first >= p.total) { return; }
+  let a = load(0u, first) + load(1u, first % p.width);
+  var b = 0.0;
+  if (first + 1u < p.total) {
+    b = load(0u, first + 1u) + load(1u, (first + 1u) % p.width);
+  }
+  output[gid.x] = pack2x16float(vec2<f32>(a, b));
+}")
+
 (def multi-head-attention-wgsl
   "Fused rank-2 Q/K/V multi-head attention with stable online softmax passes."
   "
@@ -724,6 +791,70 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   output[i] = select(0.0, result / denominator, denominator > 0.0);
+}")
+
+(def multi-head-attention-f16-wgsl
+  "Packed-F16 fused attention with f32 dot products and stable online softmax."
+  "
+struct Params { batch: u32, seq_q: u32, seq_k: u32, model: u32,
+                kv_model: u32, heads: u32, kv_heads: u32, head_dim: u32,
+                total: u32, causal: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> query: array<u32>;
+@group(0) @binding(1) var<storage, read> key: array<u32>;
+@group(0) @binding(2) var<storage, read> value: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn load_query(index: u32) -> f32 {
+  let pair = unpack2x16float(query[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_key(index: u32) -> f32 {
+  let pair = unpack2x16float(key[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_value(index: u32) -> f32 {
+  let pair = unpack2x16float(value[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn score(batch: u32, row: u32, head: u32, token: u32) -> f32 {
+  let kv_head = head / (p.heads / p.kv_heads);
+  let qbase = (batch * p.seq_q + row) * p.model + head * p.head_dim;
+  let kbase = (batch * p.seq_k + token) * p.kv_model + kv_head * p.head_dim;
+  var sum = 0.0;
+  for (var d = 0u; d < p.head_dim; d = d + 1u) {
+    sum = sum + load_query(qbase + d) * load_key(kbase + d);
+  }
+  return sum * inverseSqrt(f32(p.head_dim));
+}
+fn attend(index: u32) -> f32 {
+  let flat_row = index / p.model; let batch = flat_row / p.seq_q;
+  let row = flat_row % p.seq_q; let component = index % p.model;
+  let head = component / p.head_dim;
+  let kv_head = head / (p.heads / p.kv_heads);
+  var maximum = -3.402823e38;
+  for (var token = 0u; token < p.seq_k; token = token + 1u) {
+    if (!(p.causal != 0u && token > row)) {
+      maximum = max(maximum, score(batch, row, head, token));
+    }
+  }
+  var denominator = 0.0; var result = 0.0;
+  for (var token = 0u; token < p.seq_k; token = token + 1u) {
+    if (!(p.causal != 0u && token > row)) {
+      let weight = exp(score(batch, row, head, token) - maximum);
+      let vb = (batch * p.seq_k + token) * p.kv_model
+               + kv_head * p.head_dim + component % p.head_dim;
+      denominator = denominator + weight;
+      result = result + weight * load_value(vb);
+    }
+  }
+  return result / denominator;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u; if (first >= p.total) { return; }
+  var second = 0.0;
+  if (first + 1u < p.total) { second = attend(first + 1u); }
+  output[gid.x] = pack2x16float(vec2<f32>(attend(first), second));
 }")
 
 (def multi-head-attention-backward-wgsl
@@ -2478,8 +2609,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :slice-axis-f16 slice-axis-f16-wgsl
    :pad-right-bottom-nchw pad-right-bottom-nchw-wgsl
    :add-last-axis-bias add-last-axis-bias-wgsl
+   :add-last-axis-bias-f16 add-last-axis-bias-f16-wgsl
    :transpose-2d transpose-2d-wgsl
    :transpose-nd transpose-nd-wgsl
+   :transpose-nd-f16 transpose-nd-f16-wgsl
    :batched-matmul batched-matmul-wgsl
    :bias-gradient bias-gradient-wgsl
    :mse-loss mse-loss-wgsl
@@ -2488,6 +2621,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :adamw-step adamw-step-wgsl
    :unscale-gradient unscale-gradient-wgsl
    :multi-head-attention multi-head-attention-wgsl
+   :multi-head-attention-f16 multi-head-attention-f16-wgsl
    :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl
    :ewise1-f16 ewise1-f16-wgsl
