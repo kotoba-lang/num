@@ -188,7 +188,9 @@ paths downloads intermediate tensors.
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet
 `GroupNorm → SiLU` pair into one reduction/normalization kernel and one output
-buffer. Non-f32 backends retain identical semantics through composition.
+buffer. Packed F16 uses the same one-workgroup-per-group reduction strategy and
+falls back to the scalar reference kernel only when an odd group size would
+make a packed word straddle normalization groups.
 
 Long-running graphs can explicitly end tensor lifetimes with
 `num.array/release!`; `release-all!` deduplicates reshape/transpose aliases that
@@ -414,6 +416,9 @@ deno run --allow-all target/deno-gpu-benchmark.cjs
 # Full Stable-Diffusion-width 320→320 convolution at latent 64×64
 deno run --allow-all target/deno-gpu-benchmark.cjs full
 deno run --allow-all target/deno-gpu-benchmark.cjs full-f16
+
+# F16 GroupNorm+SiLU at [1,320,64,64], including forced readback
+deno run --allow-all target/deno-gpu-benchmark.cjs norm-f16
 ```
 
 Measured on Apple M4 with input `[1,32,64,64]`, weights `[64,32,3,3]`, and a

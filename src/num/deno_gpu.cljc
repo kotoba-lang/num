@@ -444,7 +444,7 @@
            output))
        (-group-norm-nchw-dtype [_ input-h weight-h bias-h
                                 {:keys [n c h width groups channels-group
-                                        group-size eps]} dtype*]
+                                        group-size eps silu?]} dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "typed GPU GroupNorm supports f16 only" {:dtype dtype*})))
          (let [total (* n c h width)
@@ -454,13 +454,18 @@
                             (w/-write-buffer-dtype dev buffer (repeat c 1.0) :f16)
                             buffer))
                bias (or bias-h (w/-create-buffer-dtype dev c :storage :f16))]
-           (w/-dispatch dev (wb/get-pipeline dev pipes :group-norm-nchw-f16)
+           (w/-dispatch dev (wb/get-pipeline
+                             dev pipes (if (even? group-size)
+                                         :group-norm-nchw-f16
+                                         :group-norm-nchw-f16-reference))
                         [input-h weight bias output
                          (wb/uni dev (wb/u32-tag
                                       [n c h width groups channels-group
-                                       group-size (* h width)]))
+                                       group-size (* h width) (if silu? 1 0)]))
                          (wb/uni dev [(double eps)])]
-                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+                        (if (even? group-size)
+                          [(* n groups) 1 1]
+                          [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1]))
            (when-not weight-h (w/-destroy-buffer dev weight))
            (when-not bias-h (w/-destroy-buffer dev bias))
            output))

@@ -1060,17 +1060,12 @@
                          (array-dtype input))))))))
 
 (defn group-norm-silu-nchw
-  "Fused PyTorch GroupNorm followed by SiLU. f32 ITensorBackend execution uses
-  one kernel and one output buffer; other dtypes preserve semantics by composition."
+  "Fused PyTorch GroupNorm followed by SiLU. Device tensor backends execute one
+  kernel and allocate one output buffer for both f32 and physical typed storage."
   ([input num-groups]
    (group-norm-silu-nchw input num-groups nil nil 1.0e-5))
   ([input num-groups weight bias eps]
-   (if (= :f32 (array-dtype input))
-     (group-norm-nchw input num-groups weight bias eps true)
-     (let [normalized (group-norm-nchw input num-groups weight bias eps)
-           output (silu normalized)]
-       (arr/release! normalized)
-       output))))
+   (group-norm-nchw input num-groups weight bias eps true)))
 
 (defn layer-norm-last
   "PyTorch-compatible LayerNorm over the final tensor dimension. `weight` and

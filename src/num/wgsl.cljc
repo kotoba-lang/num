@@ -1472,12 +1472,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }")
 
-(def group-norm-nchw-f16-wgsl
+(def group-norm-nchw-f16-reference-wgsl
   "Packed-f16 GroupNorm reference kernel with f32 statistics."
   "
 struct Dims {
   n: u32, c: u32, h: u32, w: u32,
   groups: u32, channels_group: u32, group_size: u32, spatial: u32,
+  activation: u32,
 }
 @group(0) @binding(0) var<storage, read> input: array<u32>;
 @group(0) @binding(1) var<storage, read> weight: array<u32>;
@@ -1511,8 +1512,10 @@ fn normalize(index: u32) -> f32 {
   }
   let mean = sum / f32(d.group_size);
   let variance = max(sum_square / f32(d.group_size) - mean * mean, 0.0);
-  return (load_input_value(index) - mean) * inverseSqrt(variance + epsilon)
-         * load_weight_value(channel) + load_bias_value(channel);
+  let normalized = (load_input_value(index) - mean) * inverseSqrt(variance + epsilon)
+                   * load_weight_value(channel) + load_bias_value(channel);
+  if (d.activation == 1u) { return normalized / (1.0 + exp(-normalized)); }
+  return normalized;
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1522,6 +1525,86 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var second = 0.0;
   if (base + 1u < total) { second = normalize(base + 1u); }
   output[gid.x] = pack2x16float(vec2<f32>(normalize(base), second));
+}")
+
+(def group-norm-nchw-f16-wgsl
+  "Parallel packed-F16 GroupNorm. One workgroup computes statistics once per
+  group and owns complete packed pairs; callers use the reference kernel for
+  odd group sizes where a packed word would straddle two groups."
+  "
+struct Dims {
+  n: u32, c: u32, h: u32, w: u32,
+  groups: u32, channels_group: u32, group_size: u32, spatial: u32,
+  activation: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> bias: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+@group(0) @binding(5) var<uniform> epsilon: f32;
+var<workgroup> sums: array<f32, 256>;
+var<workgroup> squares: array<f32, 256>;
+fn load_input(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_weight(index: u32) -> f32 {
+  let pair = unpack2x16float(weight[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_bias(index: u32) -> f32 {
+  let pair = unpack2x16float(bias[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn activate(value: f32) -> f32 {
+  if (d.activation == 1u) { return value / (1.0 + exp(-value)); }
+  return value;
+}
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid3: vec3<u32>,
+        @builtin(workgroup_id) wid3: vec3<u32>) {
+  let lid = lid3.x;
+  let slice = wid3.x;
+  if (slice >= d.n * d.groups) { return; }
+  let batch = slice / d.groups;
+  let group = slice % d.groups;
+  let base = batch * d.c * d.h * d.w + group * d.group_size;
+  var sum = 0.0;
+  var sum_square = 0.0;
+  for (var i = lid; i < d.group_size; i = i + 256u) {
+    let value = load_input(base + i);
+    sum = sum + value;
+    sum_square = sum_square + value * value;
+  }
+  sums[lid] = sum;
+  squares[lid] = sum_square;
+  workgroupBarrier();
+  var offset = 128u;
+  loop {
+    if (offset == 0u) { break; }
+    if (lid < offset) {
+      sums[lid] = sums[lid] + sums[lid + offset];
+      squares[lid] = squares[lid] + squares[lid + offset];
+    }
+    workgroupBarrier();
+    offset = offset / 2u;
+  }
+  let mean = sums[0] / f32(d.group_size);
+  let variance = max(squares[0] / f32(d.group_size) - mean * mean, 0.0);
+  let inv_std = inverseSqrt(variance + epsilon);
+  let pairs = d.group_size / 2u;
+  for (var pair = lid; pair < pairs; pair = pair + 256u) {
+    let first_index = base + pair * 2u;
+    let second_index = first_index + 1u;
+    let first_channel = group * d.channels_group + (pair * 2u) / d.spatial;
+    let second_channel = group * d.channels_group + (pair * 2u + 1u) / d.spatial;
+    let first = activate((load_input(first_index) - mean) * inv_std
+                         * load_weight(first_channel) + load_bias(first_channel));
+    let second = activate((load_input(second_index) - mean) * inv_std
+                          * load_weight(second_channel) + load_bias(second_channel));
+    output[first_index / 2u] = pack2x16float(vec2<f32>(first, second));
+  }
 }")
 
 (def embedding-wgsl
@@ -2315,6 +2398,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :conv2d-nchw-f16 conv2d-nchw-f16-wgsl
    :conv2d-nchw-f16-oc4 conv2d-nchw-f16-oc4-wgsl
    :group-norm-nchw-f16 group-norm-nchw-f16-wgsl
+   :group-norm-nchw-f16-reference group-norm-nchw-f16-reference-wgsl
    :embedding-f16 embedding-f16-wgsl
    :rms-norm-f16 rms-norm-f16-wgsl
    :rotary-embedding-f16 rotary-embedding-f16-wgsl
