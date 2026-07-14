@@ -401,8 +401,11 @@ deno run --allow-all target/deno-raw-upload-verify.cjs
 
 ### UNet Metal benchmark
 
-The benchmark forces final readback, so it measures completed GPU work rather
-than near-zero queue submission latency:
+The benchmark forces final readback, so it measures completed GPU work plus the
+host transfer rather than near-zero queue submission latency. Full-width modes
+run one cold iteration followed by five sequential warm iterations on the same
+device/backend and report every sample plus the median; this avoids presenting
+a single noisy run as a performance result:
 
 ```bash
 clojure -M:deno-benchmark
@@ -418,25 +421,26 @@ full `NCHW conv(pad=1) → GroupNorm(8) → SiLU` chain:
 
 | path | elapsed |
 |---|---:|
-| ClojureScript CPU oracle | 1019.63 ms |
-| Metal cold (pipeline compile included) | 35.04 ms |
-| Metal warm | 31.80 ms |
+| ClojureScript CPU oracle | 1300.98 ms |
+| Metal cold (pipeline compile included) | 519.91 ms |
+| Metal warm | 29.13 ms |
 
-Warm speedup is **32.06×**, with maximum absolute error `2.38e-6` against the
+Warm speedup is **44.66×**, with maximum absolute error `2.38e-6` against the
 CPU oracle. The full-width mode separately measures a real latent-resolution
 `[1,320,64,64] × [320,320,3,3]` convolution. The four-output-channel kernel
-now measures 109.01 ms warm, with its interior
-constant-input result within `4.51e-7` of the analytic value. Packed physical
-f16 now takes 586.35 ms on the same case after adding a four-output-channel,
-two-spatial-position packed fast path (down from 621.65 ms). Deno's Naga rejects native WGSL
+produced f32 warm samples of `165.61, 108.65, 124.40, 208.58, 126.71 ms`
+(median `126.71 ms`), with its interior constant-input result within `4.51e-7`
+of the analytic value. Packed physical f16 produced
+`601.75, 581.06, 652.13, 654.76, 603.05 ms` (median `603.05 ms`) on the same
+case. Deno's Naga rejects native WGSL
 `enable f16` despite the adapter advertising `shader-f16`, so f16 remains a
 correctness/storage path rather than a performance claim: repeated
 `unpack2x16float` of every convolution weight still dominates and leaves it
-5.38× slower than f32 despite using half the persistent bytes.
-The benchmark also checks explicit GPUBuffer lifetime. After two warm/cold
-executions the 32→64 chain returns to its five persistent input/weight buffers
-(`598,784` bytes) from a `2,695,984`-byte peak; the 320-channel case returns to
-three persistent buffers (`8,930,560` bytes) from a `14,173,520`-byte peak.
+4.76× slower than f32 despite using half the persistent bytes.
+The benchmark also checks explicit GPUBuffer lifetime. After the cold and five
+warm executions the full-width case returns to its three persistent
+input/weight buffers
+(`8,930,560` bytes) from a `14,173,520`-byte peak.
 Per-dispatch uniform buffers, implicit no-bias/no-mask buffers, and readback
 staging buffers are destroyed after submission/use rather than accumulating
 across diffusion steps. The live verifier repeats 100 temporary dispatches and

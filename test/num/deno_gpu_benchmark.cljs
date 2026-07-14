@@ -20,6 +20,26 @@
 
 (defn- now [] (.now js/performance))
 
+(defn- median [values]
+  (let [sorted (vec (sort values))]
+    (nth sorted (quot (count sorted) 2))))
+
+(defn- timed-run [run]
+  (let [started (now)]
+    (-> (run)
+        (.then (fn [values]
+                 {:ms (- (now) started)
+                  :values values})))))
+
+(defn- timed-runs [run n]
+  (reduce (fn [promise _]
+            (.then promise
+                   (fn [results]
+                     (-> (timed-run run)
+                         (.then #(conj results %))))))
+          (js/Promise.resolve [])
+          (range n)))
+
 (defn- tensors [backend]
   {:input (arr/from-vec backend input-values input-shape)
    :weight (arr/from-vec backend weight-values weight-shape)
@@ -52,24 +72,25 @@
         bias (arr/from-vec gpu (repeat 320 0.0) [320] dtype)
         baseline (dg/backend-stats gpu)
         run (fn [] (force-and-release
-                    (t/conv2d-nchw input weight bias {:padding 1})))
-        cold-start (now)]
-    (-> (run)
+                    (t/conv2d-nchw input weight bias {:padding 1})))]
+    (-> (timed-run run)
         (.then
-         (fn [cold-values]
-           (let [cold-ms (- (now) cold-start)
-                 warm-start (now)]
-             (-> (run)
+         (fn [{cold-ms :ms cold-values :values}]
+           (-> (timed-runs run 5)
                  (.then
-                  (fn [warm-values]
-                    (let [warm-ms (- (now) warm-start)
+                  (fn [warm-results]
+                    (let [warm-ms (mapv :ms warm-results)
+                          warm-values (:values (peek warm-results))
+                          warm-median (median warm-ms)
                           center (+ (* 160 64 64) (* 32 64) 32)
                           expected (* 320 9 0.01 0.001)]
                       (println "GPU:" (dg/adapter-description device))
                       (println "full channel conv" dtype ":" input-shape "x" weight-shape
                                "->" [1 320 64 64])
                       (println "GPU cold ms:" (.toFixed cold-ms 2))
-                      (println "GPU warm ms:" (.toFixed warm-ms 2))
+                      (println "GPU warm samples ms:"
+                               (pr-str (mapv #(.toFixed % 2) warm-ms)))
+                      (println "GPU warm median ms:" (.toFixed warm-median 2))
                       (println "GPU buffers:" (pr-str (dg/backend-stats gpu)))
                       (println "center value:" (nth warm-values center)
                                "expected:" expected)
@@ -78,7 +99,7 @@
                                    (if (= dtype :f16) 1.0e-3 1.0e-4))
                                 (not= (:live-bytes baseline)
                                       (:live-bytes (dg/backend-stats gpu))))
-                        (throw (js/Error. "full-channel convolution check failed")))))))))))))
+                        (throw (js/Error. "full-channel convolution check failed"))))))))))))
 
 (defn -main [& args]
   (if (#{"full" "full-f16"} (first args))
