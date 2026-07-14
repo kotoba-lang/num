@@ -543,6 +543,41 @@
                                        (if causal? 1 0) 0 0]))]
                         [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
            output))
+       (-multi-head-attention-backward-dtype
+         [_ query-h key-h value-h grad-output-h
+          {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim
+                  causal?]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU attention backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total-q (* batch seq-q d-model)
+               total-k (* batch seq-k kv-d-model)
+               total (max total-q total-k)
+               expand (fn [input n]
+                        (let [output (w/-create-buffer dev n :storage)]
+                          (w/-dispatch dev (wb/get-pipeline dev pipes :f16-to-f32)
+                                       [input output
+                                        (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                                       [(wb/ceil-div n 64) 1 1])
+                          output))
+               query (expand query-h total-q)
+               key (expand key-h total-k)
+               value (expand value-h total-k)
+               grad-output (expand grad-output-h total-q)
+               mask (w/-create-buffer dev (* batch seq-k) :storage)
+               grad-query (w/-create-buffer dev total-q :storage)
+               grad-key (w/-create-buffer dev total-k :storage)
+               grad-value (w/-create-buffer dev total-k :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention-backward)
+                        [query key value mask grad-output grad-query grad-key grad-value
+                         (wb/uni dev (wb/u32-tag
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total-q total-k total
+                                       (if causal? 1 0) 0 0 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           (doseq [temporary [query key value grad-output mask]]
+             (w/-destroy-buffer dev temporary))
+           {:query grad-query :key grad-key :value grad-value}))
        (-add-last-axis-bias-dtype [_ input-h bias-h {:keys [total width]} dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "typed GPU bias add supports f16 only" {:dtype dtype*})))

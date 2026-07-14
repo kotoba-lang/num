@@ -423,8 +423,13 @@
                            (= backend (:backend key-padding-mask)))
                        (= :f32 (:dtype q-data :f32)
                           (:dtype k-data :f32) (:dtype v-data :f32))
-                       (satisfies? p/ITensorBackend backend))]
-       (if fused?
+                       (satisfies? p/ITensorBackend backend))
+           typed-fused? (and (= backend (:backend k-data) (:backend v-data))
+                             (nil? key-padding-mask)
+                             (= :f16 (:dtype q-data) (:dtype k-data) (:dtype v-data))
+                             (satisfies? p/IDTypeTensorOps backend))]
+       (cond
+         fused?
          (node
           (t/multi-head-attention q-data k-data v-data heads opts)
           [Q K V]
@@ -446,6 +451,31 @@
                 (accumulate! Q (ndarray (:query gradients) q-shape))
                 (accumulate! K (ndarray (:key gradients) k-shape))
                 (accumulate! V (ndarray (:value gradients) (:shape v-data)))))))
+
+         typed-fused?
+         (node
+          (t/multi-head-attention q-data k-data v-data heads opts)
+          [Q K V]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [params {:batch batch :seq-q seq-q :seq-k seq-k
+                            :d-model d-model :kv-d-model k-d-model
+                            :heads heads :kv-heads kv-heads :head-dim d-head
+                            :causal? causal?}
+                    gradients (p/-multi-head-attention-backward-dtype
+                               backend (:handle q-data) (:handle k-data)
+                               (:handle v-data) (:handle g) params :f16)
+                    typed (fn [handle shape]
+                            (let [f32 (assoc (arr/->NDArray backend handle shape)
+                                             :dtype :f32)
+                                  f16 (arr/cast f32 :f16)]
+                              (arr/release! f32)
+                              f16))]
+                (accumulate! Q (typed (:query gradients) q-shape))
+                (accumulate! K (typed (:key gradients) k-shape))
+                (accumulate! V (typed (:value gradients) (:shape v-data)))))))
+
+         :else
          (let [q3 (if (= rank 2) (reshape* Q [1 seq-q d-model]) Q)
                k3 (if (= rank 2) (reshape* K [1 seq-k k-d-model]) K)
                v3 (if (= rank 2) (reshape* V [1 seq-k k-d-model]) V)

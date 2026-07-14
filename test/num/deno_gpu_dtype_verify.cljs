@@ -1,6 +1,7 @@
 (ns num.deno-gpu-dtype-verify
   "Live shader-f16 verification against the CPU typed-storage oracle."
   (:require [num.array :as arr]
+            [num.autograd :as ag :include-macros true]
             [num.core :as num]
             [num.cpu :as cpu]
             [num.deno-gpu :as gpu]
@@ -60,6 +61,18 @@
                        (arr/from-vec cpu-backend attention-values [1 2 4])
                        (arr/from-vec cpu-backend attention-values [1 2 4])
                        (arr/from-vec cpu-backend [1 2 3 4, 5 6 7 8] [1 2 4]) 1)
+        attention-upstream [0.2 -0.1 0.3 -0.2, 0.1 0.4 -0.3 0.2]
+        [cpu-gradient-result cpu-gradient-tape]
+        (ag/with-tape
+          (let [q (ag/value (arr/from-vec cpu-backend attention-values [1 2 4]))
+                k (ag/value (arr/from-vec cpu-backend attention-values [1 2 4]))
+                v (ag/value (arr/from-vec cpu-backend [1 2 3 4, 5 6 7 8]
+                                                [1 2 4]))
+                output (ag/multi-head-attention* q k v 1)]
+            {:q q :k k :v v :output output}))
+        _ (ag/backward! (:output cpu-gradient-result)
+                        (arr/from-vec cpu-backend attention-upstream [1 2 4])
+                        cpu-gradient-tape)
         expected [(arr/->vec (num/add cpu-a cpu-b))
                   (arr/->vec (num/silu cpu-a))
                   (arr/->vec (num/sigmoid cpu-a))
@@ -80,7 +93,10 @@
                   [0.0 0.5 1.0]
                   [1.0 3.0 2.0 4.0]
                   (arr/->vec cpu-attention)
-                  [1.5 1.5 3.5 3.5]]]
+                  [1.5 1.5 3.5 3.5]
+                  (arr/->vec @(:grad (:q cpu-gradient-result)))
+                  (arr/->vec @(:grad (:k cpu-gradient-result)))
+                  (arr/->vec @(:grad (:v cpu-gradient-result)))]]
     (-> (gpu/request-device)
         (.then
          (fn [device-result]
@@ -130,10 +146,30 @@
                             (arr/from-vec backend attention-values [1 2 4] :f16)
                             (arr/from-vec backend [1 2 3 4, 5 6 7 8] [1 2 4] :f16) 1)
                  biased (tensor/add a (arr/from-vec backend [0.5 -0.5] [2] :f16))
+                 [gradient-result gradient-tape]
+                 (ag/with-tape
+                   (let [q (ag/value (arr/from-vec backend attention-values [1 2 4] :f16))
+                         k (ag/value (arr/from-vec backend attention-values [1 2 4] :f16))
+                         v (ag/value (arr/from-vec backend [1 2 3 4, 5 6 7 8]
+                                                   [1 2 4] :f16))
+                         output (ag/multi-head-attention* q k v 1)]
+                     {:q q :k k :v v :output output}))
+                 gradient-seed (arr/from-vec backend attention-upstream [1 2 4] :f16)
+                 backward-baseline (gpu/backend-stats backend)
+                 _ (ag/backward! (:output gradient-result)
+                                 gradient-seed
+                                 gradient-tape)
+                 backward-stats (gpu/backend-stats backend)
+                 gradient-bytes (reduce + (map #(.-size (:handle %))
+                                              [@(:grad (:q gradient-result))
+                                               @(:grad (:k gradient-result))
+                                               @(:grad (:v gradient-result))]))
                  outputs [(num/add a b) (num/silu a) (num/sigmoid a) (num/tanh a)
                           (num/gelu a)
                           (num/matmul a b) conv norm norm-silu layernorm embedding rmsnorm rope
                           copy-destination sliced upsampled scaled rgb transposed attention biased
+                          @(:grad (:q gradient-result)) @(:grad (:k gradient-result))
+                          @(:grad (:v gradient-result))
                           cast-f32 cast-back]]
              (println "adapter:" (or (gpu/adapter-description device-result) "unknown"))
              (println "f16 physical bytes:" (.-size (:handle a)))
@@ -141,9 +177,14 @@
               (js/Promise.all (into-array (map arr/->vec (into [a] outputs))))
               (fn [actual]
                 (let [input-values (vec (aget actual 0))
-                      actual-values (mapv #(vec (aget actual %)) (range 1 24))
+                      actual-values (mapv #(vec (aget actual %)) (range 1 27))
                       _ (println "uploaded:" input-values)
                       checks [(= 8 (.-size (:handle a)))
+                              (= 3 (- (:live-buffers backward-stats)
+                                      (:live-buffers backward-baseline)))
+                              (= gradient-bytes
+                                 (- (:live-bytes backward-stats)
+                                    (:live-bytes backward-baseline)))
                               (approx-vec? (nth expected 0) (nth actual-values 0) 0.002)
                               (approx-vec? (nth expected 1) (nth actual-values 1) 0.002)
                               (approx-vec? (nth expected 2) (nth actual-values 2) 0.002)
@@ -165,10 +206,13 @@
                               (approx-vec? (nth expected 18) (nth actual-values 18) 0.002)
                               (approx-vec? (nth expected 19) (nth actual-values 19) 0.02)
                               (approx-vec? (nth expected 20) (nth actual-values 20) 0.002)
+                              (approx-vec? (nth expected 21) (nth actual-values 21) 0.03)
+                              (approx-vec? (nth expected 22) (nth actual-values 22) 0.03)
+                              (approx-vec? (nth expected 23) (nth actual-values 23) 0.03)
                               (approx-vec? [1.0 2.0 3.0 4.0]
-                                           (nth actual-values 21) 0.0001)
+                                           (nth actual-values 24) 0.0001)
                               (approx-vec? [1.0 2.0 3.0 4.0]
-                                           (nth actual-values 22) 0.002)]
+                                           (nth actual-values 25) 0.002)]
                       passed (count (filter true? checks))]
                   (println (str "Metal f16: " passed "/" (count checks) " passed"))
                   (when-not (= passed (count checks))

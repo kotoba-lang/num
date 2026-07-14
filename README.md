@@ -200,6 +200,11 @@ its VJP converts the upstream gradient back to the input dtype. Typed MSE
 backward likewise preserves prediction storage and uses immutable typed scale,
 allowing stable f32 subgraphs to sit inside an F16 training graph without
 severing gradients.
+On the Deno Metal backend, packed-F16 attention backward remains GPU-resident:
+Q/K/V and upstream gradients are expanded by device kernels, the existing fused
+f32 stable-softmax VJP computes conflict-free Q/K/V gradients, and cast kernels
+return them to the typed graph. No tensor is downloaded; the implementation
+reuses the same backward equations as the independently checked f32 path.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet

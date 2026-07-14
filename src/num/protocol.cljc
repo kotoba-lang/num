@@ -90,6 +90,8 @@
   (-nchw-to-rgb-image-dtype [b input-h params dtype])
   (-transpose-dtype [b input-h params dtype])
   (-multi-head-attention-dtype [b query-h key-h value-h params dtype])
+  (-multi-head-attention-backward-dtype
+    [b query-h key-h value-h grad-output-h params dtype])
   (-add-last-axis-bias-dtype [b input-h bias-h params dtype])
   (-embedding-dtype [b indices-h weight-h params dtype])
   (-rms-norm-dtype [b input-h weight-h params dtype])
