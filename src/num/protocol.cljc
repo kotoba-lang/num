@@ -97,6 +97,9 @@
   (-embedding-backward-dtype [b indices-h grad-output-h params dtype])
   (-rms-norm-dtype [b input-h weight-h params dtype])
   (-rms-norm-backward-dtype [b input-h weight-h grad-output-h params dtype])
+  (-cross-entropy-forward-dtype [b logits-h labels-h params dtype])
+  (-cross-entropy-backward-dtype
+    [b logits-h labels-h stats-h upstream-h params dtype])
   (-rotary-embedding-dtype [b input-h params dtype]))
 
 (defprotocol ITensorBackend

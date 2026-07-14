@@ -641,6 +641,40 @@
                         [(wb/ceil-div (max (wb/ceil-div total 2) dim) 64) 1 1])
            (w/-destroy-buffer dev stats)
            {:input grad-input :weight grad-weight}))
+       (-cross-entropy-forward-dtype
+         [_ logits-h labels-h {:keys [rows classes ignore-index]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU cross entropy supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows classes)
+               stats (w/-create-buffer dev (* rows 2) :storage)
+               scalar (w/-create-buffer dev 2 :storage)
+               params (wb/uni dev (wb/u32-tag
+                                   [rows classes total ignore-index]))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :cross-entropy-stats-f16)
+                        [logits-h stats params] [rows 1 1])
+           (w/-dispatch dev (wb/get-pipeline dev pipes :cross-entropy-loss-f16)
+                        [logits-h labels-h stats scalar
+                         (wb/uni dev (wb/u32-tag
+                                      [rows classes total ignore-index]))]
+                        [1 1 1])
+           {:loss scalar :stats stats}))
+       (-cross-entropy-backward-dtype
+         [_ logits-h labels-h stats-h upstream-h
+          {:keys [rows classes ignore-index loss-h]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU cross entropy backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows classes)
+               grad-logits (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev pipes :cross-entropy-gradient-f16)
+                        [logits-h labels-h stats-h loss-h upstream-h grad-logits
+                         (wb/uni dev (wb/u32-tag
+                                      [rows classes total ignore-index]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           (w/-destroy-buffer dev stats-h)
+           grad-logits))
        (-rotary-embedding-dtype
          [_ input-h {:keys [batch sequence embed heads head-dim position-offset
                             theta direction]} dtype*]

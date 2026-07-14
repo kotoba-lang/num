@@ -216,6 +216,10 @@ Packed-F16 embedding backward assigns one invocation to each table element and
 gathers all matching token positions into an f32 gradient. Repeated IDs are
 therefore deterministic and race-free without atomics or host scatter-adds,
 which closes the token-to-transformer training boundary for complete LMs.
+`cross-entropy-loss*` accepts integer labels shaped like the logits without the
+last class axis, supports `ignore-index`, uses max-subtracted softmax, and means
+over valid rows. Its Metal path keeps per-row f32 statistics and scalar loss on
+device and returns a packed-F16 logit VJP scaled by the upstream GradScaler seed.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet

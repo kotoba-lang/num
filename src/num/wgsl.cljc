@@ -1026,6 +1026,114 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   gradient[i] = upstream[0] * 2.0 * (prediction[i] - expected[i]) / f32(count);
 }")
 
+(def cross-entropy-stats-f16-wgsl
+  "Stable per-row max and exponential denominator for packed-F16 logits."
+  "
+struct Params { rows: u32, classes: u32, total: u32, ignore_index: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(1) var<storage, read_write> stats: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+var<workgroup> scratch: array<f32, 64>;
+fn load_logit(index: u32) -> f32 {
+  let pair = unpack2x16float(logits[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wid.x; let lane = lid.x;
+  if (row >= p.rows) { return; }
+  var maximum = -3.402823466e+38;
+  for (var c = lane; c < p.classes; c += 64u) {
+    maximum = max(maximum, load_logit(row * p.classes + c));
+  }
+  scratch[lane] = maximum; workgroupBarrier();
+  var stride = 32u;
+  loop {
+    if (lane < stride) { scratch[lane] = max(scratch[lane], scratch[lane + stride]); }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  let row_max = scratch[0];
+  var denominator = 0.0;
+  for (var c = lane; c < p.classes; c += 64u) {
+    denominator += exp(load_logit(row * p.classes + c) - row_max);
+  }
+  scratch[lane] = denominator; workgroupBarrier();
+  stride = 32u;
+  loop {
+    if (lane < stride) { scratch[lane] += scratch[lane + stride]; }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  if (lane == 0u) { stats[row * 2u] = row_max; stats[row * 2u + 1u] = scratch[0]; }
+}")
+
+(def cross-entropy-loss-f16-wgsl
+  "Mean stable NLL and inverse valid-row count for integer labels."
+  "
+struct Params { rows: u32, classes: u32, total: u32, ignore_index: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(1) var<storage, read> labels: array<f32>;
+@group(0) @binding(2) var<storage, read> stats: array<f32>;
+@group(0) @binding(3) var<storage, read_write> scalar: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn load_logit(index: u32) -> f32 {
+  let pair = unpack2x16float(logits[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+@compute @workgroup_size(1)
+fn main() {
+  var sum = 0.0; var valid = 0u;
+  for (var row = 0u; row < p.rows; row += 1u) {
+    let signed_label = i32(labels[row]);
+    if (bitcast<u32>(signed_label) != p.ignore_index) {
+      let label = u32(signed_label);
+      if (label < p.classes) {
+        sum += stats[row * 2u] + log(stats[row * 2u + 1u]) -
+               load_logit(row * p.classes + label);
+        valid += 1u;
+      }
+    }
+  }
+  let inverse = select(0.0, 1.0 / f32(valid), valid > 0u);
+  scalar[0] = sum * inverse; scalar[1] = inverse;
+}")
+
+(def cross-entropy-gradient-f16-wgsl
+  "Packed-F16 `(softmax-onehot)/valid * upstream` VJP."
+  "
+struct Params { rows: u32, classes: u32, total: u32, ignore_index: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(1) var<storage, read> labels: array<f32>;
+@group(0) @binding(2) var<storage, read> stats: array<f32>;
+@group(0) @binding(3) var<storage, read> scalar: array<f32>;
+@group(0) @binding(4) var<storage, read> upstream: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_logits: array<u32>;
+@group(0) @binding(6) var<uniform> p: Params;
+fn load_logit(index: u32) -> f32 {
+  let pair = unpack2x16float(logits[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+fn gradient(index: u32) -> f32 {
+  if (index >= p.total) { return 0.0; }
+  let row = index / p.classes; let c = index % p.classes;
+  let signed_label = i32(labels[row]);
+  if (bitcast<u32>(signed_label) == p.ignore_index) { return 0.0; }
+  let probability = exp(load_logit(index) - stats[row * 2u]) /
+                    stats[row * 2u + 1u];
+  return (probability - select(0.0, 1.0, c == u32(signed_label))) *
+         scalar[1] * upstream[0];
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x; let base = word * 2u;
+  if (base >= p.total) { return; }
+  grad_logits[word] = pack2x16float(vec2<f32>(gradient(base), gradient(base + 1u)));
+}")
+
 (def relu-backward-wgsl
   "ReLU vector-Jacobian product using saved pre-activation values."
   "
@@ -2735,6 +2843,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :bias-gradient bias-gradient-wgsl
    :mse-loss mse-loss-wgsl
    :mse-gradient mse-gradient-wgsl
+   :cross-entropy-stats-f16 cross-entropy-stats-f16-wgsl
+   :cross-entropy-loss-f16 cross-entropy-loss-f16-wgsl
+   :cross-entropy-gradient-f16 cross-entropy-gradient-f16-wgsl
    :sgd-step sgd-step-wgsl
    :adamw-step adamw-step-wgsl
    :unscale-gradient unscale-gradient-wgsl

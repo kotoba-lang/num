@@ -582,3 +582,22 @@
           (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
               (str label " analytic=" (arr/->vec analytic)
                    " numeric=" (arr/->vec numeric))))))))
+
+(deftest stable-cross-entropy-supports-ignore-index-and-loss-scaling
+  (let [logit-data (arr/from-vec backend [1.0 2.0 3.0, 1.0 0.0 -1.0] [2 3])
+        labels (arr/from-vec backend [2 -100] [2])
+        [result tape]
+        (ag/with-tape
+          (let [logits (ag/value logit-data)
+                loss (ag/cross-entropy-loss* logits labels)]
+            {:logits logits :loss loss}))]
+    (ag/backward! (:loss result) (arr/from-vec backend [2.0] []) tape)
+    (let [denominator (+ (Math/exp -2.0) (Math/exp -1.0) 1.0)
+          expected-gradient [(/ (* 2.0 (Math/exp -2.0)) denominator)
+                             (/ (* 2.0 (Math/exp -1.0)) denominator)
+                             (* 2.0 (- (/ 1.0 denominator) 1.0))
+                             0.0 0.0 0.0]]
+      (is (< (Math/abs (- (arr/->scalar (:data (:loss result)))
+                          (Math/log denominator))) 1.0e-9))
+      (is (approx-vec-tol? expected-gradient
+                           (arr/->vec @(:grad (:logits result))) 1.0e-9)))))

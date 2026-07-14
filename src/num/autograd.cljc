@@ -251,6 +251,97 @@
                                                 (or (:dtype diff) :f32))]
                     (accumulate! pred (t/scale diff-copy scale))))))))))
 
+(defn cross-entropy-loss*
+  "Mean stable cross entropy over the final logits axis.
+
+  `labels` has the logits shape without its final class dimension and stores
+  integer class IDs as ordinary num values. `ignore-index` rows contribute
+  neither loss nor gradient."
+  ([logits labels] (cross-entropy-loss* logits labels {}))
+  ([logits labels {:keys [ignore-index] :or {ignore-index -100}}]
+   (let [logits-data (:data logits)
+         backend (:backend logits-data)
+         shape (:shape logits-data)
+         classes (long (peek shape))
+         label-shape (vec (butlast shape))
+         rows (arr/nelems label-shape)]
+     (when-not (and (seq shape) (pos? classes) (= label-shape (:shape labels)))
+       (throw (ex-info "cross entropy labels must match logits without class axis"
+                       {:logits shape :labels (:shape labels)})))
+     (if (and (= :f16 (:dtype logits-data))
+              (= backend (:backend labels))
+              (satisfies? p/IDTypeTensorOps backend))
+       (let [{:keys [loss stats]}
+             (p/-cross-entropy-forward-dtype
+              backend (:handle logits-data) (:handle labels)
+              {:rows rows :classes classes :ignore-index ignore-index} :f16)
+             loss-data (assoc (arr/->NDArray backend loss []) :dtype :f32)]
+         (node loss-data [logits]
+               (fn [self]
+                 (when-let [g @(:grad self)]
+                   (accumulate!
+                    logits
+                    (assoc
+                     (arr/->NDArray
+                      backend
+                      (p/-cross-entropy-backward-dtype
+                       backend (:handle logits-data) (:handle labels) stats
+                       (:handle g)
+                       {:rows rows :classes classes :ignore-index ignore-index
+                        :loss-h loss}
+                       :f16)
+                      shape)
+                     :dtype :f16))))))
+       (let [values (vec (arr/->vec logits-data))
+             targets (mapv long (arr/->vec labels))
+             valid (keep-indexed (fn [row label]
+                                   (when (not= label ignore-index) row))
+                                 targets)
+             valid-count (count valid)
+             row-stats (mapv
+                        (fn [row]
+                          (let [base (* row classes)
+                                row-values (subvec values base (+ base classes))
+                                maximum (reduce max row-values)
+                                denominator (reduce + (map #(Math/exp (- % maximum))
+                                                           row-values))]
+                            [maximum denominator]))
+                        (range rows))
+             loss-value (if (zero? valid-count) 0.0
+                          (/ (reduce +
+                                     (map (fn [row]
+                                            (let [[maximum denominator]
+                                                  (nth row-stats row)
+                                                  label (nth targets row)]
+                                              (- (+ maximum (Math/log denominator))
+                                                 (nth values (+ (* row classes)
+                                                                label)))))
+                                          valid))
+                             valid-count))]
+         (node (arr/from-vec backend [loss-value] []) [logits]
+               (fn [self]
+                 (when-let [g @(:grad self)]
+                   (let [upstream (arr/->scalar g)
+                         scale (if (zero? valid-count) 0.0
+                                   (/ upstream valid-count))
+                         gradient
+                         (mapv
+                          (fn [index]
+                            (let [row (quot index classes)
+                                  c (mod index classes)
+                                  label (nth targets row)]
+                              (if (= label ignore-index) 0.0
+                                  (let [[maximum denominator] (nth row-stats row)
+                                        probability (/ (Math/exp
+                                                        (- (nth values index) maximum))
+                                                       denominator)]
+                                    (* scale (- probability
+                                                (if (= c label) 1.0 0.0)))))))
+                          (range (* rows classes)))]
+                     (accumulate! logits
+                                  (arr/from-vec backend gradient shape
+                                                (or (:dtype logits-data) :f32))))))))))))
+
 ;; --- conv2d (2026-07-13 "raise the maturity" loop) --------------------------
 ;; num.tensor/conv2d bundles im2col + matmul + reshape into one opaque
 ;; function with no seam to hook a backward onto. conv2d* below decomposes
