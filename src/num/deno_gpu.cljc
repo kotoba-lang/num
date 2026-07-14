@@ -410,6 +410,16 @@
                                                   n 0 0]))]
                         [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
            output))
+       (-scale-dtype [_ alpha xh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU scale supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :scale-f16)
+                        [xh output
+                         (wb/uni dev (wb/u32-tag [n 0 0 0]))
+                         (wb/uni dev [(double alpha)])]
+                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+           output))
        (-gemm-dtype [_ Ah m k Bh n dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
@@ -494,6 +504,16 @@
                          (wb/uni dev (wb/u32-tag
                                       [total input-block output-block input-offset]))]
                         [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-nchw-to-rgb-image-dtype [_ input-h {:keys [height width total]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RGB conversion supports f16 only"
+                           {:dtype dtype*})))
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :nchw-to-rgb-image-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        [(wb/ceil-div total 64) 1 1])
            output))
        (-embedding-dtype [_ indices-h weight-h {:keys [tokens rows dim]} dtype*]
          (when-not (= dtype* :f16)

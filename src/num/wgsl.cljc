@@ -2207,6 +2207,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = clamp(0.5 * (input[source] + 1.0), 0.0, 1.0);
 }")
 
+(def nchw-to-rgb-image-f16-wgsl
+  "Read packed F16 NCHW and emit f32 NHWC RGB in one dispatch."
+  "
+struct Params { height: u32, width: u32, total: u32, pad0: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+fn load(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.total) { return; }
+  let plane = p.height * p.width; let channel = index % 3u;
+  let spatial = (index / 3u) % plane; let batch = index / (3u * plane);
+  let source = (batch * 3u + channel) * plane + spatial;
+  output[index] = clamp(0.5 * (load(source) + 1.0), 0.0, 1.0);
+}")
+
+(def scale-f16-wgsl
+  "Immutable packed-F16 scalar multiplication with f32 evaluation."
+  "
+struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@group(0) @binding(3) var<uniform> alpha: f32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u; if (first >= p.count) { return; }
+  var values = unpack2x16float(input[gid.x]) * alpha;
+  if (first + 1u >= p.count) { values.y = 0.0; }
+  output[gid.x] = pack2x16float(values);
+}")
+
 (def f16-to-f32-wgsl
   "Expand packed IEEE binary16 storage into one f32 per output element."
   "
@@ -2425,6 +2461,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :q8-0-embedding q8-0-embedding-wgsl
    :rgb-image-to-nchw rgb-image-to-nchw-wgsl
    :nchw-to-rgb-image nchw-to-rgb-image-wgsl
+   :nchw-to-rgb-image-f16 nchw-to-rgb-image-f16-wgsl
+   :scale-f16 scale-f16-wgsl
    :f16-to-f32 f16-to-f32-wgsl
    :f32-to-f16 f32-to-f16-wgsl
    :bf16-to-f32 bf16-to-f32-wgsl

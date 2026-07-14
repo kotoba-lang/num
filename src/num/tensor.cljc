@@ -782,12 +782,24 @@
         output-shape [batch height width channels]]
     (when-not (and (= 4 (count shape)) (= 3 channels))
       (throw (ex-info "nchw-to-rgb-image requires NCHW RGB" {:shape shape})))
-    (if (and (= :f32 (array-dtype input)) (satisfies? p/ITensorBackend backend))
+    (cond
+      (and (= :f32 (array-dtype input)) (satisfies? p/ITensorBackend backend))
       (assoc (arr/->NDArray backend
                             (p/-nchw-to-rgb-image
                              backend (:handle input)
                              {:batch batch :height height :width width :total total})
                             output-shape) :dtype :f32)
+      (and (not= :f32 (array-dtype input))
+           (satisfies? p/IDTypeTensorOps backend))
+      (assoc (arr/->NDArray
+              backend
+              (p/-nchw-to-rgb-image-dtype
+               backend (:handle input)
+               {:batch batch :height height :width width :total total}
+               (array-dtype input))
+              output-shape)
+             :dtype :f32)
+      :else
       (let [source (vec (arr/->vec input))]
         (arr/from-vec
          backend
@@ -958,11 +970,21 @@
     (when (empty? shape)
       (throw (ex-info "num.tensor/scale requires a non-scalar tensor"
                       {:shape shape})))
-    (let [copy (slice-axis input 0 0 (first shape))]
-      (if (= :f32 dtype)
-        (nm/scal! (double factor) copy)
-        (arr/from-vec (:backend input)
-                      (mapv #(* (double factor) %) (arr/->vec copy))
+    (let [backend (:backend input)]
+      (cond
+        (= :f32 dtype)
+        (nm/scal! (double factor) (slice-axis input 0 0 (first shape)))
+
+        (satisfies? p/IDTypeOps backend)
+        (assoc (arr/->NDArray backend
+                              (p/-scale-dtype backend (double factor)
+                                              (:handle input) (arr/nelems shape) dtype)
+                              shape)
+               :dtype dtype)
+
+        :else
+        (arr/from-vec backend
+                      (mapv #(* (double factor) %) (arr/->vec input))
                       shape dtype)))))
 
 (defn copy-into!

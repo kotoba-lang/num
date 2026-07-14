@@ -187,6 +187,9 @@ paths downloads intermediate tensors.
 Packed F16 nearest upsampling and contiguous slicing also execute directly over
 physical half buffers, including odd logical element counts and unaligned slice
 offsets; uploads pad only the final storage word without changing tensor shape.
+Immutable scalar scaling stays packed F16, while the terminal NCHW F16 to NHWC
+f32 RGB conversion performs layout, range conversion, and unpacking in one
+dispatch instead of allocating a full intermediate f32 tensor.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet

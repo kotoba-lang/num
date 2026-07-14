@@ -290,6 +290,9 @@
               :tanh-gradient (fn [y] (- 1.0 (* y y)))
               :gelu-gradient gelu-gradient-value)]
       (typed-handle dtype* (mapv f (take n (typed-values xh))))))
+  (-scale-dtype [_ alpha xh n dtype*]
+    (typed-handle dtype*
+                  (mapv #(* (double alpha) %) (take n (typed-values xh)))))
   (-gemm-dtype [_ Ah m k Bh n dtype*]
     (let [A (typed-values Ah) B (typed-values Bh)]
       (typed-handle
