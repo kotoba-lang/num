@@ -1844,6 +1844,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[word] = pack2x16float(vec2<f32>(gather(base), second));
 }")
 
+(def embedding-backward-f16-wgsl
+  "Conflict-free embedding-table VJP. One invocation owns one f32 weight
+  gradient and gathers every occurrence, so repeated token IDs sum
+  deterministically without atomics."
+  "
+struct Params { tokens: u32, rows: u32, dim: u32, total: u32 }
+@group(0) @binding(0) var<storage, read> indices: array<f32>;
+@group(0) @binding(1) var<storage, read> grad_output: array<u32>;
+@group(0) @binding(2) var<storage, read_write> grad_weight: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+fn load_grad(index: u32) -> f32 {
+  let pair = unpack2x16float(grad_output[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let weight_index = gid.x;
+  if (weight_index >= p.total) { return; }
+  let row = weight_index / p.dim;
+  let feature = weight_index % p.dim;
+  var sum = 0.0;
+  for (var token = 0u; token < p.tokens; token += 1u) {
+    if (u32(indices[token]) == row) {
+      sum += load_grad(token * p.dim + feature);
+    }
+  }
+  grad_weight[weight_index] = sum;
+}")
+
 (def rms-norm-wgsl
   "One workgroup per row RMSNorm. Each lane accumulates strided features and
   the workgroup reduction avoids recomputing row statistics per output."
@@ -2720,6 +2749,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :group-norm-nchw-f16 group-norm-nchw-f16-wgsl
    :group-norm-nchw-f16-reference group-norm-nchw-f16-reference-wgsl
    :embedding-f16 embedding-f16-wgsl
+   :embedding-backward-f16 embedding-backward-f16-wgsl
    :rms-norm-f16 rms-norm-f16-wgsl
    :rms-norm-backward-stats-f16 rms-norm-backward-stats-f16-wgsl
    :rms-norm-backward-f16 rms-norm-backward-f16-wgsl

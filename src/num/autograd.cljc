@@ -730,23 +730,38 @@
   [indices weight]
   (let [weight-data (:data weight)
         output (t/embedding indices weight-data)
-        ids (delay (mapv long (arr/->vec indices)))
+        backend (:backend weight-data)
         [rows dim] (:shape weight-data)]
     (node output [weight]
           (fn [self]
             (when-let [g @(:grad self)]
-              (let [gs (vec (arr/->vec g))
-                    dw (double-array (* rows dim))]
-                (doseq [[token-pos row] (map-indexed vector @ids)
-                        feature (range dim)]
-                  (let [weight-index (+ (* row dim) feature)
-                        gradient-index (+ (* token-pos dim) feature)]
-                    (aset dw weight-index
-                          (+ (aget dw weight-index) (nth gs gradient-index)))))
-                (accumulate! weight
-                             (arr/from-vec (:backend weight-data) (vec dw)
-                                           (:shape weight-data)
-                                           (or (:dtype weight-data) :f32)))))))))
+              (if (and (= :f16 (:dtype weight-data) (:dtype g))
+                       (= backend (:backend indices) (:backend g))
+                       (satisfies? p/IDTypeTensorOps backend))
+                (accumulate!
+                 weight
+                 (assoc
+                  (arr/->NDArray
+                   backend
+                   (p/-embedding-backward-dtype
+                    backend (:handle indices) (:handle g)
+                    {:tokens (arr/nelems (:shape indices)) :rows rows :dim dim}
+                    :f16)
+                   (:shape weight-data))
+                  :dtype :f32))
+                (let [ids (mapv long (arr/->vec indices))
+                      gs (vec (arr/->vec g))
+                      dw (double-array (* rows dim))]
+                  (doseq [[token-pos row] (map-indexed vector ids)
+                          feature (range dim)]
+                    (let [weight-index (+ (* row dim) feature)
+                          gradient-index (+ (* token-pos dim) feature)]
+                      (aset dw weight-index
+                            (+ (aget dw weight-index) (nth gs gradient-index)))))
+                  (accumulate! weight
+                               (arr/from-vec backend (vec dw)
+                                             (:shape weight-data)
+                                             (or (:dtype weight-data) :f32))))))))))
 
 (defn rms-norm-last*
   "Differentiable RMSNorm over the final dimension."

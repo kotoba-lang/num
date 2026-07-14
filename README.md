@@ -212,6 +212,10 @@ an F16 activation VJP and a conflict-free f32 affine-weight VJP entirely on the
 device. SiLU backward is composed from typed elementwise kernels without host
 materialization, completing the normalization and SwiGLU boundaries used by
 Llama training.
+Packed-F16 embedding backward assigns one invocation to each table element and
+gathers all matching token positions into an f32 gradient. Repeated IDs are
+therefore deterministic and race-free without atomics or host scatter-adds,
+which closes the token-to-transformer training boundary for complete LMs.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet

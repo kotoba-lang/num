@@ -597,6 +597,18 @@
                          (wb/uni dev (wb/u32-tag [tokens rows dim 0]))]
                         [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
            output))
+       (-embedding-backward-dtype
+         [_ indices-h grad-output-h {:keys [tokens rows dim]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU embedding backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows dim)
+               grad-weight (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding-backward-f16)
+                        [indices-h grad-output-h grad-weight
+                         (wb/uni dev (wb/u32-tag [tokens rows dim total]))]
+                        [(wb/ceil-div total 64) 1 1])
+           grad-weight))
        (-rms-norm-dtype [_ input-h weight-h {:keys [rows dim eps]} dtype*]
          (when-not (and (= dtype* :f16) (even? dim))
            (throw (ex-info "typed GPU RMSNorm requires f16 and even features"
