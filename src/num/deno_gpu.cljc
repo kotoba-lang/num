@@ -74,6 +74,7 @@
                         live-bytes (+ (:live-bytes state) bytes)]
                     (-> state
                         (assoc :live-buffers live-buffers :live-bytes live-bytes)
+                        (update-in [:live-buffers-by-size bytes] (fnil inc 0))
                         (update :created-buffers inc)
                         (update :created-bytes + bytes)
                         (update :peak-live-buffers max live-buffers)
@@ -82,12 +83,20 @@
 
      (defn- record-destroy! [stats buffer]
        (let [bytes (.-size buffer)]
-         (swap! stats #(-> %
-                           (update :live-buffers dec)
-                           (update :live-bytes - bytes)
-                           (update :destroyed-buffers inc)
-                           (update :destroyed-bytes + bytes))))
-       (.destroy buffer))
+         (swap! stats
+                (fn [state]
+                  (let [remaining (dec (get-in state
+                                               [:live-buffers-by-size bytes] 0))]
+                    (cond-> (-> state
+                                (update :live-buffers dec)
+                                (update :live-bytes - bytes)
+                                (update :destroyed-buffers inc)
+                                (update :destroyed-bytes + bytes))
+                      (pos? remaining)
+                      (assoc-in [:live-buffers-by-size bytes] remaining)
+                      (not (pos? remaining))
+                      (update :live-buffers-by-size dissoc bytes)))))
+         (.destroy buffer)))
 
      (deftype DenoGpuDevice [dev stats]
        w/IGpuDevice
@@ -952,7 +961,8 @@
          (atom {:live-buffers 0 :live-bytes 0
                 :peak-live-buffers 0 :peak-live-bytes 0
                 :created-buffers 0 :created-bytes 0
-                :destroyed-buffers 0 :destroyed-bytes 0}))
+                :destroyed-buffers 0 :destroyed-bytes 0
+                :live-buffers-by-size {}}))
         (atom {})))
 
      (defn backend-stats

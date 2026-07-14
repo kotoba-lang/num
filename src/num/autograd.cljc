@@ -30,7 +30,19 @@
 (defrecord Value [data grad backward-fn parents])
 
 (defn- accumulate! [v contrib]
-  (swap! (:grad v) (fn [g] (if g (t/add g contrib) contrib))))
+  (swap! (:grad v)
+         (fn [g]
+           (if g
+             (do
+               (when-let [temporaries (:gradient-temporaries (meta *tape*))]
+                 ;; The summed gradient owns fresh storage. Neither displaced
+                 ;; input is necessarily reachable from a tape node: residual
+                 ;; branches commonly contribute a freshly produced VJP into
+                 ;; an already accumulated gradient. Track both operands so a
+                 ;; model-level lifecycle can release them after backward.
+                 (swap! temporaries into [g contrib]))
+               (t/add g contrib))
+             contrib))))
 
 (defn- record! [v]
   (when *tape* (swap! *tape* conj v))
@@ -48,7 +60,7 @@
 (defmacro with-tape
   "Run `body` with a fresh tape bound. Returns `[result tape-atom]`."
   [& body]
-  `(binding [*tape* (atom [])]
+  `(binding [*tape* (atom [] :meta {:gradient-temporaries (atom [])})]
      [(do ~@body) *tape*]))
 
 (defn backward!
@@ -56,9 +68,10 @@
   scalar loss node, a 1-element NDArray) and propagate through `tape` (the
   second element `with-tape` returned) in reverse creation order."
   [v seed tape]
-  (accumulate! v seed)
-  (doseq [nd (reverse @tape)]
-    ((:backward-fn nd) nd)))
+  (binding [*tape* tape]
+    (accumulate! v seed)
+    (doseq [nd (reverse @tape)]
+      ((:backward-fn nd) nd))))
 
 ;; --- ops -------------------------------------------------------------------
 
@@ -105,8 +118,13 @@
                                :input-shape (:shape (:data x))
                                :gradient-dtype (:dtype g)
                                :gradient-shape (:shape g)})))
-            (accumulate! x (t/matmul g (swap-last-two (:data W))))
-            (accumulate! W (t/matmul (swap-last-two (:data x)) g))))))
+            (let [weight-t (swap-last-two (:data W))
+                  input-t (swap-last-two (:data x))
+                  input-gradient (t/matmul g weight-t)
+                  weight-gradient (t/matmul input-t g)]
+              (arr/release-all! [weight-t input-t])
+              (accumulate! x input-gradient)
+              (accumulate! W weight-gradient))))))
 
 (defn add-bias*
   "z = x + b, b broadcast over x's leading (batch) axis. dL/dx = dL/dz;
