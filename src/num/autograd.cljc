@@ -104,7 +104,13 @@
         (fn [self]
           (when-let [g @(:grad self)]
             (accumulate! x g)
-            (accumulate! b (t/sum g 0))))))
+            (let [gradient-dtype (or (:dtype g) :f32)]
+              (if (= gradient-dtype :f32)
+                (accumulate! b (t/sum g 0))
+                (let [stable-gradient (arr/cast g :f32)
+                      bias-gradient (t/sum stable-gradient 0)]
+                  (arr/release! stable-gradient)
+                  (accumulate! b bias-gradient))))))))
 
 (defn add*
   "Elementwise addition of equal-shaped Values, including residual branches."

@@ -205,6 +205,8 @@ Q/K/V and upstream gradients are expanded by device kernels, the existing fused
 f32 stable-softmax VJP computes conflict-free Q/K/V gradients, and cast kernels
 return them to the typed graph. No tensor is downloaded; the implementation
 reuses the same backward equations as the independently checked f32 path.
+Typed projection bias backward likewise keeps the upstream tensor packed while
+casting only its row reduction to the device's f32 `sum-rows` stability path.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet
