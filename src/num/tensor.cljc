@@ -886,7 +886,8 @@
             total (arr/nelems out-shape)
             backend (:backend input)
             dtype (array-dtype input)]
-        (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+        (cond
+          (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
           (assoc (arr/->NDArray
                   backend
                   (p/-slice-axis backend (:handle input)
@@ -895,6 +896,15 @@
                                   :input-offset (* start inner)})
                   out-shape)
                  :dtype :f32)
+
+          (and (not= :f32 dtype) (satisfies? p/ICastOps backend))
+          (let [source (arr/cast input :f32)
+                sliced (slice-axis source axis start end)
+                output (arr/cast sliced dtype)]
+            (arr/release-all! [source sliced])
+            output)
+
+          :else
           (let [source (arr/->vec input)
                 outer (arr/nelems (subvec shape 0 axis))
                 output (vec
@@ -1057,7 +1067,10 @@
   ([input num-groups weight bias eps]
    (if (= :f32 (array-dtype input))
      (group-norm-nchw input num-groups weight bias eps true)
-     (silu (group-norm-nchw input num-groups weight bias eps)))))
+     (let [normalized (group-norm-nchw input num-groups weight bias eps)
+           output (silu normalized)]
+       (arr/release! normalized)
+       output))))
 
 (defn layer-norm-last
   "PyTorch-compatible LayerNorm over the final tensor dimension. `weight` and

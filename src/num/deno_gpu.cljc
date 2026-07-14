@@ -367,6 +367,24 @@
        (-copy-to-host-dtype [_ h n dtype*]
          (w/-read-buffer-dtype dev h n dtype*))
 
+       p/ICastOps
+       (-cast-dtype [_ input n source-dtype target-dtype]
+         (case [source-dtype target-dtype]
+           [:f16 :f32]
+           (let [output (w/-create-buffer dev n :storage)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :f16-to-f32)
+                          [input output (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                          [(wb/ceil-div n 64) 1 1])
+             output)
+           [:f32 :f16]
+           (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :f32-to-f16)
+                          [input output (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                          [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+             output)
+           (throw (ex-info "unsupported GPU dtype cast"
+                           {:source source-dtype :target target-dtype}))))
+
        p/IDTypeOps
        (-ewise-dtype [_ op xh yh n dtype*]
          (when-not (= dtype* :f16)

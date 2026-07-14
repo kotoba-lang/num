@@ -64,9 +64,17 @@
 (defn cast
   "Materialize `a` in physical `target-dtype` storage on the same backend."
   [a target-dtype]
-  (if (= (or (:dtype a) :f32) target-dtype)
-    a
-    (from-vec (:backend a) (->vec a) (:shape a) target-dtype)))
+  (let [source-dtype (or (:dtype a) :f32)
+        backend (:backend a)]
+    (cond
+      (= source-dtype target-dtype) a
+      (satisfies? p/ICastOps backend)
+      (assoc (->NDArray backend
+                        (p/-cast-dtype backend (:handle a) (nelems (:shape a))
+                                       source-dtype target-dtype)
+                        (:shape a))
+             :dtype target-dtype)
+      :else (from-vec backend (->vec a) (:shape a) target-dtype))))
 
 (defn ->scalar
   "Read a 1-element NDArray as a host double."

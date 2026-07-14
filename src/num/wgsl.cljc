@@ -2081,6 +2081,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[i] = select(pair.x, pair.y, (i & 1u) == 1u);
 }")
 
+(def f32-to-f16-wgsl
+  "Pack pairs of f32 values into physical IEEE binary16 storage."
+  "
+struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x; let first = word * 2u;
+  if (first >= p.count) { return; }
+  let second = select(0.0, input[first + 1u], first + 1u < p.count);
+  output[word] = pack2x16float(vec2<f32>(input[first], second));
+}")
+
 (def bf16-to-f32-wgsl
   "Expand packed bfloat16 storage into one f32 per output element."
   "
@@ -2271,6 +2286,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :rgb-image-to-nchw rgb-image-to-nchw-wgsl
    :nchw-to-rgb-image nchw-to-rgb-image-wgsl
    :f16-to-f32 f16-to-f32-wgsl
+   :f32-to-f16 f32-to-f16-wgsl
    :bf16-to-f32 bf16-to-f32-wgsl
    :paged-kv-write paged-kv-write-wgsl
    :paged-kv-copy-block paged-kv-copy-block-wgsl

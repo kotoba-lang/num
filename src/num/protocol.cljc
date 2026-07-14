@@ -54,6 +54,10 @@
   (-copy-from-host-dtype [b xs dtype] "Quantize/upload host values as `dtype`.")
   (-copy-to-host-dtype [b h n dtype] "Decode/download `n` `dtype` elements."))
 
+(defprotocol ICastOps
+  "Optional device-native conversion between physical storage dtypes."
+  (-cast-dtype [b h n source-dtype target-dtype]))
+
 (defprotocol IDTypeOps
   "Optional compute contract over physical non-f32 storage. Accumulation policy
   is backend-defined; outputs must be materialized in the requested dtype."

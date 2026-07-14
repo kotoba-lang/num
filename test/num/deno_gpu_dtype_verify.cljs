@@ -87,17 +87,19 @@
                  copy-destination (arr/zeros backend [6] :f16)
                  _ (tensor/copy-into! copy-destination
                                       (arr/from-vec backend [0.25 -0.5] [2] :f16) 2)
+                 cast-f32 (arr/cast a :f32)
+                 cast-back (arr/cast cast-f32 :f16)
                  outputs [(num/add a b) (num/silu a) (num/sigmoid a) (num/tanh a)
                           (num/gelu a)
                           (num/matmul a b) conv norm layernorm embedding rmsnorm rope
-                          copy-destination]]
+                          copy-destination cast-f32 cast-back]]
              (println "adapter:" (or (gpu/adapter-description device-result) "unknown"))
              (println "f16 physical bytes:" (.-size (:handle a)))
              (.then
               (js/Promise.all (into-array (map arr/->vec (into [a] outputs))))
               (fn [actual]
                 (let [input-values (vec (aget actual 0))
-                      actual-values (mapv #(vec (aget actual %)) (range 1 14))
+                      actual-values (mapv #(vec (aget actual %)) (range 1 16))
                       _ (println "uploaded:" input-values)
                       checks [(= 8 (.-size (:handle a)))
                               (approx-vec? (nth expected 0) (nth actual-values 0) 0.002)
@@ -112,7 +114,11 @@
                               (approx-vec? (nth expected 9) (nth actual-values 9) 0.002)
                               (approx-vec? (nth expected 10) (nth actual-values 10) 0.01)
                               (approx-vec? (nth expected 11) (nth actual-values 11) 0.002)
-                              (approx-vec? (nth expected 12) (nth actual-values 12) 0.002)]
+                              (approx-vec? (nth expected 12) (nth actual-values 12) 0.002)
+                              (approx-vec? [1.0 2.0 3.0 4.0]
+                                           (nth actual-values 13) 0.0001)
+                              (approx-vec? [1.0 2.0 3.0 4.0]
+                                           (nth actual-values 14) 0.002)]
                       passed (count (filter true? checks))]
                   (println (str "Metal f16: " passed "/" (count checks) " passed"))
                   (when-not (= passed (count checks))
