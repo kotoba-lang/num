@@ -7,7 +7,8 @@
 (defrecord QuantizedTable [backend handle shape quant-type byte-count block-size])
 
 (def ^:private layouts
-  {:q4-k {:block-size 256 :bytes-per-block 144}
+  {:q5-0 {:block-size 32 :bytes-per-block 22}
+   :q4-k {:block-size 256 :bytes-per-block 144}
    :q6-k {:block-size 256 :bytes-per-block 210}
    :q8-0 {:block-size 32 :bytes-per-block 34}})
 
@@ -15,8 +16,11 @@
   (let [{:keys [block-size bytes-per-block]} (layouts quant-type)]
     (when-not (and (= 2 (count shape)) block-size bytes-per-block
                    (pos-int? rows) (pos-int? cols)
-                   (zero? (mod cols block-size))
-                   (= (count bytes) (* rows (quot cols block-size) bytes-per-block))
+                   (if (= quant-type :q5-0)
+                     (zero? (mod (* rows cols) block-size))
+                     (zero? (mod cols block-size)))
+                   (= (count bytes) (* (quot (* rows cols) block-size)
+                                       bytes-per-block))
                    (satisfies? p/IQuantizedOps backend))
       (throw (ex-info "invalid or unsupported packed quantized tensor"
                       {:shape shape :quant-type quant-type :bytes (count bytes)})))

@@ -45,6 +45,7 @@
   pulling in `core.async` (not needed here — no complex internal control flow, just
   a couple of `.then` chains)."
   (:require [num.protocol :as p]
+            [num.array :as arr]
             [num.dtype :as dtype]
             [num.wgsl :as w]
             [num.wgsl-backend :as wb]))
@@ -73,6 +74,7 @@
                         live-bytes (+ (:live-bytes state) bytes)]
                     (-> state
                         (assoc :live-buffers live-buffers :live-bytes live-bytes)
+                        (update-in [:live-buffers-by-size bytes] (fnil inc 0))
                         (update :created-buffers inc)
                         (update :created-bytes + bytes)
                         (update :peak-live-buffers max live-buffers)
@@ -81,12 +83,20 @@
 
      (defn- record-destroy! [stats buffer]
        (let [bytes (.-size buffer)]
-         (swap! stats #(-> %
-                           (update :live-buffers dec)
-                           (update :live-bytes - bytes)
-                           (update :destroyed-buffers inc)
-                           (update :destroyed-bytes + bytes))))
-       (.destroy buffer))
+         (swap! stats
+                (fn [state]
+                  (let [remaining (dec (get-in state
+                                               [:live-buffers-by-size bytes] 0))]
+                    (cond-> (-> state
+                                (update :live-buffers dec)
+                                (update :live-bytes - bytes)
+                                (update :destroyed-buffers inc)
+                                (update :destroyed-bytes + bytes))
+                      (pos? remaining)
+                      (assoc-in [:live-buffers-by-size bytes] remaining)
+                      (not (pos? remaining))
+                      (update :live-buffers-by-size dissoc bytes)))))
+         (.destroy buffer)))
 
      (deftype DenoGpuDevice [dev stats]
        w/IGpuDevice
@@ -172,8 +182,9 @@
        (-write-buffer-dtype [_ buf xs dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
-         (let [encoded (js/Uint16Array.
-                        (into-array (map #(bit-and (dtype/f32->f16-bits %) 0xffff) xs)))]
+         (let [values (mapv #(bit-and (dtype/f32->f16-bits %) 0xffff) xs)
+               encoded (js/Uint16Array.
+                        (into-array (cond-> values (odd? (count values)) (conj 0))))]
            (.writeBuffer (.-queue dev) buf 0 encoded)))
        (-read-buffer-dtype [_ buf n dtype*]
          (when-not (= dtype* :f16)
@@ -306,12 +317,13 @@
            buffer))
        (-quantized-matmul [_ input-h weight-h
                            {:keys [quant-type m k n blocks-per-row]}]
-         (when-not (#{:q4-k :q6-k :q8-0} quant-type)
+         (when-not (#{:q5-0 :q4-k :q6-k :q8-0} quant-type)
            (throw (ex-info "unsupported WebGPU quantized matmul"
                            {:quant-type quant-type})))
          (let [output (w/-create-buffer dev (* m n) :storage)]
            (w/-dispatch dev (wb/get-pipeline
-                             dev pipes ({:q4-k :q4-k-matmul
+                             dev pipes ({:q5-0 :q5-0-matmul
+                                        :q4-k :q4-k-matmul
                                         :q6-k :q6-k-matmul
                                         :q8-0 :q8-0-matmul} quant-type))
                         [input-h weight-h output
@@ -320,7 +332,8 @@
            output))
        (-quantized-embedding [_ indices-h table-h
                               {:keys [quant-type rows dim count blocks-per-row total]}]
-         (let [pipeline ({:q4-k :q4-k-embedding :q6-k :q6-k-embedding
+         (let [pipeline ({:q5-0 :q5-0-embedding
+                          :q4-k :q4-k-embedding :q6-k :q6-k-embedding
                           :q8-0 :q8-0-embedding} quant-type)]
            (when-not pipeline
              (throw (ex-info "unsupported WebGPU quantized embedding"
@@ -364,6 +377,24 @@
        (-copy-to-host-dtype [_ h n dtype*]
          (w/-read-buffer-dtype dev h n dtype*))
 
+       p/ICastOps
+       (-cast-dtype [_ input n source-dtype target-dtype]
+         (case [source-dtype target-dtype]
+           [:f16 :f32]
+           (let [output (w/-create-buffer dev n :storage)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :f16-to-f32)
+                          [input output (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                          [(wb/ceil-div n 64) 1 1])
+             output)
+           [:f32 :f16]
+           (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :f32-to-f16)
+                          [input output (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                          [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+             output)
+           (throw (ex-info "unsupported GPU dtype cast"
+                           {:source source-dtype :target target-dtype}))))
+
        p/IDTypeOps
        (-ewise-dtype [_ op xh yh n dtype*]
          (when-not (= dtype* :f16)
@@ -386,6 +417,16 @@
                                                    :sigmoid-gradient 6 :tanh-gradient 7
                                                    :gelu 8 :gelu-gradient 9} op)
                                                   n 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+           output))
+       (-scale-dtype [_ alpha xh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU scale supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :scale-f16)
+                        [xh output
+                         (wb/uni dev (wb/u32-tag [n 0 0 0]))
+                         (wb/uni dev [(double alpha)])]
                         [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
            output))
        (-gemm-dtype [_ Ah m k Bh n dtype*]
@@ -423,7 +464,7 @@
            output))
        (-group-norm-nchw-dtype [_ input-h weight-h bias-h
                                 {:keys [n c h width groups channels-group
-                                        group-size eps]} dtype*]
+                                        group-size eps silu?]} dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "typed GPU GroupNorm supports f16 only" {:dtype dtype*})))
          (let [total (* n c h width)
@@ -433,15 +474,127 @@
                             (w/-write-buffer-dtype dev buffer (repeat c 1.0) :f16)
                             buffer))
                bias (or bias-h (w/-create-buffer-dtype dev c :storage :f16))]
-           (w/-dispatch dev (wb/get-pipeline dev pipes :group-norm-nchw-f16)
+           (w/-dispatch dev (wb/get-pipeline
+                             dev pipes (if (even? group-size)
+                                         :group-norm-nchw-f16
+                                         :group-norm-nchw-f16-reference))
                         [input-h weight bias output
                          (wb/uni dev (wb/u32-tag
                                       [n c h width groups channels-group
-                                       group-size (* h width)]))
+                                       group-size (* h width) (if silu? 1 0)]))
                          (wb/uni dev [(double eps)])]
-                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+                        (if (even? group-size)
+                          [(* n groups) 1 1]
+                          [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1]))
            (when-not weight-h (w/-destroy-buffer dev weight))
            (when-not bias-h (w/-destroy-buffer dev bias))
+           output))
+       (-upsample-nearest2d-dtype [_ input-h
+                                    {:keys [n c h width oh ow scale-h scale-w]}
+                                    dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU upsample supports f16 only" {:dtype dtype*})))
+         (let [total (* n c oh ow)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :upsample-nearest2d-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [n c h width oh ow scale-h scale-w total]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-slice-axis-dtype [_ input-h
+                           {:keys [total input-block output-block input-offset]}
+                           dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU slice supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :slice-axis-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [total input-block output-block input-offset]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-nchw-to-rgb-image-dtype [_ input-h {:keys [height width total]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RGB conversion supports f16 only"
+                           {:dtype dtype*})))
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :nchw-to-rgb-image-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-transpose-dtype [_ input-h
+                          {:keys [rank total input-shape output-shape perm]}
+                          dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU transpose supports f16 only" {:dtype dtype*})))
+         (let [pad4 #(vec (take 4 (concat % (repeat 0))))
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               params (concat [rank total 0 0] (pad4 input-shape)
+                              (pad4 output-shape) (pad4 perm))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-nd-f16)
+                        [input-h output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-multi-head-attention-dtype
+         [_ query-h key-h value-h
+          {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim total
+                  causal?]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU attention supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention-f16)
+                        [query-h key-h value-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total
+                                       (if causal? 1 0) 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-multi-head-attention-backward-dtype
+         [_ query-h key-h value-h grad-output-h
+          {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim
+                  causal?]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU attention backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total-q (* batch seq-q d-model)
+               total-k (* batch seq-k kv-d-model)
+               total (max total-q total-k)
+               expand (fn [input n]
+                        (let [output (w/-create-buffer dev n :storage)]
+                          (w/-dispatch dev (wb/get-pipeline dev pipes :f16-to-f32)
+                                       [input output
+                                        (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                                       [(wb/ceil-div n 64) 1 1])
+                          output))
+               query (expand query-h total-q)
+               key (expand key-h total-k)
+               value (expand value-h total-k)
+               grad-output (expand grad-output-h total-q)
+               mask (w/-create-buffer dev (* batch seq-k) :storage)
+               grad-query (w/-create-buffer dev total-q :storage)
+               grad-key (w/-create-buffer dev total-k :storage)
+               grad-value (w/-create-buffer dev total-k :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention-backward)
+                        [query key value mask grad-output grad-query grad-key grad-value
+                         (wb/uni dev (wb/u32-tag
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total-q total-k total
+                                       (if causal? 1 0) 0 0 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           (doseq [temporary [query key value grad-output mask]]
+             (w/-destroy-buffer dev temporary))
+           {:query grad-query :key grad-key :value grad-value}))
+       (-add-last-axis-bias-dtype [_ input-h bias-h {:keys [total width]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU bias add supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :add-last-axis-bias-f16)
+                        [input-h bias-h output
+                         (wb/uni dev (wb/u32-tag [total width 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
            output))
        (-embedding-dtype [_ indices-h weight-h {:keys [tokens rows dim]} dtype*]
          (when-not (= dtype* :f16)
@@ -453,6 +606,18 @@
                          (wb/uni dev (wb/u32-tag [tokens rows dim 0]))]
                         [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
            output))
+       (-embedding-backward-dtype
+         [_ indices-h grad-output-h {:keys [tokens rows dim]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU embedding backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows dim)
+               grad-weight (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding-backward-f16)
+                        [indices-h grad-output-h grad-weight
+                         (wb/uni dev (wb/u32-tag [tokens rows dim total]))]
+                        [(wb/ceil-div total 64) 1 1])
+           grad-weight))
        (-rms-norm-dtype [_ input-h weight-h {:keys [rows dim eps]} dtype*]
          (when-not (and (= dtype* :f16) (even? dim))
            (throw (ex-info "typed GPU RMSNorm requires f16 and even features"
@@ -464,6 +629,61 @@
                          (wb/uni dev [(double eps)])]
                         [rows 1 1])
            output))
+       (-rms-norm-backward-dtype
+         [_ input-h weight-h grad-output-h {:keys [rows dim eps]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RMSNorm backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows dim)
+               stats (w/-create-buffer dev (* rows 2) :storage)
+               grad-input (w/-create-buffer-dtype dev total :storage :f16)
+               grad-weight (w/-create-buffer dev dim :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev pipes :rms-norm-backward-stats-f16)
+                        [input-h weight-h grad-output-h stats
+                         (wb/uni dev (wb/u32-tag [rows dim total 0]))
+                         (wb/uni dev [(double eps)])]
+                        [rows 1 1])
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rms-norm-backward-f16)
+                        [input-h weight-h grad-output-h stats grad-input grad-weight
+                         (wb/uni dev (wb/u32-tag [rows dim total 0]))]
+                        [(wb/ceil-div (max (wb/ceil-div total 2) dim) 64) 1 1])
+           (w/-destroy-buffer dev stats)
+           {:input grad-input :weight grad-weight}))
+       (-cross-entropy-forward-dtype
+         [_ logits-h labels-h {:keys [rows classes ignore-index]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU cross entropy supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows classes)
+               stats (w/-create-buffer dev (* rows 2) :storage)
+               scalar (w/-create-buffer dev 2 :storage)
+               params (wb/uni dev (wb/u32-tag
+                                   [rows classes total ignore-index]))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :cross-entropy-stats-f16)
+                        [logits-h stats params] [rows 1 1])
+           (w/-dispatch dev (wb/get-pipeline dev pipes :cross-entropy-loss-f16)
+                        [logits-h labels-h stats scalar
+                         (wb/uni dev (wb/u32-tag
+                                      [rows classes total ignore-index]))]
+                        [1 1 1])
+           {:loss scalar :stats stats}))
+       (-cross-entropy-backward-dtype
+         [_ logits-h labels-h stats-h upstream-h
+          {:keys [rows classes ignore-index loss-h]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU cross entropy backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows classes)
+               grad-logits (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev pipes :cross-entropy-gradient-f16)
+                        [logits-h labels-h stats-h loss-h upstream-h grad-logits
+                         (wb/uni dev (wb/u32-tag
+                                      [rows classes total ignore-index]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           (w/-destroy-buffer dev stats-h)
+           grad-logits))
        (-rotary-embedding-dtype
          [_ input-h {:keys [batch sequence embed heads head-dim position-offset
                             theta direction]} dtype*]
@@ -741,7 +961,8 @@
          (atom {:live-buffers 0 :live-bytes 0
                 :peak-live-buffers 0 :peak-live-bytes 0
                 :created-buffers 0 :created-bytes 0
-                :destroyed-buffers 0 :destroyed-bytes 0}))
+                :destroyed-buffers 0 :destroyed-bytes 0
+                :live-buffers-by-size {}}))
         (atom {})))
 
      (defn backend-stats
@@ -750,6 +971,192 @@
        Promise and destroyed immediately after unmap."
        [backend]
        @(.-stats (.-dev backend)))
+
+     (defn upload-byte-view
+       "Upload an already encoded little-endian f32/f16 ArrayBufferView without
+       expanding it into a JavaScript number sequence. The queue copies the
+       supplied bytes before returning; the source view may therefore alias a
+       mapped checkpoint file."
+       [backend bytes shape dtype*]
+       (dtype/check dtype*)
+       (when-not (or (= dtype* :f32) (= dtype* :f16))
+         (throw (ex-info "raw WebGPU upload supports f32/f16"
+                         {:dtype dtype*})))
+       (let [elements (arr/nelems shape)
+             expected (* elements (dtype/element-bytes dtype*))
+             actual (.-byteLength bytes)]
+         (when-not (= expected actual)
+           (throw (ex-info "raw byte length does not match shape/dtype"
+                           {:expected expected :actual actual :shape shape
+                            :dtype dtype*})))
+         (let [device (.-dev (.-dev backend))
+               buffer (if (= dtype* :f32)
+                        (w/-create-buffer (.-dev backend) elements :storage)
+                        (w/-create-buffer-dtype (.-dev backend) elements :storage :f16))
+               source (if (zero? (mod actual 4))
+                        bytes
+                        (let [padded (js/Uint8Array. (* 4 (Math/ceil (/ actual 4))))]
+                          (.set padded bytes)
+                          padded))]
+           (.writeBuffer (.-queue device) buffer 0 source)
+           (assoc (arr/->NDArray backend buffer (vec shape)) :dtype dtype*))))
+
+     (defn cast-f16-to-f32
+       "Expand a physical f16 NDArray into a device-resident f32 NDArray."
+       [input]
+       (when-not (= :f16 (:dtype input))
+         (throw (ex-info "cast-f16-to-f32 requires f16 input"
+                         {:dtype (:dtype input)})))
+       (let [backend (:backend input)
+             count (arr/nelems (:shape input))
+             dev (.-dev backend)
+             output (w/-create-buffer dev count :storage)]
+         (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :f16-to-f32)
+                      [(:handle input) output
+                       (wb/uni dev (wb/u32-tag [count 0 0 0]))]
+                      [(wb/ceil-div count 64) 1 1])
+         (assoc (arr/->NDArray backend output (:shape input)) :dtype :f32)))
+
+     (defn upload-f16-as-f32-byte-view
+       "Upload encoded f16 bytes and expand them to f32 entirely on the GPU."
+       [backend bytes shape]
+       (let [packed (upload-byte-view backend bytes shape :f16)
+             output (cast-f16-to-f32 packed)]
+         (arr/release! packed)
+         output))
+
+     (defn upload-bf16-as-f32-byte-view
+       "Upload encoded bf16 bytes and expand them to f32 entirely on the GPU."
+       [backend bytes shape]
+       ;; Raw bf16 and f16 have the same packed-u16 physical storage. The
+       ;; dedicated shader, rather than the temporary's logical tag, determines
+       ;; how those words are decoded.
+       (let [packed (upload-byte-view backend bytes shape :f16)
+             count (arr/nelems shape)
+             dev (.-dev backend)
+             output (w/-create-buffer dev count :storage)]
+         (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :bf16-to-f32)
+                      [(:handle packed) output
+                       (wb/uni dev (wb/u32-tag [count 0 0 0]))]
+                      [(wb/ceil-div count 64) 1 1])
+         (arr/release! packed)
+         (assoc (arr/->NDArray backend output (vec shape)) :dtype :f32)))
+
+     (defn paged-kv-write!
+       "Write one K/V token into `[physical-block,offset]` without host readback."
+       [key-pool value-pool key value block offset]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             backend (:backend key-pool)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (= kv-width (arr/nelems (:shape key)))
+                        (= kv-width (arr/nelems (:shape value)))
+                        (<= 0 block) (< block blocks)
+                        (<= 0 offset) (< offset block-size))
+           (throw (ex-info "invalid paged KV write shapes or address"
+                           {:pool (:shape key-pool) :key (:shape key)
+                            :value (:shape value) :block block :offset offset})))
+         (let [dev (.-dev backend)]
+           (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :paged-kv-write)
+                        [(:handle key) (:handle value)
+                         (:handle key-pool) (:handle value-pool)
+                         (wb/uni dev (wb/u32-tag
+                                      [block offset block-size kv-width]))]
+                        [(wb/ceil-div kv-width 64) 1 1]))
+         nil))
+
+     (defn paged-kv-copy-block!
+       "Copy `tokens` used positions from one physical block to another."
+       [key-pool value-pool source destination tokens]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             backend (:backend key-pool)
+             total (* tokens kv-width)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (<= 0 source) (< source blocks)
+                        (<= 0 destination) (< destination blocks)
+                        (not= source destination)
+                        (pos? tokens) (<= tokens block-size))
+           (throw (ex-info "invalid paged KV block copy"
+                           {:pool (:shape key-pool) :source source
+                            :destination destination :tokens tokens})))
+         (let [dev (.-dev backend)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-kv-copy-block)
+                        [(:handle key-pool) (:handle value-pool)
+                         (wb/uni dev (wb/u32-tag
+                                      [source destination tokens block-size
+                                       kv-width total 0 0]))]
+                        [(wb/ceil-div total 64) 1 1]))
+         nil))
+
+     (defn paged-gqa-attention
+       "One-token GQA decode over physical K/V pools and a logical block table."
+       [query key-pool value-pool block-table length heads kv-heads]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             model (arr/nelems (:shape query))
+             head-dim (quot model heads)
+             required-blocks (quot (+ length block-size -1) block-size)
+             backend (:backend query)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (pos? length) (<= length (* blocks block-size))
+                        (pos? heads) (pos? kv-heads)
+                        (zero? (mod heads kv-heads))
+                        (zero? (mod model heads))
+                        (= kv-width (* kv-heads head-dim))
+                        (<= required-blocks (arr/nelems (:shape block-table))))
+           (throw (ex-info "invalid paged GQA attention shapes"
+                           {:query (:shape query) :pool (:shape key-pool)
+                            :block-table (:shape block-table) :length length
+                            :heads heads :kv-heads kv-heads})))
+         (let [dev (.-dev backend)
+               output (w/-create-buffer dev model :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-gqa-attention)
+                        [(:handle query) (:handle key-pool) (:handle value-pool)
+                         (:handle block-table) output
+                         (wb/uni dev (wb/u32-tag
+                                      [length block-size kv-width heads kv-heads
+                                       head-dim model 0]))]
+                        [(wb/ceil-div model 64) 1 1])
+           (assoc (arr/->NDArray backend output (:shape query)) :dtype :f32))))
+
+     (defn paged-gqa-attention-batch
+       "Batched one-token GQA over shared physical pools. Each query row uses
+       its own block-table row and sequence length."
+       [query key-pool value-pool block-tables lengths heads kv-heads]
+       (let [[batch model] (:shape query)
+             [table-batch max-blocks] (:shape block-tables)
+             [_blocks block-size kv-width] (:shape key-pool)
+             head-dim (quot model heads)
+             backend (:backend query)
+             total (* batch model)]
+         (when-not (and (= 2 (count (:shape query)))
+                        (= (:shape key-pool) (:shape value-pool))
+                        (= batch table-batch)
+                        (= [batch] (:shape lengths))
+                        (pos? batch) (pos? max-blocks)
+                        (pos? heads) (pos? kv-heads)
+                        (zero? (mod heads kv-heads))
+                        (zero? (mod model heads))
+                        (= kv-width (* kv-heads head-dim)))
+           (throw (ex-info "invalid batched paged GQA attention shapes"
+                           {:query (:shape query) :pool (:shape key-pool)
+                            :block-tables (:shape block-tables)
+                            :lengths (:shape lengths) :heads heads
+                            :kv-heads kv-heads})))
+         (let [dev (.-dev backend)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-gqa-attention-batch)
+                        [(:handle query) (:handle key-pool) (:handle value-pool)
+                         (:handle block-tables) (:handle lengths) output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch max-blocks block-size kv-width
+                                       heads kv-heads head-dim model total 0 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           (assoc (arr/->NDArray backend output (:shape query)) :dtype :f32))))
 
      (defn gpu-backend
        "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.
@@ -767,4 +1174,12 @@
      (defn request-device [] (throw (ex-info "num.deno-gpu/request-device requires ClojureScript compiled for a Deno/WebGPU host — see README 'Live GPU backend (Deno)'." {})))
      (defn adapter-description [_] (throw (ex-info "num.deno-gpu/adapter-description requires a cljs/Deno host." {})))
      (defn backend [_] (throw (ex-info "num.deno-gpu/backend requires a cljs/Deno host." {})))
+     (defn upload-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-byte-view requires a cljs/Deno host." {})))
+     (defn cast-f16-to-f32 [& _] (throw (ex-info "num.deno-gpu/cast-f16-to-f32 requires a cljs/Deno host." {})))
+     (defn upload-f16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-f16-as-f32-byte-view requires a cljs/Deno host." {})))
+     (defn upload-bf16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-bf16-as-f32-byte-view requires a cljs/Deno host." {})))
+     (defn paged-kv-write! [& _] (throw (ex-info "num.deno-gpu/paged-kv-write! requires a cljs/Deno host." {})))
+     (defn paged-kv-copy-block! [& _] (throw (ex-info "num.deno-gpu/paged-kv-copy-block! requires a cljs/Deno host." {})))
+     (defn paged-gqa-attention [& _] (throw (ex-info "num.deno-gpu/paged-gqa-attention requires a cljs/Deno host." {})))
+     (defn paged-gqa-attention-batch [& _] (throw (ex-info "num.deno-gpu/paged-gqa-attention-batch requires a cljs/Deno host." {})))
      (defn gpu-backend [] (throw (ex-info "num.deno-gpu/gpu-backend requires a cljs/Deno host." {})))))

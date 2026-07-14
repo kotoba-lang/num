@@ -54,11 +54,16 @@
   (-copy-from-host-dtype [b xs dtype] "Quantize/upload host values as `dtype`.")
   (-copy-to-host-dtype [b h n dtype] "Decode/download `n` `dtype` elements."))
 
+(defprotocol ICastOps
+  "Optional device-native conversion between physical storage dtypes."
+  (-cast-dtype [b h n source-dtype target-dtype]))
+
 (defprotocol IDTypeOps
   "Optional compute contract over physical non-f32 storage. Accumulation policy
   is backend-defined; outputs must be materialized in the requested dtype."
   (-ewise-dtype [b op xh yh n dtype])
   (-ewise1-dtype [b op xh n dtype])
+  (-scale-dtype [b alpha xh n dtype])
   (-gemm-dtype [b Ah m k Bh n dtype]))
 
 (defprotocol IMutableBufferOps
@@ -80,8 +85,21 @@
   "Optional N-D compute operations over physical typed storage."
   (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])
   (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype])
+  (-upsample-nearest2d-dtype [b input-h params dtype])
+  (-slice-axis-dtype [b input-h params dtype])
+  (-nchw-to-rgb-image-dtype [b input-h params dtype])
+  (-transpose-dtype [b input-h params dtype])
+  (-multi-head-attention-dtype [b query-h key-h value-h params dtype])
+  (-multi-head-attention-backward-dtype
+    [b query-h key-h value-h grad-output-h params dtype])
+  (-add-last-axis-bias-dtype [b input-h bias-h params dtype])
   (-embedding-dtype [b indices-h weight-h params dtype])
+  (-embedding-backward-dtype [b indices-h grad-output-h params dtype])
   (-rms-norm-dtype [b input-h weight-h params dtype])
+  (-rms-norm-backward-dtype [b input-h weight-h grad-output-h params dtype])
+  (-cross-entropy-forward-dtype [b logits-h labels-h params dtype])
+  (-cross-entropy-backward-dtype
+    [b logits-h labels-h stats-h upstream-h params dtype])
   (-rotary-embedding-dtype [b input-h params dtype]))
 
 (defprotocol ITensorBackend

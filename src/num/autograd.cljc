@@ -30,7 +30,19 @@
 (defrecord Value [data grad backward-fn parents])
 
 (defn- accumulate! [v contrib]
-  (swap! (:grad v) (fn [g] (if g (t/add g contrib) contrib))))
+  (swap! (:grad v)
+         (fn [g]
+           (if g
+             (do
+               (when-let [temporaries (:gradient-temporaries (meta *tape*))]
+                 ;; The summed gradient owns fresh storage. Neither displaced
+                 ;; input is necessarily reachable from a tape node: residual
+                 ;; branches commonly contribute a freshly produced VJP into
+                 ;; an already accumulated gradient. Track both operands so a
+                 ;; model-level lifecycle can release them after backward.
+                 (swap! temporaries into [g contrib]))
+               (t/add g contrib))
+             contrib))))
 
 (defn- record! [v]
   (when *tape* (swap! *tape* conj v))
@@ -48,7 +60,7 @@
 (defmacro with-tape
   "Run `body` with a fresh tape bound. Returns `[result tape-atom]`."
   [& body]
-  `(binding [*tape* (atom [])]
+  `(binding [*tape* (atom [] :meta {:gradient-temporaries (atom [])})]
      [(do ~@body) *tape*]))
 
 (defn backward!
@@ -56,11 +68,26 @@
   scalar loss node, a 1-element NDArray) and propagate through `tape` (the
   second element `with-tape` returned) in reverse creation order."
   [v seed tape]
-  (accumulate! v seed)
-  (doseq [nd (reverse @tape)]
-    ((:backward-fn nd) nd)))
+  (binding [*tape* tape]
+    (accumulate! v seed)
+    (doseq [nd (reverse @tape)]
+      ((:backward-fn nd) nd))))
 
 ;; --- ops -------------------------------------------------------------------
+
+(defn cast*
+  "Differentiable physical dtype conversion. Forward materializes `dtype`;
+  backward converts the upstream gradient to the input's storage dtype before
+  accumulation, preserving graph connectivity across autocast boundaries."
+  [x dtype]
+  (let [input-dtype (or (:dtype (:data x)) :f32)]
+    (if (= input-dtype dtype)
+      x
+      (node (arr/cast (:data x) dtype)
+            [x]
+            (fn [self]
+              (when-let [g @(:grad self)]
+                (accumulate! x (arr/cast g input-dtype))))))))
 
 (defn- swap-last-two
   "Transpose the matrix dimensions while preserving any batch dimensions."
@@ -74,11 +101,30 @@
   only the final two (matrix) axes and preserve all leading batch axes."
   [x W]
   (node (t/matmul (:data x) (:data W))
-        [x W]
-        (fn [self]
-          (when-let [g @(:grad self)]
-            (accumulate! x (t/matmul g (swap-last-two (:data W))))
-            (accumulate! W (t/matmul (swap-last-two (:data x)) g))))))
+          [x W]
+          (fn [self]
+            (when-let [g @(:grad self)]
+            (when-not (= (or (:dtype g) :f32)
+                         (or (:dtype (:data W)) :f32))
+              (throw (ex-info "matmul VJP activation/weight dtype mismatch"
+                              {:gradient-dtype (:dtype g)
+                               :gradient-shape (:shape g)
+                               :weight-dtype (:dtype (:data W))
+                               :weight-shape (:shape (:data W))})))
+            (when-not (= (or (:dtype (:data x)) :f32)
+                         (or (:dtype g) :f32))
+              (throw (ex-info "matmul VJP input/gradient dtype mismatch"
+                              {:input-dtype (:dtype (:data x))
+                               :input-shape (:shape (:data x))
+                               :gradient-dtype (:dtype g)
+                               :gradient-shape (:shape g)})))
+            (let [weight-t (swap-last-two (:data W))
+                  input-t (swap-last-two (:data x))
+                  input-gradient (t/matmul g weight-t)
+                  weight-gradient (t/matmul input-t g)]
+              (arr/release-all! [weight-t input-t])
+              (accumulate! x input-gradient)
+              (accumulate! W weight-gradient))))))
 
 (defn add-bias*
   "z = x + b, b broadcast over x's leading (batch) axis. dL/dx = dL/dz;
@@ -90,7 +136,13 @@
         (fn [self]
           (when-let [g @(:grad self)]
             (accumulate! x g)
-            (accumulate! b (t/sum g 0))))))
+            (let [gradient-dtype (or (:dtype g) :f32)]
+              (if (= gradient-dtype :f32)
+                (accumulate! b (t/sum g 0))
+                (let [stable-gradient (arr/cast g :f32)
+                      bias-gradient (t/sum stable-gradient 0)]
+                  (arr/release! stable-gradient)
+                  (accumulate! b bias-gradient))))))))
 
 (defn add*
   "Elementwise addition of equal-shaped Values, including residual branches."
@@ -213,8 +265,100 @@
               (fn [self]
                 (when-let [g @(:grad self)]
                   (let [scale (* 2.0 (arr/->scalar g) (/ 1.0 n))
-                        diff-copy (arr/from-vec backend (arr/->vec diff) shape)]
-                    (accumulate! pred (nm/scal! scale diff-copy))))))))))
+                        diff-copy (arr/from-vec backend (arr/->vec diff) shape
+                                                (or (:dtype diff) :f32))]
+                    (accumulate! pred (t/scale diff-copy scale))))))))))
+
+(defn cross-entropy-loss*
+  "Mean stable cross entropy over the final logits axis.
+
+  `labels` has the logits shape without its final class dimension and stores
+  integer class IDs as ordinary num values. `ignore-index` rows contribute
+  neither loss nor gradient."
+  ([logits labels] (cross-entropy-loss* logits labels {}))
+  ([logits labels {:keys [ignore-index] :or {ignore-index -100}}]
+   (let [logits-data (:data logits)
+         backend (:backend logits-data)
+         shape (:shape logits-data)
+         classes (long (peek shape))
+         label-shape (vec (butlast shape))
+         rows (arr/nelems label-shape)]
+     (when-not (and (seq shape) (pos? classes) (= label-shape (:shape labels)))
+       (throw (ex-info "cross entropy labels must match logits without class axis"
+                       {:logits shape :labels (:shape labels)})))
+     (if (and (= :f16 (:dtype logits-data))
+              (= backend (:backend labels))
+              (satisfies? p/IDTypeTensorOps backend))
+       (let [{:keys [loss stats]}
+             (p/-cross-entropy-forward-dtype
+              backend (:handle logits-data) (:handle labels)
+              {:rows rows :classes classes :ignore-index ignore-index} :f16)
+             loss-data (assoc (arr/->NDArray backend loss []) :dtype :f32)]
+         (node loss-data [logits]
+               (fn [self]
+                 (when-let [g @(:grad self)]
+                   (accumulate!
+                    logits
+                    (assoc
+                     (arr/->NDArray
+                      backend
+                      (p/-cross-entropy-backward-dtype
+                       backend (:handle logits-data) (:handle labels) stats
+                       (:handle g)
+                       {:rows rows :classes classes :ignore-index ignore-index
+                        :loss-h loss}
+                       :f16)
+                      shape)
+                     :dtype :f16))))))
+       (let [values (vec (arr/->vec logits-data))
+             targets (mapv long (arr/->vec labels))
+             valid (keep-indexed (fn [row label]
+                                   (when (not= label ignore-index) row))
+                                 targets)
+             valid-count (count valid)
+             row-stats (mapv
+                        (fn [row]
+                          (let [base (* row classes)
+                                row-values (subvec values base (+ base classes))
+                                maximum (reduce max row-values)
+                                denominator (reduce + (map #(Math/exp (- % maximum))
+                                                           row-values))]
+                            [maximum denominator]))
+                        (range rows))
+             loss-value (if (zero? valid-count) 0.0
+                          (/ (reduce +
+                                     (map (fn [row]
+                                            (let [[maximum denominator]
+                                                  (nth row-stats row)
+                                                  label (nth targets row)]
+                                              (- (+ maximum (Math/log denominator))
+                                                 (nth values (+ (* row classes)
+                                                                label)))))
+                                          valid))
+                             valid-count))]
+         (node (arr/from-vec backend [loss-value] []) [logits]
+               (fn [self]
+                 (when-let [g @(:grad self)]
+                   (let [upstream (arr/->scalar g)
+                         scale (if (zero? valid-count) 0.0
+                                   (/ upstream valid-count))
+                         gradient
+                         (mapv
+                          (fn [index]
+                            (let [row (quot index classes)
+                                  c (mod index classes)
+                                  label (nth targets row)]
+                              (if (= label ignore-index) 0.0
+                                  (let [[maximum denominator] (nth row-stats row)
+                                        probability (/ (Math/exp
+                                                        (- (nth values index) maximum))
+                                                       denominator)]
+                                    (* scale (- probability
+                                                (if (= c label) 1.0 0.0)))))))
+                          (range (* rows classes)))]
+                     (accumulate! logits
+                                  (arr/from-vec backend gradient shape
+                                                (or (:dtype logits-data) :f32))))))))))))
 
 ;; --- conv2d (2026-07-13 "raise the maturity" loop) --------------------------
 ;; num.tensor/conv2d bundles im2col + matmul + reshape into one opaque
@@ -408,8 +552,13 @@
                            (= backend (:backend key-padding-mask)))
                        (= :f32 (:dtype q-data :f32)
                           (:dtype k-data :f32) (:dtype v-data :f32))
-                       (satisfies? p/ITensorBackend backend))]
-       (if fused?
+                       (satisfies? p/ITensorBackend backend))
+           typed-fused? (and (= backend (:backend k-data) (:backend v-data))
+                             (nil? key-padding-mask)
+                             (= :f16 (:dtype q-data) (:dtype k-data) (:dtype v-data))
+                             (satisfies? p/IDTypeTensorOps backend))]
+       (cond
+         fused?
          (node
           (t/multi-head-attention q-data k-data v-data heads opts)
           [Q K V]
@@ -431,6 +580,31 @@
                 (accumulate! Q (ndarray (:query gradients) q-shape))
                 (accumulate! K (ndarray (:key gradients) k-shape))
                 (accumulate! V (ndarray (:value gradients) (:shape v-data)))))))
+
+         typed-fused?
+         (node
+          (t/multi-head-attention q-data k-data v-data heads opts)
+          [Q K V]
+          (fn [self]
+            (when-let [g @(:grad self)]
+              (let [params {:batch batch :seq-q seq-q :seq-k seq-k
+                            :d-model d-model :kv-d-model k-d-model
+                            :heads heads :kv-heads kv-heads :head-dim d-head
+                            :causal? causal?}
+                    gradients (p/-multi-head-attention-backward-dtype
+                               backend (:handle q-data) (:handle k-data)
+                               (:handle v-data) (:handle g) params :f16)
+                    typed (fn [handle shape]
+                            (let [f32 (assoc (arr/->NDArray backend handle shape)
+                                             :dtype :f32)
+                                  f16 (arr/cast f32 :f16)]
+                              (arr/release! f32)
+                              f16))]
+                (accumulate! Q (typed (:query gradients) q-shape))
+                (accumulate! K (typed (:key gradients) k-shape))
+                (accumulate! V (typed (:value gradients) (:shape v-data)))))))
+
+         :else
          (let [q3 (if (= rank 2) (reshape* Q [1 seq-q d-model]) Q)
                k3 (if (= rank 2) (reshape* K [1 seq-k k-d-model]) K)
                v3 (if (= rank 2) (reshape* V [1 seq-k k-d-model]) V)
@@ -540,16 +714,27 @@
           [x]
           (fn [self]
             (when-let [g @(:grad self)]
-              (let [xs (arr/->vec input-data)
-                    gs (arr/->vec g)
-                    dx (mapv (fn [value upstream]
-                               (let [sigmoid (/ 1.0 (+ 1.0 (Math/exp (- (double value)))))
-                                     derivative (* sigmoid
-                                                   (+ 1.0 (* value (- 1.0 sigmoid))))]
-                                 (* upstream derivative)))
-                             xs gs)]
-                (accumulate! x (arr/from-vec (:backend input-data) dx
-                                             (:shape input-data)))))))))
+              (if (and (= :f16 (:dtype input-data))
+                       (= (:backend input-data) (:backend g))
+                       (satisfies? p/IDTypeOps (:backend input-data)))
+                (let [sigmoid (nm/sigmoid input-data)
+                      sigmoid-gradient (nm/sigmoid-gradient sigmoid)
+                      weighted-gradient (nm/mul input-data sigmoid-gradient)
+                      derivative (nm/add sigmoid weighted-gradient)
+                      dx (nm/mul g derivative)]
+                  (arr/release-all! [sigmoid sigmoid-gradient weighted-gradient
+                                     derivative])
+                  (accumulate! x dx))
+                (let [xs (arr/->vec input-data)
+                      gs (arr/->vec g)
+                      dx (mapv (fn [value upstream]
+                                 (let [sigmoid (/ 1.0 (+ 1.0 (Math/exp (- (double value)))))
+                                       derivative (* sigmoid
+                                                     (+ 1.0 (* value (- 1.0 sigmoid))))]
+                                   (* upstream derivative)))
+                               xs gs)]
+                  (accumulate! x (arr/from-vec (:backend input-data) dx
+                                               (:shape input-data))))))))))
 
 (defn group-norm-nchw*
   "Differentiable PyTorch-style GroupNorm. Optional affine `weight`/`bias`
@@ -654,23 +839,38 @@
   [indices weight]
   (let [weight-data (:data weight)
         output (t/embedding indices weight-data)
-        ids (delay (mapv long (arr/->vec indices)))
+        backend (:backend weight-data)
         [rows dim] (:shape weight-data)]
     (node output [weight]
           (fn [self]
             (when-let [g @(:grad self)]
-              (let [gs (vec (arr/->vec g))
-                    dw (double-array (* rows dim))]
-                (doseq [[token-pos row] (map-indexed vector @ids)
-                        feature (range dim)]
-                  (let [weight-index (+ (* row dim) feature)
-                        gradient-index (+ (* token-pos dim) feature)]
-                    (aset dw weight-index
-                          (+ (aget dw weight-index) (nth gs gradient-index)))))
-                (accumulate! weight
-                             (arr/from-vec (:backend weight-data) (vec dw)
-                                           (:shape weight-data)
-                                           (or (:dtype weight-data) :f32)))))))))
+              (if (and (= :f16 (:dtype weight-data) (:dtype g))
+                       (= backend (:backend indices) (:backend g))
+                       (satisfies? p/IDTypeTensorOps backend))
+                (accumulate!
+                 weight
+                 (assoc
+                  (arr/->NDArray
+                   backend
+                   (p/-embedding-backward-dtype
+                    backend (:handle indices) (:handle g)
+                    {:tokens (arr/nelems (:shape indices)) :rows rows :dim dim}
+                    :f16)
+                   (:shape weight-data))
+                  :dtype :f32))
+                (let [ids (mapv long (arr/->vec indices))
+                      gs (vec (arr/->vec g))
+                      dw (double-array (* rows dim))]
+                  (doseq [[token-pos row] (map-indexed vector ids)
+                          feature (range dim)]
+                    (let [weight-index (+ (* row dim) feature)
+                          gradient-index (+ (* token-pos dim) feature)]
+                      (aset dw weight-index
+                            (+ (aget dw weight-index) (nth gs gradient-index)))))
+                  (accumulate! weight
+                               (arr/from-vec backend (vec dw)
+                                             (:shape weight-data)
+                                             (or (:dtype weight-data) :f32))))))))))
 
 (defn rms-norm-last*
   "Differentiable RMSNorm over the final dimension."
@@ -683,7 +883,20 @@
      (node output [x weight]
            (fn [self]
              (when-let [g @(:grad self)]
-               (let [xs (vec (arr/->vec input-data))
+               (if (and (= :f16 (:dtype input-data) (:dtype weight-data))
+                        (= (:backend input-data) (:backend weight-data) (:backend g))
+                        (satisfies? p/IDTypeTensorOps (:backend input-data)))
+                 (let [backend (:backend input-data)
+                       gradients (p/-rms-norm-backward-dtype
+                                  backend (:handle input-data) (:handle weight-data)
+                                  (:handle g) {:rows rows :dim dim :eps eps} :f16)]
+                   (accumulate! x (assoc (arr/->NDArray backend (:input gradients) shape)
+                                         :dtype :f16))
+                   (accumulate! weight
+                                (assoc (arr/->NDArray backend (:weight gradients)
+                                                     (:shape weight-data))
+                                       :dtype :f32)))
+                 (let [xs (vec (arr/->vec input-data))
                      ws (vec (arr/->vec weight-data))
                      gs (vec (arr/->vec g))
                      dx (double-array (* rows dim))
@@ -708,7 +921,7 @@
                  (accumulate! x (arr/from-vec (:backend input-data) (vec dx) shape))
                  (accumulate! weight
                               (arr/from-vec (:backend weight-data) (vec dw)
-                                            (:shape weight-data))))))))))
+                                            (:shape weight-data)))))))))))
 
 (defn rotary-embedding*
   "Differentiable RoPE. Since each pair is an orthogonal rotation, its VJP is

@@ -622,6 +622,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[output_index] = input[input_index];
 }")
 
+(def transpose-nd-f16-wgsl
+  "Generic packed-F16 rank-1 through rank-4 axis permutation."
+  "
+struct Params {
+  info: vec4<u32>, input_shape: vec4<u32>, output_shape: vec4<u32>, perm: vec4<u32>
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+fn load(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn source(output_index: u32) -> u32 {
+  let rank = p.info.x;
+  var remaining = output_index; var output_coord = vec4<u32>(0u);
+  var axis = rank;
+  loop {
+    if (axis == 0u) { break; } axis = axis - 1u;
+    output_coord[axis] = remaining % p.output_shape[axis];
+    remaining = remaining / p.output_shape[axis];
+  }
+  var input_coord = vec4<u32>(0u); var i = 0u;
+  loop {
+    if (i >= rank) { break; }
+    input_coord[p.perm[i]] = output_coord[i]; i = i + 1u;
+  }
+  var input_index = 0u; i = 0u;
+  loop {
+    if (i >= rank) { break; }
+    input_index = input_index * p.input_shape[i] + input_coord[i]; i = i + 1u;
+  }
+  return input_index;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u; if (first >= p.info.y) { return; }
+  var second = 0.0;
+  if (first + 1u < p.info.y) { second = load(source(first + 1u)); }
+  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+}")
+
 (def batched-matmul-wgsl
   "Batched matmul with up to two NumPy-broadcast leading dimensions."
   "
@@ -675,6 +717,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[i] = input[i] + bias[i % p.width];
 }")
 
+(def add-last-axis-bias-f16-wgsl
+  "Packed-F16 last-axis bias broadcasting, one invocation per output pair."
+  "
+struct Params { total: u32, width: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> bias: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+@group(0) @binding(3) var<uniform> p: Params;
+fn load(buffer: u32, index: u32) -> f32 {
+  var pair = vec2<f32>(0.0);
+  if (buffer == 0u) { pair = unpack2x16float(input[index / 2u]); }
+  else { pair = unpack2x16float(bias[index / 2u]); }
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u; if (first >= p.total) { return; }
+  let a = load(0u, first) + load(1u, first % p.width);
+  var b = 0.0;
+  if (first + 1u < p.total) {
+    b = load(0u, first + 1u) + load(1u, (first + 1u) % p.width);
+  }
+  output[gid.x] = pack2x16float(vec2<f32>(a, b));
+}")
+
 (def multi-head-attention-wgsl
   "Fused rank-2 Q/K/V multi-head attention with stable online softmax passes."
   "
@@ -724,6 +791,70 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   output[i] = select(0.0, result / denominator, denominator > 0.0);
+}")
+
+(def multi-head-attention-f16-wgsl
+  "Packed-F16 fused attention with f32 dot products and stable online softmax."
+  "
+struct Params { batch: u32, seq_q: u32, seq_k: u32, model: u32,
+                kv_model: u32, heads: u32, kv_heads: u32, head_dim: u32,
+                total: u32, causal: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> query: array<u32>;
+@group(0) @binding(1) var<storage, read> key: array<u32>;
+@group(0) @binding(2) var<storage, read> value: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn load_query(index: u32) -> f32 {
+  let pair = unpack2x16float(query[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_key(index: u32) -> f32 {
+  let pair = unpack2x16float(key[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_value(index: u32) -> f32 {
+  let pair = unpack2x16float(value[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn score(batch: u32, row: u32, head: u32, token: u32) -> f32 {
+  let kv_head = head / (p.heads / p.kv_heads);
+  let qbase = (batch * p.seq_q + row) * p.model + head * p.head_dim;
+  let kbase = (batch * p.seq_k + token) * p.kv_model + kv_head * p.head_dim;
+  var sum = 0.0;
+  for (var d = 0u; d < p.head_dim; d = d + 1u) {
+    sum = sum + load_query(qbase + d) * load_key(kbase + d);
+  }
+  return sum * inverseSqrt(f32(p.head_dim));
+}
+fn attend(index: u32) -> f32 {
+  let flat_row = index / p.model; let batch = flat_row / p.seq_q;
+  let row = flat_row % p.seq_q; let component = index % p.model;
+  let head = component / p.head_dim;
+  let kv_head = head / (p.heads / p.kv_heads);
+  var maximum = -3.402823e38;
+  for (var token = 0u; token < p.seq_k; token = token + 1u) {
+    if (!(p.causal != 0u && token > row)) {
+      maximum = max(maximum, score(batch, row, head, token));
+    }
+  }
+  var denominator = 0.0; var result = 0.0;
+  for (var token = 0u; token < p.seq_k; token = token + 1u) {
+    if (!(p.causal != 0u && token > row)) {
+      let weight = exp(score(batch, row, head, token) - maximum);
+      let vb = (batch * p.seq_k + token) * p.kv_model
+               + kv_head * p.head_dim + component % p.head_dim;
+      denominator = denominator + weight;
+      result = result + weight * load_value(vb);
+    }
+  }
+  return result / denominator;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u; if (first >= p.total) { return; }
+  var second = 0.0;
+  if (first + 1u < p.total) { second = attend(first + 1u); }
+  output[gid.x] = pack2x16float(vec2<f32>(attend(first), second));
 }")
 
 (def multi-head-attention-backward-wgsl
@@ -893,6 +1024,114 @@ fn main(@builtin(local_invocation_id) lid3: vec3<u32>) {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x; if (i >= count) { return; }
   gradient[i] = upstream[0] * 2.0 * (prediction[i] - expected[i]) / f32(count);
+}")
+
+(def cross-entropy-stats-f16-wgsl
+  "Stable per-row max and exponential denominator for packed-F16 logits."
+  "
+struct Params { rows: u32, classes: u32, total: u32, ignore_index: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(1) var<storage, read_write> stats: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+var<workgroup> scratch: array<f32, 64>;
+fn load_logit(index: u32) -> f32 {
+  let pair = unpack2x16float(logits[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wid.x; let lane = lid.x;
+  if (row >= p.rows) { return; }
+  var maximum = -3.402823466e+38;
+  for (var c = lane; c < p.classes; c += 64u) {
+    maximum = max(maximum, load_logit(row * p.classes + c));
+  }
+  scratch[lane] = maximum; workgroupBarrier();
+  var stride = 32u;
+  loop {
+    if (lane < stride) { scratch[lane] = max(scratch[lane], scratch[lane + stride]); }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  let row_max = scratch[0];
+  var denominator = 0.0;
+  for (var c = lane; c < p.classes; c += 64u) {
+    denominator += exp(load_logit(row * p.classes + c) - row_max);
+  }
+  scratch[lane] = denominator; workgroupBarrier();
+  stride = 32u;
+  loop {
+    if (lane < stride) { scratch[lane] += scratch[lane + stride]; }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  if (lane == 0u) { stats[row * 2u] = row_max; stats[row * 2u + 1u] = scratch[0]; }
+}")
+
+(def cross-entropy-loss-f16-wgsl
+  "Mean stable NLL and inverse valid-row count for integer labels."
+  "
+struct Params { rows: u32, classes: u32, total: u32, ignore_index: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(1) var<storage, read> labels: array<f32>;
+@group(0) @binding(2) var<storage, read> stats: array<f32>;
+@group(0) @binding(3) var<storage, read_write> scalar: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+fn load_logit(index: u32) -> f32 {
+  let pair = unpack2x16float(logits[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+@compute @workgroup_size(1)
+fn main() {
+  var sum = 0.0; var valid = 0u;
+  for (var row = 0u; row < p.rows; row += 1u) {
+    let signed_label = i32(labels[row]);
+    if (bitcast<u32>(signed_label) != p.ignore_index) {
+      let label = u32(signed_label);
+      if (label < p.classes) {
+        sum += stats[row * 2u] + log(stats[row * 2u + 1u]) -
+               load_logit(row * p.classes + label);
+        valid += 1u;
+      }
+    }
+  }
+  let inverse = select(0.0, 1.0 / f32(valid), valid > 0u);
+  scalar[0] = sum * inverse; scalar[1] = inverse;
+}")
+
+(def cross-entropy-gradient-f16-wgsl
+  "Packed-F16 `(softmax-onehot)/valid * upstream` VJP."
+  "
+struct Params { rows: u32, classes: u32, total: u32, ignore_index: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<u32>;
+@group(0) @binding(1) var<storage, read> labels: array<f32>;
+@group(0) @binding(2) var<storage, read> stats: array<f32>;
+@group(0) @binding(3) var<storage, read> scalar: array<f32>;
+@group(0) @binding(4) var<storage, read> upstream: array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_logits: array<u32>;
+@group(0) @binding(6) var<uniform> p: Params;
+fn load_logit(index: u32) -> f32 {
+  let pair = unpack2x16float(logits[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+fn gradient(index: u32) -> f32 {
+  if (index >= p.total) { return 0.0; }
+  let row = index / p.classes; let c = index % p.classes;
+  let signed_label = i32(labels[row]);
+  if (bitcast<u32>(signed_label) == p.ignore_index) { return 0.0; }
+  let probability = exp(load_logit(index) - stats[row * 2u]) /
+                    stats[row * 2u + 1u];
+  return (probability - select(0.0, 1.0, c == u32(signed_label))) *
+         scalar[1] * upstream[0];
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x; let base = word * 2u;
+  if (base >= p.total) { return; }
+  grad_logits[word] = pack2x16float(vec2<f32>(gradient(base), gradient(base + 1u)));
 }")
 
 (def relu-backward-wgsl
@@ -1220,6 +1459,63 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = input[outer * d.input_block + d.input_offset + within];
 }")
 
+(def upsample-nearest2d-f16-wgsl
+  "Packed-F16 nearest-neighbor NCHW upsampling, one invocation per output pair."
+  "
+struct Dims {
+  n: u32, c: u32, h: u32, w: u32,
+  oh: u32, ow: u32, scale_h: u32, scale_w: u32, total: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> d: Dims;
+fn load(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn source(index: u32) -> u32 {
+  let x = index % d.ow;
+  let y = (index / d.ow) % d.oh;
+  let channel = (index / (d.ow * d.oh)) % d.c;
+  let batch = index / (d.ow * d.oh * d.c);
+  return ((batch * d.c + channel) * d.h + y / d.scale_h) * d.w
+         + x / d.scale_w;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u;
+  if (first >= d.total) { return; }
+  var second = 0.0;
+  if (first + 1u < d.total) { second = load(source(first + 1u)); }
+  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+}")
+
+(def slice-axis-f16-wgsl
+  "Packed-F16 contiguous axis slicing, including unaligned input offsets."
+  "
+struct Dims {
+  total: u32, input_block: u32, output_block: u32, input_offset: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> d: Dims;
+fn load(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn source(index: u32) -> u32 {
+  return (index / d.output_block) * d.input_block + d.input_offset
+         + index % d.output_block;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u;
+  if (first >= d.total) { return; }
+  var second = 0.0;
+  if (first + 1u < d.total) { second = load(source(first + 1u)); }
+  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+}")
+
 (def pad-right-bottom-nchw-wgsl
   "Append a zero-valued right column and bottom row to every NCHW plane."
   "
@@ -1472,12 +1768,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }")
 
-(def group-norm-nchw-f16-wgsl
+(def group-norm-nchw-f16-reference-wgsl
   "Packed-f16 GroupNorm reference kernel with f32 statistics."
   "
 struct Dims {
   n: u32, c: u32, h: u32, w: u32,
   groups: u32, channels_group: u32, group_size: u32, spatial: u32,
+  activation: u32,
 }
 @group(0) @binding(0) var<storage, read> input: array<u32>;
 @group(0) @binding(1) var<storage, read> weight: array<u32>;
@@ -1511,8 +1808,10 @@ fn normalize(index: u32) -> f32 {
   }
   let mean = sum / f32(d.group_size);
   let variance = max(sum_square / f32(d.group_size) - mean * mean, 0.0);
-  return (load_input_value(index) - mean) * inverseSqrt(variance + epsilon)
-         * load_weight_value(channel) + load_bias_value(channel);
+  let normalized = (load_input_value(index) - mean) * inverseSqrt(variance + epsilon)
+                   * load_weight_value(channel) + load_bias_value(channel);
+  if (d.activation == 1u) { return normalized / (1.0 + exp(-normalized)); }
+  return normalized;
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -1522,6 +1821,86 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var second = 0.0;
   if (base + 1u < total) { second = normalize(base + 1u); }
   output[gid.x] = pack2x16float(vec2<f32>(normalize(base), second));
+}")
+
+(def group-norm-nchw-f16-wgsl
+  "Parallel packed-F16 GroupNorm. One workgroup computes statistics once per
+  group and owns complete packed pairs; callers use the reference kernel for
+  odd group sizes where a packed word would straddle two groups."
+  "
+struct Dims {
+  n: u32, c: u32, h: u32, w: u32,
+  groups: u32, channels_group: u32, group_size: u32, spatial: u32,
+  activation: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> bias: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output: array<u32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+@group(0) @binding(5) var<uniform> epsilon: f32;
+var<workgroup> sums: array<f32, 256>;
+var<workgroup> squares: array<f32, 256>;
+fn load_input(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_weight(index: u32) -> f32 {
+  let pair = unpack2x16float(weight[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn load_bias(index: u32) -> f32 {
+  let pair = unpack2x16float(bias[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn activate(value: f32) -> f32 {
+  if (d.activation == 1u) { return value / (1.0 + exp(-value)); }
+  return value;
+}
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid3: vec3<u32>,
+        @builtin(workgroup_id) wid3: vec3<u32>) {
+  let lid = lid3.x;
+  let slice = wid3.x;
+  if (slice >= d.n * d.groups) { return; }
+  let batch = slice / d.groups;
+  let group = slice % d.groups;
+  let base = batch * d.c * d.h * d.w + group * d.group_size;
+  var sum = 0.0;
+  var sum_square = 0.0;
+  for (var i = lid; i < d.group_size; i = i + 256u) {
+    let value = load_input(base + i);
+    sum = sum + value;
+    sum_square = sum_square + value * value;
+  }
+  sums[lid] = sum;
+  squares[lid] = sum_square;
+  workgroupBarrier();
+  var offset = 128u;
+  loop {
+    if (offset == 0u) { break; }
+    if (lid < offset) {
+      sums[lid] = sums[lid] + sums[lid + offset];
+      squares[lid] = squares[lid] + squares[lid + offset];
+    }
+    workgroupBarrier();
+    offset = offset / 2u;
+  }
+  let mean = sums[0] / f32(d.group_size);
+  let variance = max(squares[0] / f32(d.group_size) - mean * mean, 0.0);
+  let inv_std = inverseSqrt(variance + epsilon);
+  let pairs = d.group_size / 2u;
+  for (var pair = lid; pair < pairs; pair = pair + 256u) {
+    let first_index = base + pair * 2u;
+    let second_index = first_index + 1u;
+    let first_channel = group * d.channels_group + (pair * 2u) / d.spatial;
+    let second_channel = group * d.channels_group + (pair * 2u + 1u) / d.spatial;
+    let first = activate((load_input(first_index) - mean) * inv_std
+                         * load_weight(first_channel) + load_bias(first_channel));
+    let second = activate((load_input(second_index) - mean) * inv_std
+                          * load_weight(second_channel) + load_bias(second_channel));
+    output[first_index / 2u] = pack2x16float(vec2<f32>(first, second));
+  }
 }")
 
 (def embedding-wgsl
@@ -1571,6 +1950,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (base >= n) { return; }
   let second = select(gather(base + 1u), 0.0, base + 1u >= n);
   output[word] = pack2x16float(vec2<f32>(gather(base), second));
+}")
+
+(def embedding-backward-f16-wgsl
+  "Conflict-free embedding-table VJP. One invocation owns one f32 weight
+  gradient and gathers every occurrence, so repeated token IDs sum
+  deterministically without atomics."
+  "
+struct Params { tokens: u32, rows: u32, dim: u32, total: u32 }
+@group(0) @binding(0) var<storage, read> indices: array<f32>;
+@group(0) @binding(1) var<storage, read> grad_output: array<u32>;
+@group(0) @binding(2) var<storage, read_write> grad_weight: array<f32>;
+@group(0) @binding(3) var<uniform> p: Params;
+fn load_grad(index: u32) -> f32 {
+  let pair = unpack2x16float(grad_output[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let weight_index = gid.x;
+  if (weight_index >= p.total) { return; }
+  let row = weight_index / p.dim;
+  let feature = weight_index % p.dim;
+  var sum = 0.0;
+  for (var token = 0u; token < p.tokens; token += 1u) {
+    if (u32(indices[token]) == row) {
+      sum += load_grad(token * p.dim + feature);
+    }
+  }
+  grad_weight[weight_index] = sum;
 }")
 
 (def rms-norm-wgsl
@@ -1643,6 +2051,95 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let v = unpack2x16float(input[row * words + w]);
     let gamma = unpack2x16float(weight[w]);
     output[row * words + w] = pack2x16float(v * inv_rms * gamma);
+  }
+}")
+
+(def rms-norm-backward-stats-f16-wgsl
+  "Per-row f32 RMSNorm backward statistics for packed-f16 tensors."
+  "
+struct Params { rows: u32, dim: u32, total: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> grad: array<u32>;
+@group(0) @binding(3) var<storage, read_write> stats: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+@group(0) @binding(5) var<uniform> eps: f32;
+var<workgroup> square_sums: array<f32, 64>;
+var<workgroup> dot_sums: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wid.x; let lane = lid.x; let words = p.dim / 2u;
+  if (row >= p.rows) { return; }
+  var square_sum = 0.0; var dot_sum = 0.0;
+  for (var word = lane; word < words; word += 64u) {
+    let x = unpack2x16float(input[row * words + word]);
+    let g = unpack2x16float(grad[row * words + word]);
+    let w = unpack2x16float(weight[word]);
+    square_sum += dot(x, x); dot_sum += dot(g * w, x);
+  }
+  square_sums[lane] = square_sum; dot_sums[lane] = dot_sum;
+  workgroupBarrier();
+  var stride = 32u;
+  loop {
+    if (lane < stride) {
+      square_sums[lane] += square_sums[lane + stride];
+      dot_sums[lane] += dot_sums[lane + stride];
+    }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  if (lane == 0u) {
+    let inv = inverseSqrt(square_sums[0] / f32(p.dim) + eps);
+    stats[row * 2u] = inv;
+    stats[row * 2u + 1u] = dot_sums[0] * inv * inv * inv / f32(p.dim);
+  }
+}")
+
+(def rms-norm-backward-f16-wgsl
+  "Packed-f16 input VJP and conflict-free f32 affine VJP for RMSNorm."
+  "
+struct Params { rows: u32, dim: u32, total: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> grad: array<u32>;
+@group(0) @binding(3) var<storage, read> stats: array<f32>;
+@group(0) @binding(4) var<storage, read_write> grad_input: array<u32>;
+@group(0) @binding(5) var<storage, read_write> grad_weight: array<f32>;
+@group(0) @binding(6) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  let packed_count = (p.total + 1u) / 2u;
+  if (index < packed_count) {
+    let base = index * 2u;
+    let x = unpack2x16float(input[index]);
+    let g = unpack2x16float(grad[index]);
+    let features = vec2<u32>(base % p.dim, (base + 1u) % p.dim);
+    let rows = vec2<u32>(base / p.dim, (base + 1u) / p.dim);
+    let w0 = unpack2x16float(weight[features.x / 2u]);
+    let w1 = unpack2x16float(weight[features.y / 2u]);
+    let gamma = vec2<f32>(select(w0.x, w0.y, (features.x & 1u) == 1u),
+                          select(w1.x, w1.y, (features.y & 1u) == 1u));
+    let inv = vec2<f32>(stats[rows.x * 2u], stats[rows.y * 2u]);
+    let correction = vec2<f32>(stats[rows.x * 2u + 1u],
+                                stats[rows.y * 2u + 1u]);
+    var dx = g * gamma * inv - x * correction;
+    if (base + 1u >= p.total) { dx.y = 0.0; }
+    grad_input[index] = pack2x16float(dx);
+  }
+  if (index < p.dim) {
+    var sum = 0.0;
+    for (var row = 0u; row < p.rows; row += 1u) {
+      let element = row * p.dim + index;
+      let xv = unpack2x16float(input[element / 2u]);
+      let gv = unpack2x16float(grad[element / 2u]);
+      let x = select(xv.x, xv.y, (element & 1u) == 1u);
+      let g = select(gv.x, gv.y, (element & 1u) == 1u);
+      sum += g * x * stats[row * 2u];
+    }
+    grad_weight[index] = sum;
   }
 }")
 
@@ -1922,6 +2419,30 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   }
 }")
 
+(def q5-0-matmul-wgsl
+  "Dense f32 activations times original packed GGML Q5_0 blocks."
+  (str/replace
+   q8-0-matmul-wgsl
+   "fn value_at(row: u32, column: u32) -> f32 {
+  let block_index = row * p.blocks_per_row + column / 32u;
+  let block = block_index * 34u;
+  let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
+  let d = unpack2x16float(d_bits).x;
+  let raw = byte_at(block + 2u + column % 32u);
+  let quant = select(i32(raw), i32(raw) - 256, raw >= 128u);
+  return d * f32(quant);
+}"
+   "fn value_at(row: u32, column: u32) -> f32 {
+  let linear = row * p.k + column;
+  let block = (linear / 32u) * 22u; let local = linear % 32u;
+  let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
+  let packed = byte_at(block + 6u + local % 16u);
+  let low = select(packed & 15u, packed >> 4u, local >= 16u);
+  let high = (byte_at(block + 2u + local / 8u) >> (local % 8u)) & 1u;
+  let quant = i32(low | (high << 4u)) - 16;
+  return unpack2x16float(d_bits).x * f32(quant);
+}"))
+
 (defn- packed-embedding-wgsl [value-function]
   (str
    "struct Params { rows: u32, dim: u32, count: u32, blocks_per_row: u32,
@@ -1998,6 +2519,19 @@ fn value_at(row: u32, column: u32) -> f32 {
   return unpack2x16float(d_bits).x * f32(quant);
 }"))
 
+(def q5-0-embedding-wgsl
+  (packed-embedding-wgsl
+   "fn value_at(row: u32, column: u32) -> f32 {
+  let linear = row * p.dim + column;
+  let block = (linear / 32u) * 22u; let local = linear % 32u;
+  let d_bits = byte_at(block) | (byte_at(block + 1u) << 8u);
+  let packed = byte_at(block + 6u + local % 16u);
+  let low = select(packed & 15u, packed >> 4u, local >= 16u);
+  let high = (byte_at(block + 2u + local / 8u) >> (local % 8u)) & 1u;
+  let quant = i32(low | (high << 4u)) - 16;
+  return unpack2x16float(d_bits).x * f32(quant);
+}"))
+
 (def rgb-image-to-nchw-wgsl
   "Fused NHWC→NCHW layout and [0,1]→[-1,1] range conversion."
   "
@@ -2030,6 +2564,231 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = clamp(0.5 * (input[source] + 1.0), 0.0, 1.0);
 }")
 
+(def nchw-to-rgb-image-f16-wgsl
+  "Read packed F16 NCHW and emit f32 NHWC RGB in one dispatch."
+  "
+struct Params { height: u32, width: u32, total: u32, pad0: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+fn load(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.total) { return; }
+  let plane = p.height * p.width; let channel = index % 3u;
+  let spatial = (index / 3u) % plane; let batch = index / (3u * plane);
+  let source = (batch * 3u + channel) * plane + spatial;
+  output[index] = clamp(0.5 * (load(source) + 1.0), 0.0, 1.0);
+}")
+
+(def scale-f16-wgsl
+  "Immutable packed-F16 scalar multiplication with f32 evaluation."
+  "
+struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@group(0) @binding(3) var<uniform> alpha: f32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u; if (first >= p.count) { return; }
+  var values = unpack2x16float(input[gid.x]) * alpha;
+  if (first + 1u >= p.count) { values.y = 0.0; }
+  output[gid.x] = pack2x16float(values);
+}")
+
+(def f16-to-f32-wgsl
+  "Expand packed IEEE binary16 storage into one f32 per output element."
+  "
+struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.count) { return; }
+  let pair = unpack2x16float(input[i / 2u]);
+  output[i] = select(pair.x, pair.y, (i & 1u) == 1u);
+}")
+
+(def f32-to-f16-wgsl
+  "Pack pairs of f32 values into physical IEEE binary16 storage."
+  "
+struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let word = gid.x; let first = word * 2u;
+  if (first >= p.count) { return; }
+  let second = select(0.0, input[first + 1u], first + 1u < p.count);
+  output[word] = pack2x16float(vec2<f32>(input[first], second));
+}")
+
+(def bf16-to-f32-wgsl
+  "Expand packed bfloat16 storage into one f32 per output element."
+  "
+struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.count) { return; }
+  let word = input[i / 2u];
+  let bits = select((word & 0xffffu) << 16u, word & 0xffff0000u,
+                    (i & 1u) == 1u);
+  output[i] = bitcast<f32>(bits);
+}")
+
+(def paged-kv-write-wgsl
+  "Write one projected K/V token into a physical paged-cache slot."
+  "
+struct Params {
+  block: u32, offset: u32, block_size: u32, kv_width: u32,
+}
+@group(0) @binding(0) var<storage, read> key: array<f32>;
+@group(0) @binding(1) var<storage, read> value: array<f32>;
+@group(0) @binding(2) var<storage, read_write> key_pool: array<f32>;
+@group(0) @binding(3) var<storage, read_write> value_pool: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.kv_width) { return; }
+  let destination = ((p.block * p.block_size + p.offset) * p.kv_width) + i;
+  key_pool[destination] = key[i];
+  value_pool[destination] = value[i];
+}")
+
+(def paged-kv-copy-block-wgsl
+  "Copy the used prefix of one physical K/V block for prefix COW."
+  "
+struct Params {
+  source: u32, destination: u32, tokens: u32, block_size: u32,
+  kv_width: u32, total: u32, pad0: u32, pad1: u32,
+}
+@group(0) @binding(0) var<storage, read_write> key_pool: array<f32>;
+@group(0) @binding(1) var<storage, read_write> value_pool: array<f32>;
+@group(0) @binding(2) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.total) { return; }
+  let source_index = p.source * p.block_size * p.kv_width + i;
+  let destination_index = p.destination * p.block_size * p.kv_width + i;
+  key_pool[destination_index] = key_pool[source_index];
+  value_pool[destination_index] = value_pool[source_index];
+}")
+
+(def paged-gqa-attention-wgsl
+  "One-token grouped-query attention reading K/V through a physical block table."
+  "
+struct Params {
+  length: u32, block_size: u32, kv_width: u32, heads: u32,
+  kv_heads: u32, head_dim: u32, model: u32, pad0: u32,
+}
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key_pool: array<f32>;
+@group(0) @binding(2) var<storage, read> value_pool: array<f32>;
+// Block IDs are numerically exact f32 values, allowing the ordinary NDArray
+// upload path while the kernel casts each entry to an address index.
+@group(0) @binding(3) var<storage, read> block_table: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> p: Params;
+fn pool_index(token: u32, component: u32) -> u32 {
+  let logical_block = token / p.block_size;
+  let offset = token % p.block_size;
+  let physical_block = u32(block_table[logical_block]);
+  return ((physical_block * p.block_size + offset) * p.kv_width) + component;
+}
+fn score(head: u32, token: u32) -> f32 {
+  let kv_head = head / (p.heads / p.kv_heads);
+  var dot: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    dot = dot + query[head * p.head_dim + d] *
+                key_pool[pool_index(token, kv_head * p.head_dim + d)];
+  }
+  return dot * inverseSqrt(f32(p.head_dim));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let component = gid.x; if (component >= p.model) { return; }
+  let head = component / p.head_dim;
+  let local = component % p.head_dim;
+  let kv_head = head / (p.heads / p.kv_heads);
+  var maximum: f32 = -3.402823e38;
+  for (var token: u32 = 0u; token < p.length; token = token + 1u) {
+    maximum = max(maximum, score(head, token));
+  }
+  var denominator: f32 = 0.0;
+  var weighted: f32 = 0.0;
+  for (var token: u32 = 0u; token < p.length; token = token + 1u) {
+    let weight = exp(score(head, token) - maximum);
+    denominator = denominator + weight;
+    weighted = weighted + weight *
+      value_pool[pool_index(token, kv_head * p.head_dim + local)];
+  }
+  output[component] = weighted / denominator;
+}")
+
+(def paged-gqa-attention-batch-wgsl
+  "Batched one-token GQA with independent lengths and physical block tables."
+  "
+struct Params {
+  batch: u32, max_blocks: u32, block_size: u32, kv_width: u32,
+  heads: u32, kv_heads: u32, head_dim: u32, model: u32,
+  total: u32, pad0: u32, pad1: u32, pad2: u32,
+}
+@group(0) @binding(0) var<storage, read> query: array<f32>;
+@group(0) @binding(1) var<storage, read> key_pool: array<f32>;
+@group(0) @binding(2) var<storage, read> value_pool: array<f32>;
+@group(0) @binding(3) var<storage, read> block_tables: array<f32>;
+@group(0) @binding(4) var<storage, read> lengths: array<f32>;
+@group(0) @binding(5) var<storage, read_write> output: array<f32>;
+@group(0) @binding(6) var<uniform> p: Params;
+fn pool_index(batch: u32, token: u32, component: u32) -> u32 {
+  let logical_block = token / p.block_size;
+  let offset = token % p.block_size;
+  let physical = u32(block_tables[batch * p.max_blocks + logical_block]);
+  return ((physical * p.block_size + offset) * p.kv_width) + component;
+}
+fn score(batch: u32, head: u32, token: u32) -> f32 {
+  let kv_head = head / (p.heads / p.kv_heads);
+  var dot: f32 = 0.0;
+  for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
+    dot = dot + query[batch * p.model + head * p.head_dim + d] *
+                key_pool[pool_index(batch, token,
+                                    kv_head * p.head_dim + d)];
+  }
+  return dot * inverseSqrt(f32(p.head_dim));
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x; if (index >= p.total) { return; }
+  let batch = index / p.model;
+  let component = index % p.model;
+  let head = component / p.head_dim;
+  let local = component % p.head_dim;
+  let kv_head = head / (p.heads / p.kv_heads);
+  let length = u32(lengths[batch]);
+  var maximum: f32 = -3.402823e38;
+  for (var token: u32 = 0u; token < length; token = token + 1u) {
+    maximum = max(maximum, score(batch, head, token));
+  }
+  var denominator: f32 = 0.0;
+  var weighted: f32 = 0.0;
+  for (var token: u32 = 0u; token < length; token = token + 1u) {
+    let weight = exp(score(batch, head, token) - maximum);
+    denominator = denominator + weight;
+    weighted = weighted + weight *
+      value_pool[pool_index(batch, token, kv_head * p.head_dim + local)];
+  }
+  output[index] = weighted / denominator;
+}")
+
 (def shaders
   "All compute kernels by op keyword — the menu a WgslBackend compiles on init.
   Verified on Apple M4 Metal (wgpu via WebGPU): the full IBackend contract
@@ -2049,30 +2808,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :rms-norm rms-norm-wgsl
    :rotary-embedding rotary-embedding-wgsl
    :copy-into copy-into-wgsl
+   :q5-0-matmul q5-0-matmul-wgsl
    :q4-k-matmul q4-k-matmul-wgsl
    :q6-k-matmul q6-k-matmul-wgsl
    :q8-0-matmul q8-0-matmul-wgsl
+   :q5-0-embedding q5-0-embedding-wgsl
    :q4-k-embedding q4-k-embedding-wgsl
    :q6-k-embedding q6-k-embedding-wgsl
    :q8-0-embedding q8-0-embedding-wgsl
    :rgb-image-to-nchw rgb-image-to-nchw-wgsl
    :nchw-to-rgb-image nchw-to-rgb-image-wgsl
+   :nchw-to-rgb-image-f16 nchw-to-rgb-image-f16-wgsl
+   :scale-f16 scale-f16-wgsl
+   :f16-to-f32 f16-to-f32-wgsl
+   :f32-to-f16 f32-to-f16-wgsl
+   :bf16-to-f32 bf16-to-f32-wgsl
+   :paged-kv-write paged-kv-write-wgsl
+   :paged-kv-copy-block paged-kv-copy-block-wgsl
+   :paged-gqa-attention paged-gqa-attention-wgsl
+   :paged-gqa-attention-batch paged-gqa-attention-batch-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
+   :upsample-nearest2d-f16 upsample-nearest2d-f16-wgsl
    :cat-copy cat-copy-wgsl
    :slice-axis slice-axis-wgsl
+   :slice-axis-f16 slice-axis-f16-wgsl
    :pad-right-bottom-nchw pad-right-bottom-nchw-wgsl
    :add-last-axis-bias add-last-axis-bias-wgsl
+   :add-last-axis-bias-f16 add-last-axis-bias-f16-wgsl
    :transpose-2d transpose-2d-wgsl
    :transpose-nd transpose-nd-wgsl
+   :transpose-nd-f16 transpose-nd-f16-wgsl
    :batched-matmul batched-matmul-wgsl
    :bias-gradient bias-gradient-wgsl
    :mse-loss mse-loss-wgsl
    :mse-gradient mse-gradient-wgsl
+   :cross-entropy-stats-f16 cross-entropy-stats-f16-wgsl
+   :cross-entropy-loss-f16 cross-entropy-loss-f16-wgsl
+   :cross-entropy-gradient-f16 cross-entropy-gradient-f16-wgsl
    :sgd-step sgd-step-wgsl
    :adamw-step adamw-step-wgsl
    :unscale-gradient unscale-gradient-wgsl
    :multi-head-attention multi-head-attention-wgsl
+   :multi-head-attention-f16 multi-head-attention-f16-wgsl
    :multi-head-attention-backward multi-head-attention-backward-wgsl
    :ewise-f16 ewise-f16-wgsl
    :ewise1-f16 ewise1-f16-wgsl
@@ -2080,8 +2858,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :conv2d-nchw-f16 conv2d-nchw-f16-wgsl
    :conv2d-nchw-f16-oc4 conv2d-nchw-f16-oc4-wgsl
    :group-norm-nchw-f16 group-norm-nchw-f16-wgsl
+   :group-norm-nchw-f16-reference group-norm-nchw-f16-reference-wgsl
    :embedding-f16 embedding-f16-wgsl
+   :embedding-backward-f16 embedding-backward-f16-wgsl
    :rms-norm-f16 rms-norm-f16-wgsl
+   :rms-norm-backward-stats-f16 rms-norm-backward-stats-f16-wgsl
+   :rms-norm-backward-f16 rms-norm-backward-f16-wgsl
    :rotary-embedding-f16 rotary-embedding-f16-wgsl
    :copy-into-f16 copy-into-f16-wgsl
    :spmv   spmv-csr-wgsl})

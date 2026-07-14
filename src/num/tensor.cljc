@@ -179,15 +179,27 @@
                             (= (:shape x) [(last (:shape y))])) [y x]
                        :else [nil nil])
         backend (:backend input)]
-    (if (and input (= :f32 (array-dtype input)) (= backend (:backend bias))
-             (satisfies? p/ITensorBackend backend))
+    (cond
+      (and input (= :f32 (array-dtype input)) (= backend (:backend bias))
+           (satisfies? p/ITensorBackend backend))
       (assoc (arr/->NDArray
               backend
               (p/-add-last-axis-bias
                backend (:handle input) (:handle bias)
                {:total (arr/nelems (:shape input)) :width (last (:shape input))})
               (:shape input)) :dtype :f32)
-      (ewise-bc :add x y))))
+      (and input (not= :f32 (array-dtype input)) (= backend (:backend bias))
+           (= (array-dtype input) (array-dtype bias))
+           (satisfies? p/IDTypeTensorOps backend))
+      (assoc (arr/->NDArray
+              backend
+              (p/-add-last-axis-bias-dtype
+               backend (:handle input) (:handle bias)
+               {:total (arr/nelems (:shape input)) :width (last (:shape input))}
+               (array-dtype input))
+              (:shape input))
+             :dtype (array-dtype input))
+      :else (ewise-bc :add x y))))
 (defn sub "Broadcasting x - y." [x y] (ewise-bc :sub x y))
 (defn mul "Broadcasting elementwise x * y (Hadamard, not matmul)." [x y] (ewise-bc :mul x y))
 (defn div "Broadcasting elementwise x / y." [x y] (ewise-bc :div x y))
@@ -358,8 +370,9 @@
                         {:shape shape :perm perm})))
      (let [out-shape (mapv shape perm)
            backend (:backend a)]
-       (if (and (<= 1 r 4) (= :f32 (array-dtype a))
-                (satisfies? p/ITensorBackend backend))
+       (cond
+         (and (<= 1 r 4) (= :f32 (array-dtype a))
+              (satisfies? p/ITensorBackend backend))
          (assoc
           (arr/->NDArray
            backend
@@ -373,6 +386,20 @@
                                :perm perm}))
            out-shape)
           :dtype :f32)
+
+         (and (<= 1 r 4) (not= :f32 (array-dtype a))
+              (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray
+                 backend
+                 (p/-transpose-dtype
+                  backend (:handle a)
+                  {:rank r :total (arr/nelems out-shape)
+                   :input-shape shape :output-shape out-shape :perm perm}
+                  (array-dtype a))
+                 out-shape)
+                :dtype (array-dtype a))
+
+         :else
          (let [in-strides (row-major-strides shape)
                out-strides (row-major-strides out-shape)
                xs (double-array (arr/->vec a))
@@ -385,7 +412,7 @@
                                   (vec (repeat r 0))
                                   (map-indexed vector perm))]
                (aset out oi (aget xs (ravel in-idx in-strides)))))
-           (arr/from-vec backend (vec out) out-shape)))))))
+           (arr/from-vec backend (vec out) out-shape (array-dtype a))))))))
 
 ;; --- axis-parameterized reductions ---------------------------------------------
 
@@ -782,12 +809,24 @@
         output-shape [batch height width channels]]
     (when-not (and (= 4 (count shape)) (= 3 channels))
       (throw (ex-info "nchw-to-rgb-image requires NCHW RGB" {:shape shape})))
-    (if (and (= :f32 (array-dtype input)) (satisfies? p/ITensorBackend backend))
+    (cond
+      (and (= :f32 (array-dtype input)) (satisfies? p/ITensorBackend backend))
       (assoc (arr/->NDArray backend
                             (p/-nchw-to-rgb-image
                              backend (:handle input)
                              {:batch batch :height height :width width :total total})
                             output-shape) :dtype :f32)
+      (and (not= :f32 (array-dtype input))
+           (satisfies? p/IDTypeTensorOps backend))
+      (assoc (arr/->NDArray
+              backend
+              (p/-nchw-to-rgb-image-dtype
+               backend (:handle input)
+               {:batch batch :height height :width width :total total}
+               (array-dtype input))
+              output-shape)
+             :dtype :f32)
+      :else
       (let [source (vec (arr/->vec input))]
         (arr/from-vec
          backend
@@ -886,7 +925,8 @@
             total (arr/nelems out-shape)
             backend (:backend input)
             dtype (array-dtype input)]
-        (if (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
+        (cond
+          (and (= :f32 dtype) (satisfies? p/ITensorBackend backend))
           (assoc (arr/->NDArray
                   backend
                   (p/-slice-axis backend (:handle input)
@@ -895,6 +935,19 @@
                                   :input-offset (* start inner)})
                   out-shape)
                  :dtype :f32)
+
+          (and (not= :f32 dtype) (satisfies? p/IDTypeTensorOps backend))
+          (assoc (arr/->NDArray
+                  backend
+                  (p/-slice-axis-dtype
+                   backend (:handle input)
+                   {:total total :input-block input-block
+                    :output-block output-block :input-offset (* start inner)}
+                   dtype)
+                  out-shape)
+                 :dtype dtype)
+
+          :else
           (let [source (arr/->vec input)
                 outer (arr/nelems (subvec shape 0 axis))
                 output (vec
@@ -944,11 +997,21 @@
     (when (empty? shape)
       (throw (ex-info "num.tensor/scale requires a non-scalar tensor"
                       {:shape shape})))
-    (let [copy (slice-axis input 0 0 (first shape))]
-      (if (= :f32 dtype)
-        (nm/scal! (double factor) copy)
-        (arr/from-vec (:backend input)
-                      (mapv #(* (double factor) %) (arr/->vec copy))
+    (let [backend (:backend input)]
+      (cond
+        (= :f32 dtype)
+        (nm/scal! (double factor) (slice-axis input 0 0 (first shape)))
+
+        (satisfies? p/IDTypeOps backend)
+        (assoc (arr/->NDArray backend
+                              (p/-scale-dtype backend (double factor)
+                                              (:handle input) (arr/nelems shape) dtype)
+                              shape)
+               :dtype dtype)
+
+        :else
+        (arr/from-vec backend
+                      (mapv #(* (double factor) %) (arr/->vec input))
                       shape dtype)))))
 
 (defn copy-into!
@@ -1050,14 +1113,12 @@
                          (array-dtype input))))))))
 
 (defn group-norm-silu-nchw
-  "Fused PyTorch GroupNorm followed by SiLU. f32 ITensorBackend execution uses
-  one kernel and one output buffer; other dtypes preserve semantics by composition."
+  "Fused PyTorch GroupNorm followed by SiLU. Device tensor backends execute one
+  kernel and allocate one output buffer for both f32 and physical typed storage."
   ([input num-groups]
    (group-norm-silu-nchw input num-groups nil nil 1.0e-5))
   ([input num-groups weight bias eps]
-   (if (= :f32 (array-dtype input))
-     (group-norm-nchw input num-groups weight bias eps true)
-     (silu (group-norm-nchw input num-groups weight bias eps)))))
+   (group-norm-nchw input num-groups weight bias eps true)))
 
 (defn layer-norm-last
   "PyTorch-compatible LayerNorm over the final tensor dimension. `weight` and
@@ -1247,11 +1308,22 @@
           backend (:backend input)
           params {:n N :c C :h H :width W :oh oh :ow ow
                   :scale-h scale-h :scale-w scale-w}]
-      (if (and (= :f32 (array-dtype input))
-               (satisfies? p/ITensorBackend backend))
+      (cond
+        (and (= :f32 (array-dtype input))
+             (satisfies? p/ITensorBackend backend))
         (assoc (arr/->NDArray backend
                        (p/-upsample-nearest2d backend (:handle input) params)
                        [N C oh ow]) :dtype :f32)
+
+        (and (not= :f32 (array-dtype input))
+             (satisfies? p/IDTypeTensorOps backend))
+        (assoc (arr/->NDArray backend
+                              (p/-upsample-nearest2d-dtype
+                               backend (:handle input) params (array-dtype input))
+                              [N C oh ow])
+               :dtype (array-dtype input))
+
+        :else
         (let [xs (double-array (arr/->vec input))
               out (double-array (* N C oh ow))]
           (dotimes [n N]
@@ -1339,7 +1411,8 @@
                    :head-dim d-head :causal? causal?
                    :has-key-padding-mask? (boolean key-padding-mask)
                    :total (* batch seq-q d-model)}]
-       (if (and (= backend (:backend K) (:backend V))
+       (cond
+         (and (= backend (:backend K) (:backend V))
                 (or (nil? key-padding-mask) (= backend mask-backend))
                 (= :f32 (array-dtype Q) (array-dtype K) (array-dtype V))
                 (or (nil? key-padding-mask) (= :f32 (array-dtype key-padding-mask)))
@@ -1350,6 +1423,21 @@
                   backend (:handle Q) (:handle K) (:handle V)
                   (when key-padding-mask (:handle key-padding-mask)) params)
                  output-shape) :dtype :f32)
+
+         (and (= backend (:backend K) (:backend V))
+              (nil? key-padding-mask)
+              (= (array-dtype Q) (array-dtype K) (array-dtype V))
+              (not= :f32 (array-dtype Q))
+              (satisfies? p/IDTypeTensorOps backend))
+         (assoc (arr/->NDArray
+                 backend
+                 (p/-multi-head-attention-dtype
+                  backend (:handle Q) (:handle K) (:handle V) params
+                  (array-dtype Q))
+                 output-shape)
+                :dtype (array-dtype Q))
+
+         :else
          (if (= h kv-heads)
            (let [q3 (if (= rank 2) (reshape Q [1 seq-q d-model]) Q)
                k3 (if (= rank 2) (reshape K [1 seq-k d-model]) K)

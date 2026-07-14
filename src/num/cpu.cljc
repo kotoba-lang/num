@@ -101,6 +101,24 @@
         quant (signed-byte (nth bytes (+ block-offset 2 (mod column 32))))]
     (* d quant)))
 
+(defn- q5-0-value [bytes row cols column]
+  (let [linear (+ (* row cols) column)
+        block-index (quot linear 32)
+        block-offset (* block-index 22)
+        local (mod linear 32)
+        d (dtype/f16-bits->f32 (packed-u16 bytes block-offset))
+        high-word (reduce (fn [value index]
+                            (bit-or value
+                                    (bit-shift-left
+                                     (nth bytes (+ block-offset 2 index))
+                                     (* index 8))))
+                          0 (range 4))
+        packed (nth bytes (+ block-offset 6 (mod local 16)))
+        low (if (< local 16) (bit-and packed 0x0f)
+                (bit-shift-right packed 4))
+        high (bit-and (unsigned-bit-shift-right high-word local) 1)]
+    (* d (- (bit-or low (bit-shift-left high 4)) 16))))
+
 (deftype CpuBackend []
   p/IBackend
   (-backend-name [_] :cpu)
@@ -199,11 +217,12 @@
   (-quantized-from-host [_ bytes params]
     {:bytes (mapv #(bit-and 0xff %) bytes) :params params})
   (-quantized-matmul [_ input weight {:keys [quant-type m k n]}]
-    (when-not (#{:q4-k :q6-k :q8-0} quant-type)
+    (when-not (#{:q5-0 :q4-k :q6-k :q8-0} quant-type)
       (throw (ex-info "unsupported CPU quantized matmul" {:quant-type quant-type})))
     (let [^doubles input input bytes (:bytes weight) output (double-array (* m n))
           value-at (case quant-type
-                     :q4-k q4-k-value :q6-k q6-k-value :q8-0 q8-0-value)]
+                     :q5-0 q5-0-value :q4-k q4-k-value
+                     :q6-k q6-k-value :q8-0 q8-0-value)]
       (dotimes [row m]
         (dotimes [column n]
           (aset output (+ (* row n) column)
@@ -217,7 +236,8 @@
   (-quantized-embedding [_ indices table {:keys [quant-type rows dim count]}]
     (let [^doubles indices indices bytes (:bytes table)
           value-at (case quant-type
-                     :q4-k q4-k-value :q6-k q6-k-value :q8-0 q8-0-value)
+                     :q5-0 q5-0-value :q4-k q4-k-value
+                     :q6-k q6-k-value :q8-0 q8-0-value)
           output (double-array (* count dim))]
       (dotimes [position count]
         (let [raw (aget indices position) row (long raw)]
@@ -270,6 +290,9 @@
               :tanh-gradient (fn [y] (- 1.0 (* y y)))
               :gelu-gradient gelu-gradient-value)]
       (typed-handle dtype* (mapv f (take n (typed-values xh))))))
+  (-scale-dtype [_ alpha xh n dtype*]
+    (typed-handle dtype*
+                  (mapv #(* (double alpha) %) (take n (typed-values xh)))))
   (-gemm-dtype [_ Ah m k Bh n dtype*]
     (let [A (typed-values Ah) B (typed-values Bh)]
       (typed-handle

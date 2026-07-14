@@ -184,11 +184,49 @@ device-to-device slice dispatches. None requires tensor host readback. A complet
 `GroupNorm → SiLU → upsample → skip cat` chain plus slicing and asymmetric
 padding are verified against the CPU oracle on Apple M4 Metal. None of these
 paths downloads intermediate tensors.
+Packed F16 nearest upsampling and contiguous slicing also execute directly over
+physical half buffers, including odd logical element counts and unaligned slice
+offsets; uploads pad only the final storage word without changing tensor shape.
+Immutable scalar scaling stays packed F16, while the terminal NCHW F16 to NHWC
+f32 RGB conversion performs layout, range conversion, and unpacking in one
+dispatch instead of allocating a full intermediate f32 tensor.
+Rank-1 through rank-4 transpose, last-axis bias broadcasting, and fused
+multi-head attention also have packed-F16 paths. Attention evaluates dot
+products, scaling, and stable softmax in f32 registers and stores the result in
+physical F16; the current typed kernel supports causal/unmasked execution while
+the f32 kernel retains key-padding-mask support.
+`num.autograd/cast*` records physical dtype conversion on the reverse-mode tape;
+its VJP converts the upstream gradient back to the input dtype. Typed MSE
+backward likewise preserves prediction storage and uses immutable typed scale,
+allowing stable f32 subgraphs to sit inside an F16 training graph without
+severing gradients.
+On the Deno Metal backend, packed-F16 attention backward remains GPU-resident:
+Q/K/V and upstream gradients are expanded by device kernels, the existing fused
+f32 stable-softmax VJP computes conflict-free Q/K/V gradients, and cast kernels
+return them to the typed graph. No tensor is downloaded; the implementation
+reuses the same backward equations as the independently checked f32 path.
+Typed projection bias backward likewise keeps the upstream tensor packed while
+casting only its row reduction to the device's f32 `sum-rows` stability path.
+Packed-F16 RMSNorm backward computes one pair of f32 row statistics, then emits
+an F16 activation VJP and a conflict-free f32 affine-weight VJP entirely on the
+device. SiLU backward is composed from typed elementwise kernels without host
+materialization, completing the normalization and SwiGLU boundaries used by
+Llama training.
+Packed-F16 embedding backward assigns one invocation to each table element and
+gathers all matching token positions into an f32 gradient. Repeated IDs are
+therefore deterministic and race-free without atomics or host scatter-adds,
+which closes the token-to-transformer training boundary for complete LMs.
+`cross-entropy-loss*` accepts integer labels shaped like the logits without the
+last class axis, supports `ignore-index`, uses max-subtracted softmax, and means
+over valid rows. Its Metal path keeps per-row f32 statistics and scalar loss on
+device and returns a packed-F16 logit VJP scaled by the upstream GradScaler seed.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet
 `GroupNorm → SiLU` pair into one reduction/normalization kernel and one output
-buffer. Non-f32 backends retain identical semantics through composition.
+buffer. Packed F16 uses the same one-workgroup-per-group reduction strategy and
+falls back to the scalar reference kernel only when an odd group size would
+make a packed word straddle normalization groups.
 
 Long-running graphs can explicitly end tensor lifetimes with
 `num.array/release!`; `release-all!` deduplicates reshape/transpose aliases that
@@ -228,6 +266,32 @@ loss, output, all gradients, and all
 eight updated projection tensors plus batched causal+padding output/Q/K/V gradients
 pass 27/27 checks without intermediate host
 readback. Only final verification values are downloaded.
+
+Autoregressive serving can keep K/V in a bounded physical block pool instead
+of one contiguous allocation per sequence. `num.deno-gpu/paged-kv-write!`
+writes one projected token directly to a `[block,offset]` slot;
+`paged-kv-copy-block!` copies only the used prefix when a shared partial block
+becomes copy-on-write; and `paged-gqa-attention` resolves a logical f32 block
+table inside the Metal kernel while performing stable one-token grouped-query
+attention. A live Apple M4 verifier uses the deliberately non-contiguous table
+`[2,0]`, compares its result with ordinary CPU GQA, forks a one-token prefix
+into another physical block, writes a divergent token, checks that result
+independently, and returns every tracked GPU buffer to baseline:
+
+```sh
+clojure -M:deno-paged-kv-verify
+deno run --allow-all target/deno-paged-kv-verify.cjs
+# non-contiguous paged GQA parity: passed
+# prefix COW block-copy parity: passed
+# paged GPU storage release: passed
+```
+
+`paged-gqa-attention-batch` extends the same physical pools to one fused
+multi-request dispatch. Query rows carry independent sequence lengths and padded
+block-table rows, so ragged decode does not require padding K/V payloads or
+materializing contiguous caches. The live verifier evaluates the length-3
+`[2,0]` request and a length-2 fork `[1,_]` together and matches both CPU GQA
+oracles.
 
 **Host-materialized, not device-native (an explicit, documented tradeoff):**
 `num.protocol/IBackend` has no notion of strides/gather/scatter — a handle is an opaque
@@ -278,19 +342,20 @@ deno run --allow-all target/deno-q8-verify.cjs
 #           Metal    [73.75999451 95.43997955]
 ```
 
-`num.quantized/matrix` additionally stores complete GGML Q4_K, Q6_K, and Q8_0
-blocks at their original 4.5/6.5625/8.5 bits per weight and exposes them as
+`num.quantized/matrix` additionally stores complete GGML Q5_0, Q4_K, Q6_K, and
+Q8_0 blocks at their original 5.5/4.5/6.5625/8.5 bits per weight and exposes them as
 `[in,out]` matrices. `num.quantized/matmul` decodes their packed fp16
 super-scales, subblock scales/mins, and quant bits inside the compute kernel
 while accumulating f32; it supports multi-row activations and never creates a
 dense weight buffer. `num.quantized/table` performs device-native token lookup
-from the same three formats, and `as-matrix` creates a zero-copy tied output-head
+from the same four formats, and `as-matrix` creates a zero-copy tied output-head
 view over the exact same packed buffer.
 
 ```sh
 clojure -M:deno-quantized-verify && \
   deno run --allow-all target/deno-quantized-verify.cjs
-# Apple M4: Q4_K CPU/Metal parity: passed
+# Apple M4: Q5_0 CPU/Metal parity: passed
+#           Q4_K CPU/Metal parity: passed
 #           Q6_K CPU/Metal parity: passed
 #           Q8_0 CPU/Metal parity: passed
 #           packed embedding CPU/Metal parity: passed
@@ -356,10 +421,29 @@ no `--unstable-webgpu` flag needed):
 clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
 ```
 
+Large checkpoint hosts can bypass per-element JavaScript number allocation with
+`num.deno-gpu/upload-byte-view`. It validates shape × dtype byte length and sends
+an existing little-endian `ArrayBufferView` directly to WebGPU storage for f32
+or f16 (padding only an odd f16 tail to WebGPU's four-byte write alignment).
+`upload-f16-as-f32-byte-view` follows that upload with a packed-half expansion
+kernel (`unpack2x16float`) and retires the temporary f16 buffer, allowing an f32
+inference graph to consume half-precision checkpoint files without allocating a
+host-side vector of decoded numbers. `upload-bf16-as-f32-byte-view` provides the
+same path for packed bfloat16 by reconstructing each IEEE f32 bit pattern on GPU.
+The live raw-upload gate covers both physical formats and exact buffer cleanup:
+
+```bash
+clojure -M:deno-raw-upload-verify
+deno run --allow-all target/deno-raw-upload-verify.cjs
+```
+
 ### UNet Metal benchmark
 
-The benchmark forces final readback, so it measures completed GPU work rather
-than near-zero queue submission latency:
+The benchmark forces final readback, so it measures completed GPU work plus the
+host transfer rather than near-zero queue submission latency. Full-width modes
+run one cold iteration followed by five sequential warm iterations on the same
+device/backend and report every sample plus the median; this avoids presenting
+a single noisy run as a performance result:
 
 ```bash
 clojure -M:deno-benchmark
@@ -368,6 +452,9 @@ deno run --allow-all target/deno-gpu-benchmark.cjs
 # Full Stable-Diffusion-width 320→320 convolution at latent 64×64
 deno run --allow-all target/deno-gpu-benchmark.cjs full
 deno run --allow-all target/deno-gpu-benchmark.cjs full-f16
+
+# F16 GroupNorm+SiLU at [1,320,64,64], including forced readback
+deno run --allow-all target/deno-gpu-benchmark.cjs norm-f16
 ```
 
 Measured on Apple M4 with input `[1,32,64,64]`, weights `[64,32,3,3]`, and a
@@ -375,25 +462,26 @@ full `NCHW conv(pad=1) → GroupNorm(8) → SiLU` chain:
 
 | path | elapsed |
 |---|---:|
-| ClojureScript CPU oracle | 1019.63 ms |
-| Metal cold (pipeline compile included) | 35.04 ms |
-| Metal warm | 31.80 ms |
+| ClojureScript CPU oracle | 1300.98 ms |
+| Metal cold (pipeline compile included) | 519.91 ms |
+| Metal warm | 29.13 ms |
 
-Warm speedup is **32.06×**, with maximum absolute error `2.38e-6` against the
+Warm speedup is **44.66×**, with maximum absolute error `2.38e-6` against the
 CPU oracle. The full-width mode separately measures a real latent-resolution
 `[1,320,64,64] × [320,320,3,3]` convolution. The four-output-channel kernel
-now measures 109.01 ms warm, with its interior
-constant-input result within `4.51e-7` of the analytic value. Packed physical
-f16 now takes 586.35 ms on the same case after adding a four-output-channel,
-two-spatial-position packed fast path (down from 621.65 ms). Deno's Naga rejects native WGSL
+produced f32 warm samples of `165.61, 108.65, 124.40, 208.58, 126.71 ms`
+(median `126.71 ms`), with its interior constant-input result within `4.51e-7`
+of the analytic value. Packed physical f16 produced
+`601.75, 581.06, 652.13, 654.76, 603.05 ms` (median `603.05 ms`) on the same
+case. Deno's Naga rejects native WGSL
 `enable f16` despite the adapter advertising `shader-f16`, so f16 remains a
 correctness/storage path rather than a performance claim: repeated
 `unpack2x16float` of every convolution weight still dominates and leaves it
-5.38× slower than f32 despite using half the persistent bytes.
-The benchmark also checks explicit GPUBuffer lifetime. After two warm/cold
-executions the 32→64 chain returns to its five persistent input/weight buffers
-(`598,784` bytes) from a `2,695,984`-byte peak; the 320-channel case returns to
-three persistent buffers (`8,930,560` bytes) from a `14,173,520`-byte peak.
+4.76× slower than f32 despite using half the persistent bytes.
+The benchmark also checks explicit GPUBuffer lifetime. After the cold and five
+warm executions the full-width case returns to its three persistent
+input/weight buffers
+(`8,930,560` bytes) from a `14,173,520`-byte peak.
 Per-dispatch uniform buffers, implicit no-bias/no-mask buffers, and readback
 staging buffers are destroyed after submission/use rather than accumulating
 across diffusion steps. The live verifier repeats 100 temporary dispatches and

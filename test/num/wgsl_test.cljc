@@ -12,6 +12,11 @@
     (doseq [op [:axpy :scal :ewise :ewise1 :reduce :gemv :gemm
                 :ewise-f16 :ewise1-f16 :gemm-f16
                 :conv2d-nchw-f16 :conv2d-nchw-f16-oc4 :group-norm-nchw-f16
+                :group-norm-nchw-f16-reference
+                :upsample-nearest2d-f16 :slice-axis-f16
+                :nchw-to-rgb-image-f16 :scale-f16
+                :transpose-nd-f16 :multi-head-attention-f16
+                :add-last-axis-bias-f16
                 :conv2d-nchw :conv2d-nchw-oc4
                 :group-norm-nchw :group-norm-silu-nchw
                 :upsample-nearest2d :cat-copy
@@ -30,7 +35,11 @@
   (testing "the tiled GEMM uses workgroup shared memory (the optimized path)"
     (is (re-find #"var<workgroup>" (:gemm w/shaders))))
   (testing "fused GroupNorm applies SiLU in the normalization kernel"
-    (is (re-find #"exp\(-normalized\)" (:group-norm-silu-nchw w/shaders))))
+    (is (re-find #"exp\(-normalized\)" (:group-norm-silu-nchw w/shaders)))
+    (is (re-find #"d\.activation == 1u" (:group-norm-nchw-f16 w/shaders))))
+  (testing "typed GroupNorm reduces each group once in workgroup memory"
+    (is (re-find #"var<workgroup> sums" (:group-norm-nchw-f16 w/shaders)))
+    (is (re-find #"workgroupBarrier" (:group-norm-nchw-f16 w/shaders))))
   (testing "typed kernels use packed physical halves and accumulate GEMM in f32"
     (is (re-find #"unpack2x16float" (:gemm-f16 w/shaders)))
     (is (re-find #"pack2x16float" (:gemm-f16 w/shaders)))
@@ -94,6 +103,8 @@
 (deftest q5-gemv-shaders-restore-fifth-bit
   (is (re-find #"high_bit" w/q5-0-gemv-wgsl))
   (is (re-find #"- 16.0" w/q5-0-gemv-wgsl))
+  (is (re-find #"row \* p.k \+ column" w/q5-0-matmul-wgsl))
+  (is (re-find #"high << 4u" w/q5-0-embedding-wgsl))
   (is (re-find #"high_bit" w/q5-1-gemv-wgsl))
   (is (re-find #"dm.y" w/q5-1-gemv-wgsl)))
 
