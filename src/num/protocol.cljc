@@ -95,6 +95,7 @@
   (-add-last-axis-bias-dtype [b input-h bias-h params dtype])
   (-embedding-dtype [b indices-h weight-h params dtype])
   (-rms-norm-dtype [b input-h weight-h params dtype])
+  (-rms-norm-backward-dtype [b input-h weight-h grad-output-h params dtype])
   (-rotary-embedding-dtype [b input-h params dtype]))
 
 (defprotocol ITensorBackend

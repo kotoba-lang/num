@@ -1917,6 +1917,95 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   }
 }")
 
+(def rms-norm-backward-stats-f16-wgsl
+  "Per-row f32 RMSNorm backward statistics for packed-f16 tensors."
+  "
+struct Params { rows: u32, dim: u32, total: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> grad: array<u32>;
+@group(0) @binding(3) var<storage, read_write> stats: array<f32>;
+@group(0) @binding(4) var<uniform> p: Params;
+@group(0) @binding(5) var<uniform> eps: f32;
+var<workgroup> square_sums: array<f32, 64>;
+var<workgroup> dot_sums: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wid.x; let lane = lid.x; let words = p.dim / 2u;
+  if (row >= p.rows) { return; }
+  var square_sum = 0.0; var dot_sum = 0.0;
+  for (var word = lane; word < words; word += 64u) {
+    let x = unpack2x16float(input[row * words + word]);
+    let g = unpack2x16float(grad[row * words + word]);
+    let w = unpack2x16float(weight[word]);
+    square_sum += dot(x, x); dot_sum += dot(g * w, x);
+  }
+  square_sums[lane] = square_sum; dot_sums[lane] = dot_sum;
+  workgroupBarrier();
+  var stride = 32u;
+  loop {
+    if (lane < stride) {
+      square_sums[lane] += square_sums[lane + stride];
+      dot_sums[lane] += dot_sums[lane + stride];
+    }
+    workgroupBarrier();
+    if (stride == 1u) { break; }
+    stride /= 2u;
+  }
+  if (lane == 0u) {
+    let inv = inverseSqrt(square_sums[0] / f32(p.dim) + eps);
+    stats[row * 2u] = inv;
+    stats[row * 2u + 1u] = dot_sums[0] * inv * inv * inv / f32(p.dim);
+  }
+}")
+
+(def rms-norm-backward-f16-wgsl
+  "Packed-f16 input VJP and conflict-free f32 affine VJP for RMSNorm."
+  "
+struct Params { rows: u32, dim: u32, total: u32, pad: u32 }
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read> weight: array<u32>;
+@group(0) @binding(2) var<storage, read> grad: array<u32>;
+@group(0) @binding(3) var<storage, read> stats: array<f32>;
+@group(0) @binding(4) var<storage, read_write> grad_input: array<u32>;
+@group(0) @binding(5) var<storage, read_write> grad_weight: array<f32>;
+@group(0) @binding(6) var<uniform> p: Params;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let index = gid.x;
+  let packed_count = (p.total + 1u) / 2u;
+  if (index < packed_count) {
+    let base = index * 2u;
+    let x = unpack2x16float(input[index]);
+    let g = unpack2x16float(grad[index]);
+    let features = vec2<u32>(base % p.dim, (base + 1u) % p.dim);
+    let rows = vec2<u32>(base / p.dim, (base + 1u) / p.dim);
+    let w0 = unpack2x16float(weight[features.x / 2u]);
+    let w1 = unpack2x16float(weight[features.y / 2u]);
+    let gamma = vec2<f32>(select(w0.x, w0.y, (features.x & 1u) == 1u),
+                          select(w1.x, w1.y, (features.y & 1u) == 1u));
+    let inv = vec2<f32>(stats[rows.x * 2u], stats[rows.y * 2u]);
+    let correction = vec2<f32>(stats[rows.x * 2u + 1u],
+                                stats[rows.y * 2u + 1u]);
+    var dx = g * gamma * inv - x * correction;
+    if (base + 1u >= p.total) { dx.y = 0.0; }
+    grad_input[index] = pack2x16float(dx);
+  }
+  if (index < p.dim) {
+    var sum = 0.0;
+    for (var row = 0u; row < p.rows; row += 1u) {
+      let element = row * p.dim + index;
+      let xv = unpack2x16float(input[element / 2u]);
+      let gv = unpack2x16float(grad[element / 2u]);
+      let x = select(xv.x, xv.y, (element & 1u) == 1u);
+      let g = select(gv.x, gv.y, (element & 1u) == 1u);
+      sum += g * x * stats[row * 2u];
+    }
+    grad_weight[index] = sum;
+  }
+}")
+
 (def rotary-embedding-wgsl
   "Llama half-rotation RoPE over `[batch, sequence, embedding]`."
   "
@@ -2632,6 +2721,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :group-norm-nchw-f16-reference group-norm-nchw-f16-reference-wgsl
    :embedding-f16 embedding-f16-wgsl
    :rms-norm-f16 rms-norm-f16-wgsl
+   :rms-norm-backward-stats-f16 rms-norm-backward-stats-f16-wgsl
+   :rms-norm-backward-f16 rms-norm-backward-f16-wgsl
    :rotary-embedding-f16 rotary-embedding-f16-wgsl
    :copy-into-f16 copy-into-f16-wgsl
    :spmv   spmv-csr-wgsl})

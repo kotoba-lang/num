@@ -88,9 +88,23 @@
   only the final two (matrix) axes and preserve all leading batch axes."
   [x W]
   (node (t/matmul (:data x) (:data W))
-        [x W]
-        (fn [self]
-          (when-let [g @(:grad self)]
+          [x W]
+          (fn [self]
+            (when-let [g @(:grad self)]
+            (when-not (= (or (:dtype g) :f32)
+                         (or (:dtype (:data W)) :f32))
+              (throw (ex-info "matmul VJP activation/weight dtype mismatch"
+                              {:gradient-dtype (:dtype g)
+                               :gradient-shape (:shape g)
+                               :weight-dtype (:dtype (:data W))
+                               :weight-shape (:shape (:data W))})))
+            (when-not (= (or (:dtype (:data x)) :f32)
+                         (or (:dtype g) :f32))
+              (throw (ex-info "matmul VJP input/gradient dtype mismatch"
+                              {:input-dtype (:dtype (:data x))
+                               :input-shape (:shape (:data x))
+                               :gradient-dtype (:dtype g)
+                               :gradient-shape (:shape g)})))
             (accumulate! x (t/matmul g (swap-last-two (:data W))))
             (accumulate! W (t/matmul (swap-last-two (:data x)) g))))))
 
@@ -591,16 +605,27 @@
           [x]
           (fn [self]
             (when-let [g @(:grad self)]
-              (let [xs (arr/->vec input-data)
-                    gs (arr/->vec g)
-                    dx (mapv (fn [value upstream]
-                               (let [sigmoid (/ 1.0 (+ 1.0 (Math/exp (- (double value)))))
-                                     derivative (* sigmoid
-                                                   (+ 1.0 (* value (- 1.0 sigmoid))))]
-                                 (* upstream derivative)))
-                             xs gs)]
-                (accumulate! x (arr/from-vec (:backend input-data) dx
-                                             (:shape input-data)))))))))
+              (if (and (= :f16 (:dtype input-data))
+                       (= (:backend input-data) (:backend g))
+                       (satisfies? p/IDTypeOps (:backend input-data)))
+                (let [sigmoid (nm/sigmoid input-data)
+                      sigmoid-gradient (nm/sigmoid-gradient sigmoid)
+                      weighted-gradient (nm/mul input-data sigmoid-gradient)
+                      derivative (nm/add sigmoid weighted-gradient)
+                      dx (nm/mul g derivative)]
+                  (arr/release-all! [sigmoid sigmoid-gradient weighted-gradient
+                                     derivative])
+                  (accumulate! x dx))
+                (let [xs (arr/->vec input-data)
+                      gs (arr/->vec g)
+                      dx (mapv (fn [value upstream]
+                                 (let [sigmoid (/ 1.0 (+ 1.0 (Math/exp (- (double value)))))
+                                       derivative (* sigmoid
+                                                     (+ 1.0 (* value (- 1.0 sigmoid))))]
+                                   (* upstream derivative)))
+                               xs gs)]
+                  (accumulate! x (arr/from-vec (:backend input-data) dx
+                                               (:shape input-data))))))))))
 
 (defn group-norm-nchw*
   "Differentiable PyTorch-style GroupNorm. Optional affine `weight`/`bias`
@@ -734,7 +759,20 @@
      (node output [x weight]
            (fn [self]
              (when-let [g @(:grad self)]
-               (let [xs (vec (arr/->vec input-data))
+               (if (and (= :f16 (:dtype input-data) (:dtype weight-data))
+                        (= (:backend input-data) (:backend weight-data) (:backend g))
+                        (satisfies? p/IDTypeTensorOps (:backend input-data)))
+                 (let [backend (:backend input-data)
+                       gradients (p/-rms-norm-backward-dtype
+                                  backend (:handle input-data) (:handle weight-data)
+                                  (:handle g) {:rows rows :dim dim :eps eps} :f16)]
+                   (accumulate! x (assoc (arr/->NDArray backend (:input gradients) shape)
+                                         :dtype :f16))
+                   (accumulate! weight
+                                (assoc (arr/->NDArray backend (:weight gradients)
+                                                     (:shape weight-data))
+                                       :dtype :f32)))
+                 (let [xs (vec (arr/->vec input-data))
                      ws (vec (arr/->vec weight-data))
                      gs (vec (arr/->vec g))
                      dx (double-array (* rows dim))
@@ -759,7 +797,7 @@
                  (accumulate! x (arr/from-vec (:backend input-data) (vec dx) shape))
                  (accumulate! weight
                               (arr/from-vec (:backend weight-data) (vec dw)
-                                            (:shape weight-data))))))))))
+                                            (:shape weight-data)))))))))))
 
 (defn rotary-embedding*
   "Differentiable RoPE. Since each pair is an orthogonal rotation, its VJP is

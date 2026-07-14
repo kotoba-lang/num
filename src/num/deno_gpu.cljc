@@ -608,6 +608,27 @@
                          (wb/uni dev [(double eps)])]
                         [rows 1 1])
            output))
+       (-rms-norm-backward-dtype
+         [_ input-h weight-h grad-output-h {:keys [rows dim eps]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RMSNorm backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows dim)
+               stats (w/-create-buffer dev (* rows 2) :storage)
+               grad-input (w/-create-buffer-dtype dev total :storage :f16)
+               grad-weight (w/-create-buffer dev dim :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev pipes :rms-norm-backward-stats-f16)
+                        [input-h weight-h grad-output-h stats
+                         (wb/uni dev (wb/u32-tag [rows dim total 0]))
+                         (wb/uni dev [(double eps)])]
+                        [rows 1 1])
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rms-norm-backward-f16)
+                        [input-h weight-h grad-output-h stats grad-input grad-weight
+                         (wb/uni dev (wb/u32-tag [rows dim total 0]))]
+                        [(wb/ceil-div (max (wb/ceil-div total 2) dim) 64) 1 1])
+           (w/-destroy-buffer dev stats)
+           {:input grad-input :weight grad-weight}))
        (-rotary-embedding-dtype
          [_ input-h {:keys [batch sequence embed heads head-dim position-offset
                             theta direction]} dtype*]
