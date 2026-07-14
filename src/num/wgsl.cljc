@@ -1220,6 +1220,63 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   output[index] = input[outer * d.input_block + d.input_offset + within];
 }")
 
+(def upsample-nearest2d-f16-wgsl
+  "Packed-F16 nearest-neighbor NCHW upsampling, one invocation per output pair."
+  "
+struct Dims {
+  n: u32, c: u32, h: u32, w: u32,
+  oh: u32, ow: u32, scale_h: u32, scale_w: u32, total: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> d: Dims;
+fn load(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn source(index: u32) -> u32 {
+  let x = index % d.ow;
+  let y = (index / d.ow) % d.oh;
+  let channel = (index / (d.ow * d.oh)) % d.c;
+  let batch = index / (d.ow * d.oh * d.c);
+  return ((batch * d.c + channel) * d.h + y / d.scale_h) * d.w
+         + x / d.scale_w;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u;
+  if (first >= d.total) { return; }
+  var second = 0.0;
+  if (first + 1u < d.total) { second = load(source(first + 1u)); }
+  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+}")
+
+(def slice-axis-f16-wgsl
+  "Packed-F16 contiguous axis slicing, including unaligned input offsets."
+  "
+struct Dims {
+  total: u32, input_block: u32, output_block: u32, input_offset: u32,
+}
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> d: Dims;
+fn load(index: u32) -> f32 {
+  let pair = unpack2x16float(input[index / 2u]);
+  return select(pair.x, pair.y, index % 2u == 1u);
+}
+fn source(index: u32) -> u32 {
+  return (index / d.output_block) * d.input_block + d.input_offset
+         + index % d.output_block;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let first = gid.x * 2u;
+  if (first >= d.total) { return; }
+  var second = 0.0;
+  if (first + 1u < d.total) { second = load(source(first + 1u)); }
+  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+}")
+
 (def pad-right-bottom-nchw-wgsl
   "Append a zero-valued right column and bottom row to every NCHW plane."
   "
@@ -2377,8 +2434,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :paged-gqa-attention-batch paged-gqa-attention-batch-wgsl
    :group-norm-silu-nchw group-norm-silu-nchw-wgsl
    :upsample-nearest2d upsample-nearest2d-wgsl
+   :upsample-nearest2d-f16 upsample-nearest2d-f16-wgsl
    :cat-copy cat-copy-wgsl
    :slice-axis slice-axis-wgsl
+   :slice-axis-f16 slice-axis-f16-wgsl
    :pad-right-bottom-nchw pad-right-bottom-nchw-wgsl
    :add-last-axis-bias add-last-axis-bias-wgsl
    :transpose-2d transpose-2d-wgsl

@@ -50,6 +50,10 @@
         cpu-copy-destination (arr/zeros cpu-backend [6] :f16)
         _ (tensor/copy-into! cpu-copy-destination
                              (arr/from-vec cpu-backend [0.25 -0.5] [2] :f16) 2)
+        cpu-odd (arr/from-vec cpu-backend [1 2 3 4 5] [1 1 1 5] :f16)
+        cpu-slice (tensor/slice-axis cpu-odd 3 1 4)
+        cpu-upsample (tensor/upsample-nearest2d
+                      (arr/from-vec cpu-backend [1 2 3] [1 1 1 3] :f16) [2 2])
         expected [(arr/->vec (num/add cpu-a cpu-b))
                   (arr/->vec (num/silu cpu-a))
                   (arr/->vec (num/sigmoid cpu-a))
@@ -63,7 +67,9 @@
                   (arr/->vec cpu-embedding)
                   (arr/->vec cpu-rmsnorm)
                   (arr/->vec cpu-rope)
-                  (arr/->vec cpu-copy-destination)]]
+                  (arr/->vec cpu-copy-destination)
+                  (arr/->vec cpu-slice)
+                  (arr/->vec cpu-upsample)]]
     (-> (gpu/request-device)
         (.then
          (fn [device-result]
@@ -100,17 +106,21 @@
                                       (arr/from-vec backend [0.25 -0.5] [2] :f16) 2)
                  cast-f32 (arr/cast a :f32)
                  cast-back (arr/cast cast-f32 :f16)
+                 odd (arr/from-vec backend [1 2 3 4 5] [1 1 1 5] :f16)
+                 sliced (tensor/slice-axis odd 3 1 4)
+                 upsampled (tensor/upsample-nearest2d
+                            (arr/from-vec backend [1 2 3] [1 1 1 3] :f16) [2 2])
                  outputs [(num/add a b) (num/silu a) (num/sigmoid a) (num/tanh a)
                           (num/gelu a)
                           (num/matmul a b) conv norm norm-silu layernorm embedding rmsnorm rope
-                          copy-destination cast-f32 cast-back]]
+                          copy-destination sliced upsampled cast-f32 cast-back]]
              (println "adapter:" (or (gpu/adapter-description device-result) "unknown"))
              (println "f16 physical bytes:" (.-size (:handle a)))
              (.then
               (js/Promise.all (into-array (map arr/->vec (into [a] outputs))))
               (fn [actual]
                 (let [input-values (vec (aget actual 0))
-                      actual-values (mapv #(vec (aget actual %)) (range 1 17))
+                      actual-values (mapv #(vec (aget actual %)) (range 1 19))
                       _ (println "uploaded:" input-values)
                       checks [(= 8 (.-size (:handle a)))
                               (approx-vec? (nth expected 0) (nth actual-values 0) 0.002)
@@ -127,10 +137,12 @@
                               (approx-vec? (nth expected 11) (nth actual-values 11) 0.01)
                               (approx-vec? (nth expected 12) (nth actual-values 12) 0.002)
                               (approx-vec? (nth expected 13) (nth actual-values 13) 0.002)
+                              (approx-vec? (nth expected 14) (nth actual-values 14) 0.002)
+                              (approx-vec? (nth expected 15) (nth actual-values 15) 0.002)
                               (approx-vec? [1.0 2.0 3.0 4.0]
-                                           (nth actual-values 14) 0.0001)
+                                           (nth actual-values 16) 0.0001)
                               (approx-vec? [1.0 2.0 3.0 4.0]
-                                           (nth actual-values 15) 0.002)]
+                                           (nth actual-values 17) 0.002)]
                       passed (count (filter true? checks))]
                   (println (str "Metal f16: " passed "/" (count checks) " passed"))
                   (when-not (= passed (count checks))

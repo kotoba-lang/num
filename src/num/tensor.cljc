@@ -897,12 +897,16 @@
                   out-shape)
                  :dtype :f32)
 
-          (and (not= :f32 dtype) (satisfies? p/ICastOps backend))
-          (let [source (arr/cast input :f32)
-                sliced (slice-axis source axis start end)
-                output (arr/cast sliced dtype)]
-            (arr/release-all! [source sliced])
-            output)
+          (and (not= :f32 dtype) (satisfies? p/IDTypeTensorOps backend))
+          (assoc (arr/->NDArray
+                  backend
+                  (p/-slice-axis-dtype
+                   backend (:handle input)
+                   {:total total :input-block input-block
+                    :output-block output-block :input-offset (* start inner)}
+                   dtype)
+                  out-shape)
+                 :dtype dtype)
 
           :else
           (let [source (arr/->vec input)
@@ -1255,11 +1259,22 @@
           backend (:backend input)
           params {:n N :c C :h H :width W :oh oh :ow ow
                   :scale-h scale-h :scale-w scale-w}]
-      (if (and (= :f32 (array-dtype input))
-               (satisfies? p/ITensorBackend backend))
+      (cond
+        (and (= :f32 (array-dtype input))
+             (satisfies? p/ITensorBackend backend))
         (assoc (arr/->NDArray backend
                        (p/-upsample-nearest2d backend (:handle input) params)
                        [N C oh ow]) :dtype :f32)
+
+        (and (not= :f32 (array-dtype input))
+             (satisfies? p/IDTypeTensorOps backend))
+        (assoc (arr/->NDArray backend
+                              (p/-upsample-nearest2d-dtype
+                               backend (:handle input) params (array-dtype input))
+                              [N C oh ow])
+               :dtype (array-dtype input))
+
+        :else
         (let [xs (double-array (arr/->vec input))
               out (double-array (* N C oh ow))]
           (dotimes [n N]

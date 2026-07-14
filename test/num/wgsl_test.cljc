@@ -13,6 +13,7 @@
                 :ewise-f16 :ewise1-f16 :gemm-f16
                 :conv2d-nchw-f16 :conv2d-nchw-f16-oc4 :group-norm-nchw-f16
                 :group-norm-nchw-f16-reference
+                :upsample-nearest2d-f16 :slice-axis-f16
                 :conv2d-nchw :conv2d-nchw-oc4
                 :group-norm-nchw :group-norm-silu-nchw
                 :upsample-nearest2d :cat-copy

@@ -173,8 +173,9 @@
        (-write-buffer-dtype [_ buf xs dtype*]
          (when-not (= dtype* :f16)
            (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
-         (let [encoded (js/Uint16Array.
-                        (into-array (map #(bit-and (dtype/f32->f16-bits %) 0xffff) xs)))]
+         (let [values (mapv #(bit-and (dtype/f32->f16-bits %) 0xffff) xs)
+               encoded (js/Uint16Array.
+                        (into-array (cond-> values (odd? (count values)) (conj 0))))]
            (.writeBuffer (.-queue dev) buf 0 encoded)))
        (-read-buffer-dtype [_ buf n dtype*]
          (when-not (= dtype* :f16)
@@ -468,6 +469,31 @@
                           [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1]))
            (when-not weight-h (w/-destroy-buffer dev weight))
            (when-not bias-h (w/-destroy-buffer dev bias))
+           output))
+       (-upsample-nearest2d-dtype [_ input-h
+                                    {:keys [n c h width oh ow scale-h scale-w]}
+                                    dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU upsample supports f16 only" {:dtype dtype*})))
+         (let [total (* n c oh ow)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :upsample-nearest2d-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [n c h width oh ow scale-h scale-w total]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-slice-axis-dtype [_ input-h
+                           {:keys [total input-block output-block input-offset]}
+                           dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU slice supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :slice-axis-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [total input-block output-block input-offset]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
            output))
        (-embedding-dtype [_ indices-h weight-h {:keys [tokens rows dim]} dtype*]
          (when-not (= dtype* :f16)

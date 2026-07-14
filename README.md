@@ -184,6 +184,9 @@ device-to-device slice dispatches. None requires tensor host readback. A complet
 `GroupNorm → SiLU → upsample → skip cat` chain plus slicing and asymmetric
 padding are verified against the CPU oracle on Apple M4 Metal. None of these
 paths downloads intermediate tensors.
+Packed F16 nearest upsampling and contiguous slicing also execute directly over
+physical half buffers, including odd logical element counts and unaligned slice
+offsets; uploads pad only the final storage word without changing tensor shape.
 `scale` provides an immutable device-native scalar multiply by combining a
 device-to-device copy with the backend BLAS scale kernel.
 `group-norm-silu-nchw` fuses the ubiquitous diffusion ResNet

@@ -84,6 +84,8 @@
   "Optional N-D compute operations over physical typed storage."
   (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])
   (-group-norm-nchw-dtype [b input-h weight-h bias-h params dtype])
+  (-upsample-nearest2d-dtype [b input-h params dtype])
+  (-slice-axis-dtype [b input-h params dtype])
   (-embedding-dtype [b indices-h weight-h params dtype])
   (-rms-norm-dtype [b input-h weight-h params dtype])
   (-rotary-embedding-dtype [b input-h params dtype]))
