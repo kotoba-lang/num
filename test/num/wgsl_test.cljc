@@ -83,7 +83,7 @@
 (deftest backend-namespaces-load
   (testing "the WgslBackend constructor and IGpuDevice port compile on the JVM"
     (is (fn? wb/wgsl-backend))
-    (is (some? (resolve 'num.wgsl/IGpuDevice)))))
+    (is (some? w/IGpuDevice))))
 
 (deftest q8-gemv-shader-decodes-packed-signed-blocks
   (is (string? w/q8-0-gemv-wgsl))
