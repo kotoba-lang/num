@@ -66,6 +66,16 @@
          :uniform uniform-usage
          (:storage :read) storage-usage))
 
+     (defn- linear-workgroups
+       "Map a 64-wide linear invocation range across WebGPU's x/y dispatch
+       dimensions without exceeding the per-dimension 65,535 limit. Shaders
+       using this layout flatten gid.xy with the reported num_workgroups.x."
+       [invocations]
+       (let [groups (wb/ceil-div invocations 64)
+             y (wb/ceil-div groups 65535)
+             x (wb/ceil-div groups y)]
+         [x y 1]))
+
      (defn- record-allocation! [stats buffer]
        (let [bytes (.-size buffer)]
          (swap! stats
@@ -404,7 +414,7 @@
                         [xh yh output
                          (wb/uni dev (wb/u32-tag [({:add 0 :sub 1 :mul 2 :div 3} op)
                                                   n 0 0]))]
-                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+                        (linear-workgroups (wb/ceil-div n 2)))
            output))
        (-ewise1-dtype [_ op xh n dtype*]
          (when-not (= dtype* :f16)
@@ -417,7 +427,7 @@
                                                    :sigmoid-gradient 6 :tanh-gradient 7
                                                    :gelu 8 :gelu-gradient 9} op)
                                                   n 0 0]))]
-                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+                        (linear-workgroups (wb/ceil-div n 2)))
            output))
        (-scale-dtype [_ alpha xh n dtype*]
          (when-not (= dtype* :f16)
@@ -427,7 +437,7 @@
                         [xh output
                          (wb/uni dev (wb/u32-tag [n 0 0 0]))
                          (wb/uni dev [(double alpha)])]
-                        [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+                        (linear-workgroups (wb/ceil-div n 2)))
            output))
        (-gemm-dtype [_ Ah m k Bh n dtype*]
          (when-not (= dtype* :f16)
@@ -500,7 +510,7 @@
                         [input-h output
                          (wb/uni dev (wb/u32-tag
                                       [n c h width oh ow scale-h scale-w total]))]
-                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+                        (linear-workgroups (wb/ceil-div total 2)))
            output))
        (-slice-axis-dtype [_ input-h
                            {:keys [total input-block output-block input-offset]}
@@ -512,7 +522,7 @@
                         [input-h output
                          (wb/uni dev (wb/u32-tag
                                       [total input-block output-block input-offset]))]
-                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+                        (linear-workgroups (wb/ceil-div total 2)))
            output))
        (-nchw-to-rgb-image-dtype [_ input-h {:keys [height width total]} dtype*]
          (when-not (= dtype* :f16)
@@ -522,7 +532,7 @@
            (w/-dispatch dev (wb/get-pipeline dev pipes :nchw-to-rgb-image-f16)
                         [input-h output
                          (wb/uni dev (wb/u32-tag [height width total 0]))]
-                        [(wb/ceil-div total 64) 1 1])
+                        (linear-workgroups total))
            output))
        (-transpose-dtype [_ input-h
                           {:keys [rank total input-shape output-shape perm]}
@@ -535,7 +545,7 @@
                               (pad4 output-shape) (pad4 perm))]
            (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-nd-f16)
                         [input-h output (wb/uni dev (wb/u32-tag params))]
-                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+                        (linear-workgroups (wb/ceil-div total 2)))
            output))
        (-multi-head-attention-dtype
          [_ query-h key-h value-h
