@@ -657,11 +657,13 @@ fn source(output_index: u32) -> u32 {
   return input_index;
 }
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let first = gid.x * 2u; if (first >= p.info.y) { return; }
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {
+  let word = gid.x + gid.y * grid.x * 64u;
+  let first = word * 2u; if (first >= p.info.y) { return; }
   var second = 0.0;
   if (first + 1u < p.info.y) { second = load(source(first + 1u)); }
-  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+  output[word] = pack2x16float(vec2<f32>(load(source(first)), second));
 }")
 
 (def batched-matmul-wgsl
@@ -1482,12 +1484,14 @@ fn source(index: u32) -> u32 {
          + x / d.scale_w;
 }
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let first = gid.x * 2u;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {
+  let word = gid.x + gid.y * grid.x * 64u;
+  let first = word * 2u;
   if (first >= d.total) { return; }
   var second = 0.0;
   if (first + 1u < d.total) { second = load(source(first + 1u)); }
-  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+  output[word] = pack2x16float(vec2<f32>(load(source(first)), second));
 }")
 
 (def slice-axis-f16-wgsl
@@ -1508,12 +1512,14 @@ fn source(index: u32) -> u32 {
          + index % d.output_block;
 }
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let first = gid.x * 2u;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {
+  let word = gid.x + gid.y * grid.x * 64u;
+  let first = word * 2u;
   if (first >= d.total) { return; }
   var second = 0.0;
   if (first + 1u < d.total) { second = load(source(first + 1u)); }
-  output[gid.x] = pack2x16float(vec2<f32>(load(source(first)), second));
+  output[word] = pack2x16float(vec2<f32>(load(source(first)), second));
 }")
 
 (def pad-right-bottom-nchw-wgsl
@@ -1546,8 +1552,9 @@ struct Params { op: u32, n: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(2) var<storage, read_write> z: array<u32>;
 @group(0) @binding(3) var<uniform> p: Params;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let word = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {
+  let word = gid.x + gid.y * grid.x * 64u;
   let base = word * 2u;
   if (base >= p.n) { return; }
   let xv = unpack2x16float(x[word]);
@@ -1592,8 +1599,9 @@ fn apply(v: f32) -> f32 {
          v * 0.3989422804014327 * exp(-0.5 * v * v);
 }
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let word = gid.x;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {
+  let word = gid.x + gid.y * grid.x * 64u;
   let base = word * 2u;
   if (base >= p.n) { return; }
   let v = unpack2x16float(x[word]);
@@ -2457,7 +2465,8 @@ fn byte_at(offset: u32) -> u32 {
 " value-function "
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let index = gid.x; if (index >= p.total) { return; }
+  let index = gid.x;
+  if (index >= p.total) { return; }
   let position = index / p.dim; let feature = index % p.dim;
   let raw_row = indices[position];
   if (raw_row < 0.0 || raw_row >= f32(p.rows) || raw_row != floor(raw_row)) {
@@ -2576,8 +2585,10 @@ fn load(index: u32) -> f32 {
   return select(pair.x, pair.y, index % 2u == 1u);
 }
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let index = gid.x; if (index >= p.total) { return; }
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {
+  let index = gid.x + gid.y * grid.x * 64u;
+  if (index >= p.total) { return; }
   let plane = p.height * p.width; let channel = index % 3u;
   let spatial = (index / 3u) % plane; let batch = index / (3u * plane);
   let source = (batch * 3u + channel) * plane + spatial;
@@ -2593,11 +2604,13 @@ struct Params { count: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(2) var<uniform> p: Params;
 @group(0) @binding(3) var<uniform> alpha: f32;
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let first = gid.x * 2u; if (first >= p.count) { return; }
-  var values = unpack2x16float(input[gid.x]) * alpha;
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(num_workgroups) grid: vec3<u32>) {
+  let word = gid.x + gid.y * grid.x * 64u;
+  let first = word * 2u; if (first >= p.count) { return; }
+  var values = unpack2x16float(input[word]) * alpha;
   if (first + 1u >= p.count) { values.y = 0.0; }
-  output[gid.x] = pack2x16float(values);
+  output[word] = pack2x16float(values);
 }")
 
 (def f16-to-f32-wgsl
