@@ -299,6 +299,16 @@
                   ["amax"   (->p (nm/amax ag))                                (fn [g] (contract/approx? g exp-amax))]
                  ["amin"   (->p (nm/amin ag))                                (fn [g] (contract/approx? g exp-amin))]
                   ["device argmax rows" (->p (arr/argmax-rows argmax-input))   (fn [g] (= [17 512] g))]
+                  ["device penalized top-k row"
+                   (->p (arr/top-k-row
+                         (arr/from-vec gpu [4.0 -3.0 2.0 1.0
+                                            0.0 6.0 5.0 4.0]
+                                       [2 4])
+                         1 3 [1 1 3] 2.0))
+                   (fn [g]
+                     (and (= [2 1 3] (mapv first g))
+                          (contract/approx-vec? [5.0 3.0 2.0]
+                                                (mapv second g))))]
                   ["matvec" (->p (arr/->vec (nm/matvec Ag xvg)))              (fn [g] (contract/approx-vec? g exp-matvec))]
                   ["matmul" (->p (arr/->vec (nm/matmul Ag Bg)))               (fn [g] (contract/approx-vec? g exp-matmul))]
                   ["bias-add" (->p (arr/->vec bias-add-out))                  (fn [g] (contract/approx-vec? g exp-bias-add))]
@@ -364,10 +374,10 @@
                         checks)))
                  (.then (fn [_]
                           (let [selection-after (dg/backend-stats gpu)]
-                            (record! pass fail "argmax scalar-only readback"
-                                     (and (= 1 (- (:selection-readbacks selection-after 0)
+                            (record! pass fail "bounded selection readback"
+                                     (and (= 2 (- (:selection-readbacks selection-after 0)
                                                   (:selection-readbacks selection-before 0)))
-                                          (= 8 (- (:selection-readback-bytes selection-after 0)
+                                          (= 32 (- (:selection-readback-bytes selection-after 0)
                                                   (:selection-readback-bytes selection-before 0))))))
                           (record! pass fail "temporary GPUBuffer lifetime"
                                    (verify-temporary-buffer-lifetime! gpu))

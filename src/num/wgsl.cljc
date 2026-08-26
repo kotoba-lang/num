@@ -293,6 +293,97 @@ fn main(@builtin(local_invocation_id) lane: vec3<u32>,
   if (lane.x == 0u) { indices[row] = best_indices[0]; }
 }")
 
+(def repetition-penalty-row-wgsl
+  "Apply the standard repetition penalty to unique token columns in one row.
+  Callers deduplicate token IDs before dispatch, avoiding write races."
+  "
+struct Dims { row: u32, cols: u32, count: u32, _pad0: u32 }
+@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> tokens: array<u32>;
+@group(0) @binding(2) var<uniform> dims: Dims;
+@group(0) @binding(3) var<uniform> penalty: f32;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= dims.count) { return; }
+  let token = tokens[gid.x];
+  if (token >= dims.cols) { return; }
+  let index = dims.row * dims.cols + token;
+  let value = logits[index];
+  logits[index] = select(value / penalty, value * penalty, value < 0.0);
+}")
+
+(def top-k-row-wgsl
+  "Exact bounded row top-k for k <= 64. Lanes repeatedly scan their strided
+  vocabulary slice, reduce the next maximum, and exclude prior winners. Output
+  is interleaved f32 `[token-id, adjusted-logit]`, permitting one small readback."
+  "
+struct Dims { row: u32, cols: u32, k: u32, _pad0: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> candidates: array<f32>;
+@group(0) @binding(2) var<uniform> dims: Dims;
+var<workgroup> best_values: array<f32, 256>;
+var<workgroup> best_indices: array<u32, 256>;
+var<workgroup> selected_indices: array<u32, 64>;
+
+fn better(value: f32, index: u32, current: f32, current_index: u32) -> bool {
+  return value > current || (value == current && index < current_index);
+}
+
+fn selected(index: u32, rank: u32) -> bool {
+  var i = 0u;
+  loop {
+    if (i >= rank) { return false; }
+    if (selected_indices[i] == index) { return true; }
+    i = i + 1u;
+  }
+  return false;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lane: vec3<u32>) {
+  var rank = 0u;
+  loop {
+    if (rank >= dims.k) { break; }
+    var value = -3.402823466e38;
+    var index = 0xffffffffu;
+    var col = lane.x;
+    loop {
+      if (col >= dims.cols) { break; }
+      let candidate = logits[dims.row * dims.cols + col];
+      if (!selected(col, rank) && better(candidate, col, value, index)) {
+        value = candidate;
+        index = col;
+      }
+      col = col + 256u;
+    }
+    best_values[lane.x] = value;
+    best_indices[lane.x] = index;
+    workgroupBarrier();
+    var width = 128u;
+    loop {
+      if (width == 0u) { break; }
+      if (lane.x < width) {
+        let other_value = best_values[lane.x + width];
+        let other_index = best_indices[lane.x + width];
+        if (better(other_value, other_index,
+                   best_values[lane.x], best_indices[lane.x])) {
+          best_values[lane.x] = other_value;
+          best_indices[lane.x] = other_index;
+        }
+      }
+      workgroupBarrier();
+      width = width / 2u;
+    }
+    if (lane.x == 0u) {
+      selected_indices[rank] = best_indices[0];
+      candidates[rank * 2u] = f32(best_indices[0]);
+      candidates[rank * 2u + 1u] = best_values[0];
+    }
+    workgroupBarrier();
+    rank = rank + 1u;
+  }
+}")
+
 (def gemv-wgsl
   "Dense GEMV: y = A·x, A is m×n row-major. One thread per row."
   "
@@ -2867,6 +2958,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :ewise1 ewise1-wgsl
    :reduce reduce-wgsl
    :argmax-rows argmax-rows-wgsl
+   :repetition-penalty-row repetition-penalty-row-wgsl
+   :top-k-row top-k-row-wgsl
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl
    :conv2d-nchw conv2d-nchw-wgsl
