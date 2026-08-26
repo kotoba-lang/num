@@ -81,6 +81,22 @@
   [a]
   (first (->vec a)))
 
+(defn argmax-rows
+  "Return one maximum-value column index per row without materializing logits
+  on the host. The array must be contiguous f32 `[rows,cols]`, and its backend
+  must implement `IDeviceSelection`. Async GPU backends return a Promise."
+  [a]
+  (let [[rows cols :as shape] (:shape a)
+        backend (:backend a)]
+    (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (= :f32 (or (:dtype a) :f32)))
+      (throw (ex-info "argmax-rows requires a non-empty f32 matrix"
+                      {:shape shape :dtype (:dtype a)})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support device row argmax"
+                      {:backend (p/-backend-name backend)})))
+    (p/-argmax-rows backend (:handle a) rows cols)))
+
 (defn like
   "An uninitialized NDArray with the same backend/shape as `a`."
   [a]

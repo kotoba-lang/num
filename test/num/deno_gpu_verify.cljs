@@ -214,6 +214,12 @@
                  Bg (arr/from-vec gpu [5 6 7 8] [2 2])
                  xsg (arr/from-vec gpu [1 1 1] [3])
                  cg (arr/from-vec gpu [0 1 -2 3] [4])
+                 argmax-values
+                 (vec (concat
+                       (assoc (vec (repeat 513 -10.0)) 17 4.0 401 4.0)
+                       (assoc (vec (repeat 513 -20.0)) 512 9.0)))
+                 argmax-input (arr/from-vec gpu argmax-values [2 513])
+                 selection-before (dg/backend-stats gpu)
                  conv-out (t/conv2d-nchw
                            (arr/from-vec gpu conv-input-values [2 4 16 16])
                            (arr/from-vec gpu conv-weight-values [8 2 3 3])
@@ -291,7 +297,8 @@
                   ["div"    (->p (arr/->vec (nm/div ag bg)))                  (fn [g] (contract/approx-vec? g exp-div))]
                   ["sum"    (->p (nm/sum ag))                                 (fn [g] (contract/approx? g exp-sum))]
                   ["amax"   (->p (nm/amax ag))                                (fn [g] (contract/approx? g exp-amax))]
-                  ["amin"   (->p (nm/amin ag))                                (fn [g] (contract/approx? g exp-amin))]
+                 ["amin"   (->p (nm/amin ag))                                (fn [g] (contract/approx? g exp-amin))]
+                  ["device argmax rows" (->p (arr/argmax-rows argmax-input))   (fn [g] (= [17 512] g))]
                   ["matvec" (->p (arr/->vec (nm/matvec Ag xvg)))              (fn [g] (contract/approx-vec? g exp-matvec))]
                   ["matmul" (->p (arr/->vec (nm/matmul Ag Bg)))               (fn [g] (contract/approx-vec? g exp-matmul))]
                   ["bias-add" (->p (arr/->vec bias-add-out))                  (fn [g] (contract/approx-vec? g exp-bias-add))]
@@ -356,6 +363,12 @@
                           (.then prom (fn [g] (record! pass fail label (okfn g)))))
                         checks)))
                  (.then (fn [_]
+                          (let [selection-after (dg/backend-stats gpu)]
+                            (record! pass fail "argmax scalar-only readback"
+                                     (and (= 1 (- (:selection-readbacks selection-after 0)
+                                                  (:selection-readbacks selection-before 0)))
+                                          (= 8 (- (:selection-readback-bytes selection-after 0)
+                                                  (:selection-readback-bytes selection-before 0))))))
                           (record! pass fail "temporary GPUBuffer lifetime"
                                    (verify-temporary-buffer-lifetime! gpu))
                           (println (str "\nDeno WgslBackendAsync ≡ CPU oracle: " @pass " passed, " @fail " failed"))

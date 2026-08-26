@@ -319,6 +319,40 @@
            (doseq [temporary [rp ci v]] (w/-destroy-buffer dev temporary))
            y))
 
+       p/IDeviceSelection
+       (-argmax-rows [_ logits-h rows cols]
+         (let [indices (w/-create-buffer dev rows :storage)
+               raw-device (.-dev dev)
+               nbytes (* 4 rows)
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :argmax-rows)
+                        [logits-h indices
+                         (wb/uni dev (wb/u32-tag [rows cols 0 0]))]
+                        [rows 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder indices 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [out (vec (js/Array.from
+                                        (js/Uint32Array.
+                                         (.slice (.getMappedRange staging) 0))))]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev indices)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          out)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev indices)
+                         (throw error))))))
+
        p/IQuantizedOps
        (-quantized-from-host [_ bytes _params]
          (let [words (wb/pack-bytes-u32 bytes)
