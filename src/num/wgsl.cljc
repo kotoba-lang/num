@@ -239,6 +239,60 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>,
   if (l.x == 0u) { partials[w.x] = s[0]; }
 }")
 
+(def argmax-rows-wgsl
+  "One 256-wide workgroup reduces each logits row to a token index. Each lane
+  scans a strided slice, then a pairwise workgroup reduction preserves the
+  lowest index on exact ties. Only one u32 per row crosses the host boundary."
+  "
+struct Dims { rows: u32, cols: u32, _pad0: u32, _pad1: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> indices: array<u32>;
+@group(0) @binding(2) var<uniform> dims: Dims;
+var<workgroup> best_values: array<f32, 256>;
+var<workgroup> best_indices: array<u32, 256>;
+
+fn better(value: f32, index: u32, current: f32, current_index: u32) -> bool {
+  return value > current || (value == current && index < current_index);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lane: vec3<u32>,
+        @builtin(workgroup_id) group: vec3<u32>) {
+  let row = group.x;
+  if (row >= dims.rows) { return; }
+  var value = -3.402823466e38;
+  var index = 0xffffffffu;
+  var col = lane.x;
+  loop {
+    if (col >= dims.cols) { break; }
+    let candidate = logits[row * dims.cols + col];
+    if (better(candidate, col, value, index)) {
+      value = candidate;
+      index = col;
+    }
+    col = col + 256u;
+  }
+  best_values[lane.x] = value;
+  best_indices[lane.x] = index;
+  workgroupBarrier();
+  var width = 128u;
+  loop {
+    if (width == 0u) { break; }
+    if (lane.x < width) {
+      let other_value = best_values[lane.x + width];
+      let other_index = best_indices[lane.x + width];
+      if (better(other_value, other_index,
+                 best_values[lane.x], best_indices[lane.x])) {
+        best_values[lane.x] = other_value;
+        best_indices[lane.x] = other_index;
+      }
+    }
+    workgroupBarrier();
+    width = width / 2u;
+  }
+  if (lane.x == 0u) { indices[row] = best_indices[0]; }
+}")
+
 (def gemv-wgsl
   "Dense GEMV: y = A·x, A is m×n row-major. One thread per row."
   "
@@ -2812,6 +2866,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :ewise  ewise-wgsl
    :ewise1 ewise1-wgsl
    :reduce reduce-wgsl
+   :argmax-rows argmax-rows-wgsl
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl
    :conv2d-nchw conv2d-nchw-wgsl

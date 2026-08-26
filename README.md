@@ -529,10 +529,19 @@ types, the full op contract) compiles to JS via ClojureScript and runs green on 
 **Apple M4/M1 Metal** three separate ways now: the standalone harness
 (`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
 (`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
-`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 47/47 against the CPU
+`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 50/50 against the CPU
 oracle). So num-clj
 genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
 longer only exercised by a script outside the Clojure dispatch seam.
+
+`num.array/argmax-rows` is the device-selection boundary used by inference
+servers. Its WGSL kernel assigns one 256-lane workgroup per contiguous logits
+row, scans arbitrarily wide vocabularies in lane-strided order, and preserves the
+lowest token index on exact ties. The Deno/WebGPU backend maps only the resulting
+u32 indices: a verified two-row, 513-column fixture transfers 8 bytes instead of
+4,104 bytes. `backend-stats` exposes `:selection-readbacks` and
+`:selection-readback-bytes` so serving tests can prove that boundary rather than
+infer it from token parity.
 
 **Honest gap:** most `num.tensor` N-D ops (broadcast/transpose/axis-reduce/batched-matmul,
 ADR-2607051400 §Phase 1) do not yet dispatch through `num.deno-gpu` or any GPU backend —
@@ -541,3 +550,5 @@ which `IBackend` is injected. Metadata-only reshape/squeeze/unsqueeze and the
 UNet path (SiLU, NCHW convolution, GroupNorm, nearest upsampling, cat) are
 exceptions. Extending the WGSL kernel set to N-D broadcast/batched-
 matmul dispatch is unimplemented net-new shader work, not attempted in this pass.
+Device-side probabilistic top-k/top-p selection is also not implemented;
+`argmax-rows` intentionally closes only the exact greedy-decode transfer path.

@@ -81,6 +81,13 @@
   (-quantized-embedding [b indices-h table-h params]
     "Gather packed quantized table rows into a dense f32 output."))
 
+(defprotocol IDeviceSelection
+  "Optional device-native token selection. This boundary returns only token
+  indices to the host instead of transferring a full logits matrix."
+  (-argmax-rows [b logits-h rows cols]
+    "Argmax each row of contiguous f32 `[rows,cols]` logits. Ties choose the
+    lowest column index. Async devices may return a Promise of indices."))
+
 (defprotocol IDTypeTensorOps
   "Optional N-D compute operations over physical typed storage."
   (-conv2d-nchw-dtype [b input-h weight-h bias-h params dtype])
