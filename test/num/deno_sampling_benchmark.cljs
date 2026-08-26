@@ -48,17 +48,24 @@
         (.then
          (fn [[k8 k40 k256]]
            (-> (measure iterations
+                        #(arr/sample-softmax-row
+                          logits 0 {:temperature 0.7 :random-value 0.51}))
+               (.then #(vector k8 k40 k256 %)))))
+        (.then
+         (fn [[k8 k40 k256 full-softmax]]
+           (-> (measure iterations
                         #(arr/speculative-rejection-row
                           logits draft 0 17
                           {:temperature 0.7 :acceptance-random 0.9
                            :residual-random 0.51}))
-               (.then #(vector k8 k40 k256 %)))))
+               (.then #(vector k8 k40 k256 full-softmax %)))))
         (.then
-         (fn [[k8 k40 k256 speculative]]
+         (fn [[k8 k40 k256 full-softmax speculative]]
            (let [after (gpu/backend-stats backend)
                  result {:adapter (gpu/adapter-description request)
                          :vocab vocab
                          :top-k-8 k8 :top-k-40 k40 :top-k-256 k256
+                         :full-softmax full-softmax
                          :speculative speculative
                          :readbacks (- (:selection-readbacks after 0)
                                        (:selection-readbacks baseline 0))

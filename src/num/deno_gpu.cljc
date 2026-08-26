@@ -451,6 +451,44 @@
                          (w/-destroy-buffer dev selected)
                          (throw error))))))
 
+       (-sample-softmax-row
+         [_ logits-h _rows cols row previous-tokens repetition-penalty
+          temperature random-value]
+         (apply-repetition-penalty-row!
+          dev pipes logits-h row cols previous-tokens repetition-penalty)
+         (let [selected (w/-create-buffer dev 1 :storage)
+               raw-device (.-dev dev)
+               nbytes 4
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :sample-softmax-row)
+                        [logits-h selected
+                         (wb/uni dev (wb/u32-tag [row cols 0 0]))
+                         (wb/uni dev [(double temperature)
+                                      (double random-value) 0.0 0.0])]
+                        [1 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder selected 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [token (aget (js/Uint32Array.
+                                           (.slice (.getMappedRange staging) 0)) 0)]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev selected)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          token)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev selected)
+                         (throw error))))))
+
        (-speculative-rejection-row
          [_ target-h draft-h _rows cols row draft-token temperature
           acceptance-random residual-random]

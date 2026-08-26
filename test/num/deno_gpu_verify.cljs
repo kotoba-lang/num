@@ -322,6 +322,12 @@
                          0 128))
                    (fn [g]
                      (= (vec (range 299 171 -1)) (mapv first g)))]
+                  ["device full-softmax sampling"
+                   (->p (arr/sample-softmax-row
+                         (arr/from-vec gpu [(Math/log 0.1) (Math/log 0.2)
+                                            (Math/log 0.7)] [1 3])
+                         0 {:temperature 1.0 :random-value 0.25}))
+                   (fn [g] (= 1 g))]
                   ["device speculative rejection"
                    (->p (arr/speculative-rejection-row
                          (arr/from-vec gpu [(Math/log 0.1) (Math/log 0.9)] [1 2])
@@ -400,9 +406,9 @@
                  (.then (fn [_]
                           (let [selection-after (dg/backend-stats gpu)]
                             (record! pass fail "bounded selection readback"
-                                     (and (= 6 (- (:selection-readbacks selection-after 0)
+                                     (and (= 7 (- (:selection-readbacks selection-after 0)
                                                   (:selection-readbacks selection-before 0)))
-                                          (= 1076 (- (:selection-readback-bytes selection-after 0)
+                                          (= 1080 (- (:selection-readback-bytes selection-after 0)
                                                   (:selection-readback-bytes selection-before 0))))))
                           (record! pass fail "temporary GPUBuffer lifetime"
                                    (verify-temporary-buffer-lifetime! gpu))

@@ -188,6 +188,35 @@
      backend (:handle target) (:handle draft) rows cols row draft-token
      temperature acceptance-random residual-random)))
 
+(defn sample-softmax-row
+  "Apply repetition penalty and sample one disposable logits row from its full
+  temperature-softmax distribution on device. This is the exact untruncated
+  categorical policy (`top-k=nil`, `top-p=1`); async backends return a Promise."
+  [a row {:keys [previous-tokens repetition-penalty temperature random-value]
+          :or {previous-tokens [] repetition-penalty 1.0 temperature 1.0
+               random-value 0.5}}]
+  (let [[rows cols :as shape] (:shape a)
+        backend (:backend a)
+        previous-tokens (vec (distinct previous-tokens))]
+    (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (= :f32 (or (:dtype a) :f32))
+                   (int? row) (<= 0 row) (< row rows)
+                   (number? repetition-penalty) (<= 1.0 repetition-penalty)
+                   (number? temperature) (pos? temperature)
+                   (number? random-value) (<= 0.0 random-value)
+                   (< random-value 1.0)
+                   (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
+      (throw (ex-info "sample-softmax-row requires valid full-softmax options"
+                      {:shape shape :dtype (:dtype a) :row row
+                       :temperature temperature
+                       :repetition-penalty repetition-penalty
+                       :random-value random-value})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support device softmax sampling"
+                      {:backend (p/-backend-name backend)})))
+    (p/-sample-softmax-row backend (:handle a) rows cols row previous-tokens
+                           repetition-penalty temperature random-value)))
+
 (defn like
   "An uninitialized NDArray with the same backend/shape as `a`."
   [a]

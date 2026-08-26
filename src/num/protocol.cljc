@@ -97,6 +97,11 @@
      temperature top-p random-value]
     "Apply repetition penalty and exact top-k, then perform temperature/top-p
     sampling on device. Returns only the selected token index.")
+  (-sample-softmax-row
+    [b logits-h rows cols row previous-tokens repetition-penalty
+     temperature random-value]
+    "Apply repetition penalty and sample the full temperature-softmax
+    distribution on device. Returns only the selected token index.")
   (-speculative-rejection-row
     [b target-h draft-h rows cols row draft-token temperature
      acceptance-random residual-random]
