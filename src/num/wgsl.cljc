@@ -452,6 +452,108 @@ fn main() {
   selected[0u] = chosen;
 }")
 
+(def sample-softmax-row-wgsl
+  "Full-distribution temperature-softmax sampling for one logits row. Parallel
+  contiguous chunks compute max and probability mass; only the selected chunk
+  performs the final token-order CDF scan."
+  "
+struct Dims { row: u32, cols: u32, _pad0: u32, _pad1: u32 }
+struct Params { temperature: f32, random_value: f32, _pad0: f32, _pad1: f32 }
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> selected: array<u32>;
+@group(0) @binding(2) var<uniform> dims: Dims;
+@group(0) @binding(3) var<uniform> params: Params;
+var<workgroup> reduce_values: array<f32, 256>;
+var<workgroup> chunk_weights: array<f32, 256>;
+var<workgroup> maximum: f32;
+var<workgroup> total: f32;
+var<workgroup> threshold: f32;
+var<workgroup> prefix: f32;
+var<workgroup> chosen_lane: u32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lane: vec3<u32>) {
+  let base = dims.row * dims.cols;
+  let chunk = (dims.cols + 255u) / 256u;
+  let begin = lane.x * chunk;
+  let end = min(dims.cols, begin + chunk);
+  var local_max = -3.402823466e38;
+  var i = begin;
+  loop {
+    if (i >= end) { break; }
+    local_max = max(local_max, logits[base + i]);
+    i = i + 1u;
+  }
+  reduce_values[lane.x] = local_max;
+  workgroupBarrier();
+  var width = 128u;
+  loop {
+    if (width == 0u) { break; }
+    if (lane.x < width) {
+      reduce_values[lane.x] = max(reduce_values[lane.x],
+                                  reduce_values[lane.x + width]);
+    }
+    workgroupBarrier();
+    width = width / 2u;
+  }
+  if (lane.x == 0u) { maximum = reduce_values[0u]; }
+  workgroupBarrier();
+  var local_sum = 0.0;
+  i = begin;
+  loop {
+    if (i >= end) { break; }
+    local_sum = local_sum +
+      exp((logits[base + i] - maximum) / params.temperature);
+    i = i + 1u;
+  }
+  chunk_weights[lane.x] = local_sum;
+  reduce_values[lane.x] = local_sum;
+  workgroupBarrier();
+  width = 128u;
+  loop {
+    if (width == 0u) { break; }
+    if (lane.x < width) {
+      reduce_values[lane.x] = reduce_values[lane.x] +
+                              reduce_values[lane.x + width];
+    }
+    workgroupBarrier();
+    width = width / 2u;
+  }
+  if (lane.x == 0u) {
+    total = reduce_values[0u];
+    threshold = params.random_value * total;
+    var cumulative = 0.0;
+    var lane_index = 0u;
+    chosen_lane = 255u;
+    loop {
+      if (lane_index >= 256u) { break; }
+      let cumulative_next = cumulative + chunk_weights[lane_index];
+      if (cumulative_next > threshold || lane_index == 255u) {
+        chosen_lane = lane_index;
+        prefix = cumulative;
+        break;
+      }
+      cumulative = cumulative_next;
+      lane_index = lane_index + 1u;
+    }
+  }
+  workgroupBarrier();
+  if (lane.x == chosen_lane) {
+    var cumulative = prefix;
+    var chosen = max(1u, end) - 1u;
+    i = begin;
+    loop {
+      if (i >= end) { break; }
+      cumulative = cumulative +
+        exp((logits[base + i] - maximum) / params.temperature);
+      chosen = i;
+      if (cumulative > threshold || i + 1u == end) { break; }
+      i = i + 1u;
+    }
+    selected[0u] = chosen;
+  }
+}")
+
 (def speculative-rejection-row-wgsl
   "Exact full-distribution speculative accept/reject and residual sampling for
   one row. Contiguous vocabulary chunks reduce softmax and residual mass in
@@ -3196,6 +3298,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :repetition-penalty-row repetition-penalty-row-wgsl
    :top-k-row top-k-row-wgsl
    :sample-candidates sample-candidates-wgsl
+   :sample-softmax-row sample-softmax-row-wgsl
    :speculative-rejection-row speculative-rejection-row-wgsl
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl

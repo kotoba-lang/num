@@ -554,15 +554,18 @@ disposable.
 
 `sample-top-k-row` keeps those candidates on device and fuses temperature,
 top-p, and categorical selection into one kernel, so each decode returns only a
-4-byte token ID. `speculative-rejection-row` performs full-distribution
-temperature softmax, proposal acceptance, and positive-residual sampling with
-parallel contiguous vocabulary chunks, returning only an 8-byte decision.
+4-byte token ID. `sample-softmax-row` handles the untruncated (`top-k=nil`,
+`top-p=1`) distribution with parallel max/mass reduction and a token-order CDF,
+also returning one 4-byte token ID. `speculative-rejection-row` performs full-
+distribution temperature softmax, proposal acceptance, and positive-residual
+sampling with parallel contiguous vocabulary chunks, returning only an 8-byte
+decision.
 
-At vocabulary 262,144, median warm selection times were: Apple M4 20.4/33.9/
-54.9 ms for k=8/40/256 and 15.3 ms for speculative rejection; Intel Arc B70
-17.0/21.8/51.7 ms and 12.1 ms respectively (three measured iterations after one
-warm-up). These are isolated sampling-kernel measurements over synthetic logits,
-not model throughput.
+At vocabulary 262,144, median warm selection times were: Apple M4 20.4/24.2/
+55.9 ms for k=8/40/256, 14.3 ms for full-softmax, and 14.5 ms for speculative
+rejection; Intel Arc B70 16.7/25.3/51.7 ms, 11.9 ms, and 12.2 ms respectively
+(three measured iterations after one warm-up). These are isolated sampling-
+kernel measurements over synthetic logits, not model throughput.
 
 **Honest gap:** most `num.tensor` N-D ops (broadcast/transpose/axis-reduce/batched-matmul,
 ADR-2607051400 §Phase 1) do not yet dispatch through `num.deno-gpu` or any GPU backend —
@@ -571,5 +574,5 @@ which `IBackend` is injected. Metadata-only reshape/squeeze/unsqueeze and the
 UNet path (SiLU, NCHW convolution, GroupNorm, nearest upsampling, cat) are
 exceptions. Extending the WGSL kernel set to N-D broadcast/batched-
 matmul dispatch is unimplemented net-new shader work, not attempted in this pass.
-Unbounded top-p still requires a full-vocabulary ordering strategy; the fused
-sampler deliberately admits only explicit top-k up to 256.
+Unbounded nucleus sampling with `top-p < 1` still requires a full-vocabulary
+ordering strategy; bounded nucleus sampling admits explicit top-k up to 256.
