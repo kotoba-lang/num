@@ -59,6 +59,12 @@
                    :main-opts ["-m" "cljs.main"
                                "-co" "{:optimizations :simple :target :nodejs :main num.deno-gpu-benchmark :output-to \"target/deno-gpu-benchmark.cjs\"}"
                                "-c" "num.deno-gpu-benchmark"]}
+  :deno-sampling-benchmark
+  {:extra-paths ["test"]
+   :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
+   :main-opts ["-m" "cljs.main"
+               "-co" "{:optimizations :simple :target :nodejs :main num.deno-sampling-benchmark :output-to \"target/deno-sampling-benchmark.cjs\"}"
+               "-c" "num.deno-sampling-benchmark"]}
   :deno-dtype-verify {:extra-paths ["test"]
                       :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
                       :main-opts ["-m" "cljs.main"

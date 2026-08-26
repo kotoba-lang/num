@@ -76,6 +76,29 @@
              x (wb/ceil-div groups y)]
          [x y 1]))
 
+     (defn- apply-repetition-penalty-row!
+       [dev pipes logits-h row cols previous-tokens repetition-penalty]
+       (let [previous-tokens (vec (distinct previous-tokens))]
+         (when (and (not= 1.0 repetition-penalty) (seq previous-tokens))
+           (let [tokens (w/-create-buffer dev (count previous-tokens) :storage)]
+             (w/-write-buffer dev tokens (wb/u32-tag previous-tokens))
+             (w/-dispatch dev (wb/get-pipeline dev pipes :repetition-penalty-row)
+                          [logits-h tokens
+                           (wb/uni dev (wb/u32-tag
+                                        [row cols (count previous-tokens) 0]))
+                           (wb/uni dev [(double repetition-penalty)])]
+                          [(wb/ceil-div (count previous-tokens) 64) 1 1])
+             (w/-destroy-buffer dev tokens)))))
+
+     (defn- top-k-row-buffer!
+       [dev pipes logits-h row cols k]
+       (let [candidates (w/-create-buffer dev (* 2 k) :storage)]
+         (w/-dispatch dev (wb/get-pipeline dev pipes :top-k-row)
+                      [logits-h candidates
+                       (wb/uni dev (wb/u32-tag [row cols k 0]))]
+                      [1 1 1])
+         candidates))
+
      (defn- record-allocation! [stats buffer]
        (let [bytes (.-size buffer)]
          (swap! stats
@@ -354,27 +377,14 @@
                          (throw error))))))
 
        (-top-k-row [_ logits-h _rows cols row k previous-tokens repetition-penalty]
-         (let [previous-tokens (vec (distinct previous-tokens))]
-           (when (and (not= 1.0 repetition-penalty) (seq previous-tokens))
-             (let [tokens (w/-create-buffer dev (count previous-tokens) :storage)]
-               (w/-write-buffer dev tokens (wb/u32-tag previous-tokens))
-               (w/-dispatch dev (wb/get-pipeline dev pipes :repetition-penalty-row)
-                            [logits-h tokens
-                             (wb/uni dev (wb/u32-tag
-                                          [row cols (count previous-tokens) 0]))
-                             (wb/uni dev [(double repetition-penalty)])]
-                            [(wb/ceil-div (count previous-tokens) 64) 1 1])
-               (w/-destroy-buffer dev tokens)))
+         (let [_ (apply-repetition-penalty-row!
+                  dev pipes logits-h row cols previous-tokens repetition-penalty)]
            (let [candidate-count (* 2 k)
-                 candidates (w/-create-buffer dev candidate-count :storage)
+                 candidates (top-k-row-buffer! dev pipes logits-h row cols k)
                  raw-device (.-dev dev)
                  nbytes (* 4 candidate-count)
                  staging (.createBuffer raw-device
                                         #js {:size nbytes :usage readback-usage})]
-             (w/-dispatch dev (wb/get-pipeline dev pipes :top-k-row)
-                          [logits-h candidates
-                           (wb/uni dev (wb/u32-tag [row cols k 0]))]
-                          [1 1 1])
              (let [encoder (.createCommandEncoder raw-device)]
                (.copyBufferToBuffer encoder candidates 0 staging 0 nbytes)
                (.submit (.-queue raw-device) #js [(.finish encoder)]))
@@ -400,6 +410,85 @@
                            (.destroy staging)
                            (w/-destroy-buffer dev candidates)
                            (throw error)))))))
+
+       (-sample-top-k-row
+         [_ logits-h _rows cols row k previous-tokens repetition-penalty
+          temperature top-p random-value]
+         (apply-repetition-penalty-row!
+          dev pipes logits-h row cols previous-tokens repetition-penalty)
+         (let [candidates (top-k-row-buffer! dev pipes logits-h row cols k)
+               selected (w/-create-buffer dev 1 :storage)
+               raw-device (.-dev dev)
+               nbytes 4
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :sample-candidates)
+                        [candidates selected (wb/uni dev (wb/u32-tag [k]))
+                         (wb/uni dev [(double temperature) (double top-p)
+                                      (double random-value) 0.0])]
+                        [1 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder selected 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [token (aget (js/Uint32Array.
+                                           (.slice (.getMappedRange staging) 0)) 0)]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev candidates)
+                          (w/-destroy-buffer dev selected)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          token)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev candidates)
+                         (w/-destroy-buffer dev selected)
+                         (throw error))))))
+
+       (-speculative-rejection-row
+         [_ target-h draft-h _rows cols row draft-token temperature
+          acceptance-random residual-random]
+         (let [result (w/-create-buffer dev 2 :storage)
+               raw-device (.-dev dev)
+               nbytes 8
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :speculative-rejection-row)
+                        [target-h draft-h result
+                         (wb/uni dev (wb/u32-tag [row cols draft-token 0]))
+                         (wb/uni dev [(double temperature)
+                                      (double acceptance-random)
+                                      (double residual-random) 0.0])]
+                        [1 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder result 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [values (js/Uint32Array.
+                                      (.slice (.getMappedRange staging) 0))
+                              out {:accepted? (= 1 (aget values 0))
+                                   :token (aget values 1)}]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev result)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          out)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev result)
+                         (throw error))))))
 
        p/IQuantizedOps
        (-quantized-from-host [_ bytes _params]

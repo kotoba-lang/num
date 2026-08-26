@@ -309,6 +309,31 @@
                      (and (= [2 1 3] (mapv first g))
                           (contract/approx-vec? [5.0 3.0 2.0]
                                                 (mapv second g))))]
+                  ["device fused top-k sampling"
+                   (->p (arr/sample-top-k-row
+                         (arr/from-vec gpu [0.0 6.0 5.0 4.0] [1 4]) 0
+                         {:top-k 3 :previous-tokens [1 1 3]
+                          :repetition-penalty 2.0 :temperature 1.0
+                          :top-p 0.95 :random-value 0.99}))
+                   (fn [g] (= 1 g))]
+                  ["device top-k above 64"
+                   (->p (arr/top-k-row
+                         (arr/from-vec gpu (mapv double (range 300)) [1 300])
+                         0 128))
+                   (fn [g]
+                     (= (vec (range 299 171 -1)) (mapv first g)))]
+                  ["device speculative rejection"
+                   (->p (arr/speculative-rejection-row
+                         (arr/from-vec gpu [(Math/log 0.1) (Math/log 0.9)] [1 2])
+                         (arr/from-vec gpu [(Math/log 0.9) (Math/log 0.1)] [1 2])
+                         0 0 {:acceptance-random 0.5 :residual-random 0.2}))
+                   (fn [g] (= {:accepted? false :token 1} g))]
+                  ["device speculative acceptance"
+                   (->p (arr/speculative-rejection-row
+                         (arr/from-vec gpu [(Math/log 0.1) (Math/log 0.9)] [1 2])
+                         (arr/from-vec gpu [(Math/log 0.9) (Math/log 0.1)] [1 2])
+                         0 0 {:acceptance-random 0.05 :residual-random 0.2}))
+                   (fn [g] (= {:accepted? true :token 0} g))]
                   ["matvec" (->p (arr/->vec (nm/matvec Ag xvg)))              (fn [g] (contract/approx-vec? g exp-matvec))]
                   ["matmul" (->p (arr/->vec (nm/matmul Ag Bg)))               (fn [g] (contract/approx-vec? g exp-matmul))]
                   ["bias-add" (->p (arr/->vec bias-add-out))                  (fn [g] (contract/approx-vec? g exp-bias-add))]
@@ -375,9 +400,9 @@
                  (.then (fn [_]
                           (let [selection-after (dg/backend-stats gpu)]
                             (record! pass fail "bounded selection readback"
-                                     (and (= 2 (- (:selection-readbacks selection-after 0)
+                                     (and (= 6 (- (:selection-readbacks selection-after 0)
                                                   (:selection-readbacks selection-before 0)))
-                                          (= 32 (- (:selection-readback-bytes selection-after 0)
+                                          (= 1076 (- (:selection-readback-bytes selection-after 0)
                                                   (:selection-readback-bytes selection-before 0))))))
                           (record! pass fail "temporary GPUBuffer lifetime"
                                    (verify-temporary-buffer-lifetime! gpu))
