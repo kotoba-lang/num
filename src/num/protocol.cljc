@@ -91,7 +91,17 @@
   (-top-k-row [b logits-h rows cols row k previous-tokens repetition-penalty]
     "Apply repetition penalty once to the unique previous-token columns of one
     row, then return its best `[token logit]` pairs in descending order. The
-    logits row may be mutated. Async devices may return a Promise."))
+    logits row may be mutated. Async devices may return a Promise.")
+  (-sample-top-k-row
+    [b logits-h rows cols row k previous-tokens repetition-penalty
+     temperature top-p random-value]
+    "Apply repetition penalty and exact top-k, then perform temperature/top-p
+    sampling on device. Returns only the selected token index.")
+  (-speculative-rejection-row
+    [b target-h draft-h rows cols row draft-token temperature
+     acceptance-random residual-random]
+    "Leviathan accept/reject for one proposed token over target/draft logits.
+    Rejection samples the positive residual distribution on device."))
 
 (defprotocol IDTypeTensorOps
   "Optional N-D compute operations over physical typed storage."

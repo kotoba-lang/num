@@ -313,7 +313,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }")
 
 (def top-k-row-wgsl
-  "Exact bounded row top-k for k <= 64. Lanes repeatedly scan their strided
+  "Exact bounded row top-k for k <= 256. Lanes repeatedly scan their strided
   vocabulary slice, reduce the next maximum, and exclude prior winners. Output
   is interleaved f32 `[token-id, adjusted-logit]`, permitting one small readback."
   "
@@ -321,66 +321,301 @@ struct Dims { row: u32, cols: u32, k: u32, _pad0: u32 }
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read_write> candidates: array<f32>;
 @group(0) @binding(2) var<uniform> dims: Dims;
-var<workgroup> best_values: array<f32, 256>;
-var<workgroup> best_indices: array<u32, 256>;
-var<workgroup> selected_indices: array<u32, 64>;
+var<workgroup> lane_values: array<f32, 256>;
+var<workgroup> lane_indices: array<u32, 256>;
+var<workgroup> reduce_values: array<f32, 256>;
+var<workgroup> reduce_indices: array<u32, 256>;
+var<workgroup> winner_lane: u32;
 
 fn better(value: f32, index: u32, current: f32, current_index: u32) -> bool {
   return value > current || (value == current && index < current_index);
 }
 
-fn selected(index: u32, rank: u32) -> bool {
-  var i = 0u;
-  loop {
-    if (i >= rank) { return false; }
-    if (selected_indices[i] == index) { return true; }
-    i = i + 1u;
-  }
-  return false;
+fn worse(value: f32, index: u32, prior: f32, prior_index: u32) -> bool {
+  return value < prior || (value == prior && index > prior_index);
 }
 
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lane: vec3<u32>) {
+  var initial_value = -3.402823466e38;
+  var initial_index = 0xffffffffu;
+  var initial_col = lane.x;
+  loop {
+    if (initial_col >= dims.cols) { break; }
+    let candidate = logits[dims.row * dims.cols + initial_col];
+    if (better(candidate, initial_col, initial_value, initial_index)) {
+      initial_value = candidate;
+      initial_index = initial_col;
+    }
+    initial_col = initial_col + 256u;
+  }
+  lane_values[lane.x] = initial_value;
+  lane_indices[lane.x] = initial_index;
+  workgroupBarrier();
   var rank = 0u;
   loop {
     if (rank >= dims.k) { break; }
-    var value = -3.402823466e38;
-    var index = 0xffffffffu;
-    var col = lane.x;
-    loop {
-      if (col >= dims.cols) { break; }
-      let candidate = logits[dims.row * dims.cols + col];
-      if (!selected(col, rank) && better(candidate, col, value, index)) {
-        value = candidate;
-        index = col;
-      }
-      col = col + 256u;
-    }
-    best_values[lane.x] = value;
-    best_indices[lane.x] = index;
+    reduce_values[lane.x] = lane_values[lane.x];
+    reduce_indices[lane.x] = lane_indices[lane.x];
     workgroupBarrier();
     var width = 128u;
     loop {
       if (width == 0u) { break; }
       if (lane.x < width) {
-        let other_value = best_values[lane.x + width];
-        let other_index = best_indices[lane.x + width];
+        let other_value = reduce_values[lane.x + width];
+        let other_index = reduce_indices[lane.x + width];
         if (better(other_value, other_index,
-                   best_values[lane.x], best_indices[lane.x])) {
-          best_values[lane.x] = other_value;
-          best_indices[lane.x] = other_index;
+                   reduce_values[lane.x], reduce_indices[lane.x])) {
+          reduce_values[lane.x] = other_value;
+          reduce_indices[lane.x] = other_index;
         }
       }
       workgroupBarrier();
       width = width / 2u;
     }
     if (lane.x == 0u) {
-      selected_indices[rank] = best_indices[0];
-      candidates[rank * 2u] = f32(best_indices[0]);
-      candidates[rank * 2u + 1u] = best_values[0];
+      candidates[rank * 2u] = f32(reduce_indices[0]);
+      candidates[rank * 2u + 1u] = reduce_values[0];
+      winner_lane = reduce_indices[0] % 256u;
+    }
+    workgroupBarrier();
+    if (lane.x == winner_lane) {
+      let prior_value = lane_values[lane.x];
+      let prior_index = lane_indices[lane.x];
+      var next_value = -3.402823466e38;
+      var next_index = 0xffffffffu;
+      var col = lane.x;
+      loop {
+        if (col >= dims.cols) { break; }
+        let candidate = logits[dims.row * dims.cols + col];
+        if (worse(candidate, col, prior_value, prior_index) &&
+            better(candidate, col, next_value, next_index)) {
+          next_value = candidate;
+          next_index = col;
+        }
+        col = col + 256u;
+      }
+      lane_values[lane.x] = next_value;
+      lane_indices[lane.x] = next_index;
     }
     workgroupBarrier();
     rank = rank + 1u;
+  }
+}")
+
+(def sample-candidates-wgsl
+  "Temperature, nucleus truncation, and categorical selection over already
+  ranked top-k candidates. One invocation returns one u32 token index."
+  "
+struct Params { temperature: f32, top_p: f32, random_value: f32, _pad0: f32 }
+@group(0) @binding(0) var<storage, read> candidates: array<f32>;
+@group(0) @binding(1) var<storage, read_write> selected: array<u32>;
+@group(0) @binding(2) var<uniform> count: u32;
+@group(0) @binding(3) var<uniform> params: Params;
+@compute @workgroup_size(1)
+fn main() {
+  if (params.temperature == 0.0) {
+    selected[0u] = u32(candidates[0u]);
+    return;
+  }
+  let maximum = candidates[1u];
+  var total = 0.0;
+  var i = 0u;
+  loop {
+    if (i >= count) { break; }
+    total = total + exp((candidates[i * 2u + 1u] - maximum) /
+                        params.temperature);
+    i = i + 1u;
+  }
+  var nucleus_weight = 0.0;
+  var nucleus_count = 0u;
+  loop {
+    if (nucleus_count >= count) { break; }
+    nucleus_weight = nucleus_weight +
+      exp((candidates[nucleus_count * 2u + 1u] - maximum) /
+          params.temperature);
+    nucleus_count = nucleus_count + 1u;
+    if (nucleus_weight / total >= params.top_p) { break; }
+  }
+  let threshold = params.random_value * nucleus_weight;
+  var cumulative = 0.0;
+  var chosen = u32(candidates[0u]);
+  i = 0u;
+  loop {
+    if (i >= nucleus_count) { break; }
+    cumulative = cumulative +
+      exp((candidates[i * 2u + 1u] - maximum) / params.temperature);
+    chosen = u32(candidates[i * 2u]);
+    if (cumulative > threshold || i + 1u == nucleus_count) { break; }
+    i = i + 1u;
+  }
+  selected[0u] = chosen;
+}")
+
+(def speculative-rejection-row-wgsl
+  "Exact full-distribution speculative accept/reject and residual sampling for
+  one row. Contiguous vocabulary chunks reduce softmax and residual mass in
+  parallel; only the selected chunk performs the final ordered CDF scan."
+  "
+struct Dims { row: u32, cols: u32, draft_token: u32, _pad0: u32 }
+struct Params { temperature: f32, accept_random: f32, residual_random: f32, _pad0: f32 }
+@group(0) @binding(0) var<storage, read> target_logits: array<f32>;
+@group(0) @binding(1) var<storage, read> draft_logits: array<f32>;
+@group(0) @binding(2) var<storage, read_write> result: array<u32>;
+@group(0) @binding(3) var<uniform> dims: Dims;
+@group(0) @binding(4) var<uniform> params: Params;
+var<workgroup> target_reduce: array<f32, 256>;
+var<workgroup> draft_reduce: array<f32, 256>;
+var<workgroup> scratch: array<f32, 256>;
+var<workgroup> target_chunks: array<f32, 256>;
+var<workgroup> residual_chunks: array<f32, 256>;
+var<workgroup> target_maximum: f32;
+var<workgroup> draft_maximum: f32;
+var<workgroup> target_total: f32;
+var<workgroup> draft_total: f32;
+var<workgroup> chosen_lane: u32;
+var<workgroup> use_target: u32;
+var<workgroup> threshold: f32;
+var<workgroup> prefix: f32;
+var<workgroup> accepted: u32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lane: vec3<u32>) {
+  let base = dims.row * dims.cols;
+  let chunk = (dims.cols + 255u) / 256u;
+  let begin = lane.x * chunk;
+  let end = min(dims.cols, begin + chunk);
+  var local_target_max = -3.402823466e38;
+  var local_draft_max = -3.402823466e38;
+  var i = begin;
+  loop {
+    if (i >= end) { break; }
+    local_target_max = max(local_target_max, target_logits[base + i]);
+    local_draft_max = max(local_draft_max, draft_logits[base + i]);
+    i = i + 1u;
+  }
+  target_reduce[lane.x] = local_target_max;
+  draft_reduce[lane.x] = local_draft_max;
+  workgroupBarrier();
+  var width = 128u;
+  loop {
+    if (width == 0u) { break; }
+    if (lane.x < width) {
+      target_reduce[lane.x] = max(target_reduce[lane.x],
+                                  target_reduce[lane.x + width]);
+      draft_reduce[lane.x] = max(draft_reduce[lane.x],
+                                 draft_reduce[lane.x + width]);
+    }
+    workgroupBarrier();
+    width = width / 2u;
+  }
+  if (lane.x == 0u) {
+    target_maximum = target_reduce[0u];
+    draft_maximum = draft_reduce[0u];
+  }
+  workgroupBarrier();
+  var local_target_sum = 0.0;
+  var local_draft_sum = 0.0;
+  i = begin;
+  loop {
+    if (i >= end) { break; }
+    local_target_sum = local_target_sum +
+      exp((target_logits[base + i] - target_maximum) / params.temperature);
+    local_draft_sum = local_draft_sum +
+      exp((draft_logits[base + i] - draft_maximum) / params.temperature);
+    i = i + 1u;
+  }
+  target_chunks[lane.x] = local_target_sum;
+  target_reduce[lane.x] = local_target_sum;
+  draft_reduce[lane.x] = local_draft_sum;
+  workgroupBarrier();
+  width = 128u;
+  loop {
+    if (width == 0u) { break; }
+    if (lane.x < width) {
+      target_reduce[lane.x] = target_reduce[lane.x] + target_reduce[lane.x + width];
+      draft_reduce[lane.x] = draft_reduce[lane.x] + draft_reduce[lane.x + width];
+    }
+    workgroupBarrier();
+    width = width / 2u;
+  }
+  if (lane.x == 0u) {
+    target_total = target_reduce[0u];
+    draft_total = draft_reduce[0u];
+    let p = exp((target_logits[base + dims.draft_token] - target_maximum) /
+                params.temperature) / target_total;
+    let q = exp((draft_logits[base + dims.draft_token] - draft_maximum) /
+                params.temperature) / draft_total;
+    accepted = select(0u, 1u,
+                      params.accept_random <= min(1.0, p / max(q, 1.0e-30)));
+    if (accepted == 1u) {
+      result[0u] = 1u;
+      result[1u] = dims.draft_token;
+    }
+  }
+  workgroupBarrier();
+  if (accepted == 1u) { return; }
+  var local_residual = 0.0;
+  i = begin;
+  loop {
+    if (i >= end) { break; }
+    let pi = exp((target_logits[base + i] - target_maximum) / params.temperature) /
+             target_total;
+    let qi = exp((draft_logits[base + i] - draft_maximum) / params.temperature) /
+             draft_total;
+    local_residual = local_residual + max(0.0, pi - qi);
+    i = i + 1u;
+  }
+  residual_chunks[lane.x] = local_residual;
+  scratch[lane.x] = local_residual;
+  workgroupBarrier();
+  width = 128u;
+  loop {
+    if (width == 0u) { break; }
+    if (lane.x < width) { scratch[lane.x] = scratch[lane.x] + scratch[lane.x + width]; }
+    workgroupBarrier();
+    width = width / 2u;
+  }
+  if (lane.x == 0u) {
+    use_target = select(0u, 1u, scratch[0u] <= 0.0);
+    let mass = select(scratch[0u], 1.0, use_target == 1u);
+    threshold = params.residual_random * mass;
+    var cumulative = 0.0;
+    chosen_lane = 255u;
+    var lane_index = 0u;
+    loop {
+      if (lane_index >= 256u) { break; }
+      let lane_mass = select(residual_chunks[lane_index],
+                             target_chunks[lane_index] / target_total,
+                             use_target == 1u);
+      if (threshold <= cumulative + lane_mass || lane_index == 255u) {
+        chosen_lane = lane_index;
+        prefix = cumulative;
+        break;
+      }
+      cumulative = cumulative + lane_mass;
+      lane_index = lane_index + 1u;
+    }
+    result[0u] = 0u;
+  }
+  workgroupBarrier();
+  if (lane.x == chosen_lane) {
+    var cumulative = prefix;
+    var chosen = max(1u, end) - 1u;
+    i = begin;
+    loop {
+      if (i >= end) { break; }
+      let pi = exp((target_logits[base + i] - target_maximum) /
+                   params.temperature) / target_total;
+      let qi = exp((draft_logits[base + i] - draft_maximum) /
+                   params.temperature) / draft_total;
+      cumulative = cumulative + select(max(0.0, pi - qi), pi,
+                                       use_target == 1u);
+      chosen = i;
+      if (threshold <= cumulative || i + 1u == end) { break; }
+      i = i + 1u;
+    }
+    result[1u] = chosen;
   }
 }")
 
@@ -2960,6 +3195,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :argmax-rows argmax-rows-wgsl
    :repetition-penalty-row repetition-penalty-row-wgsl
    :top-k-row top-k-row-wgsl
+   :sample-candidates sample-candidates-wgsl
+   :speculative-rejection-row speculative-rejection-row-wgsl
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl
    :conv2d-nchw conv2d-nchw-wgsl

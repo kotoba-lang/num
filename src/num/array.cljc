@@ -111,10 +111,10 @@
      (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
                     (= :f32 (or (:dtype a) :f32))
                     (int? row) (<= 0 row) (< row rows)
-                    (pos-int? k) (<= k cols) (<= k 64)
+                    (pos-int? k) (<= k cols) (<= k 256)
                     (number? repetition-penalty) (<= 1.0 repetition-penalty)
                     (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
-       (throw (ex-info "top-k-row requires a valid f32 matrix row and k <= 64"
+       (throw (ex-info "top-k-row requires a valid f32 matrix row and k <= 256"
                        {:shape shape :dtype (:dtype a) :row row :k k
                         :repetition-penalty repetition-penalty})))
      (when-not (satisfies? p/IDeviceSelection backend)
@@ -122,6 +122,71 @@
                        {:backend (p/-backend-name backend)})))
      (p/-top-k-row backend (:handle a) rows cols row k previous-tokens
                    repetition-penalty))))
+
+(defn sample-top-k-row
+  "Apply repetition penalty and exact top-k to one disposable logits row, then
+  perform temperature/top-p sampling on device. Returns only a token index;
+  async GPU backends return a Promise."
+  [a row {:keys [top-k previous-tokens repetition-penalty temperature top-p
+                 random-value]
+          :or {previous-tokens [] repetition-penalty 1.0 temperature 1.0
+               top-p 1.0 random-value 0.5}}]
+  (let [[rows cols :as shape] (:shape a)
+        backend (:backend a)
+        previous-tokens (vec (distinct previous-tokens))]
+    (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (= :f32 (or (:dtype a) :f32))
+                   (int? row) (<= 0 row) (< row rows)
+                   (pos-int? top-k) (<= top-k cols) (<= top-k 256)
+                   (number? repetition-penalty) (<= 1.0 repetition-penalty)
+                   (number? temperature) (<= 0.0 temperature)
+                   (number? top-p) (< 0.0 top-p) (<= top-p 1.0)
+                   (number? random-value) (<= 0.0 random-value)
+                   (< random-value 1.0)
+                   (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
+      (throw (ex-info "sample-top-k-row requires valid bounded sampling options"
+                      {:shape shape :dtype (:dtype a) :row row :top-k top-k
+                       :temperature temperature :top-p top-p
+                       :repetition-penalty repetition-penalty
+                       :random-value random-value})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support device top-k sampling"
+                      {:backend (p/-backend-name backend)})))
+    (p/-sample-top-k-row backend (:handle a) rows cols row top-k
+                         previous-tokens repetition-penalty temperature top-p
+                         random-value)))
+
+(defn speculative-rejection-row
+  "Verify one speculative token from target/draft logits using temperature
+  softmax. Returns `{:accepted? boolean :token int}`; a rejection samples the
+  positive target-minus-draft residual entirely on device."
+  [target draft row draft-token
+   {:keys [temperature acceptance-random residual-random]
+    :or {temperature 1.0 acceptance-random 0.5 residual-random 0.5}}]
+  (let [[rows cols :as shape] (:shape target)
+        backend (:backend target)]
+    (when-not (and (= shape (:shape draft))
+                   (= (:backend target) (:backend draft))
+                   (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (= :f32 (or (:dtype target) :f32))
+                   (= :f32 (or (:dtype draft) :f32))
+                   (int? row) (<= 0 row) (< row rows)
+                   (int? draft-token) (<= 0 draft-token) (< draft-token cols)
+                   (number? temperature) (pos? temperature)
+                   (number? acceptance-random) (<= 0.0 acceptance-random)
+                   (< acceptance-random 1.0)
+                   (number? residual-random) (<= 0.0 residual-random)
+                   (< residual-random 1.0))
+      (throw (ex-info "speculative rejection requires compatible f32 logits"
+                      {:target-shape shape :draft-shape (:shape draft)
+                       :row row :draft-token draft-token
+                       :temperature temperature})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support device speculative rejection"
+                      {:backend (p/-backend-name backend)})))
+    (p/-speculative-rejection-row
+     backend (:handle target) (:handle draft) rows cols row draft-token
+     temperature acceptance-random residual-random)))
 
 (defn like
   "An uninitialized NDArray with the same backend/shape as `a`."
