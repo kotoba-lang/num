@@ -97,6 +97,32 @@
                       {:backend (p/-backend-name backend)})))
     (p/-argmax-rows backend (:handle a) rows cols)))
 
+(defn top-k-row
+  "Return the best `k` `[token logit]` pairs for one row without materializing
+  the logits matrix on the host. Repetition penalty is applied once per unique
+  previous token. The device may mutate that row, so call this only for logits
+  that are no longer needed by model compute. Async GPU backends return a
+  Promise."
+  ([a row k] (top-k-row a row k [] 1.0))
+  ([a row k previous-tokens repetition-penalty]
+   (let [[rows cols :as shape] (:shape a)
+         backend (:backend a)
+         previous-tokens (vec (distinct previous-tokens))]
+     (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                    (= :f32 (or (:dtype a) :f32))
+                    (int? row) (<= 0 row) (< row rows)
+                    (pos-int? k) (<= k cols) (<= k 64)
+                    (number? repetition-penalty) (<= 1.0 repetition-penalty)
+                    (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
+       (throw (ex-info "top-k-row requires a valid f32 matrix row and k <= 64"
+                       {:shape shape :dtype (:dtype a) :row row :k k
+                        :repetition-penalty repetition-penalty})))
+     (when-not (satisfies? p/IDeviceSelection backend)
+       (throw (ex-info "backend does not support device row top-k"
+                       {:backend (p/-backend-name backend)})))
+     (p/-top-k-row backend (:handle a) rows cols row k previous-tokens
+                   repetition-penalty))))
+
 (defn like
   "An uninitialized NDArray with the same backend/shape as `a`."
   [a]

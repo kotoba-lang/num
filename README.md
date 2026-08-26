@@ -529,7 +529,7 @@ types, the full op contract) compiles to JS via ClojureScript and runs green on 
 **Apple M4/M1 Metal** three separate ways now: the standalone harness
 (`verify/metal_contract.js`, 13/13) including a Jacobi-PCG Poisson solve
 (`verify/metal_pcg.js`), AND the live `num.deno-gpu` backend dispatched through real
-`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 50/50 against the CPU
+`num.core`/`num.tensor` Clojure code (`deno-gpu-verify`, 51/51 against the CPU
 oracle). So num-clj
 genuinely spans pure-Clojure → cljs → live GPU from one source, with the GPU path no
 longer only exercised by a script outside the Clojure dispatch seam.
@@ -542,6 +542,13 @@ u32 indices: a verified two-row, 513-column fixture transfers 8 bytes instead of
 4,104 bytes. `backend-stats` exposes `:selection-readbacks` and
 `:selection-readback-bytes` so serving tests can prove that boundary rather than
 infer it from token parity.
+
+`num.array/top-k-row` extends that boundary to exact top-k candidates (bounded
+to 64) from any row of a shared batch tensor. A sparse WGSL pass first applies
+the standard sign-aware repetition penalty once per unique previous token; the
+selection pass returns interleaved `[token-id, adjusted-logit]` pairs in stable
+descending order. Thus `k=8` reads 64 bytes rather than a 32k-vocabulary logits
+row. The source row may be mutated and is explicitly documented as disposable.
 
 **Honest gap:** most `num.tensor` N-D ops (broadcast/transpose/axis-reduce/batched-matmul,
 ADR-2607051400 §Phase 1) do not yet dispatch through `num.deno-gpu` or any GPU backend —

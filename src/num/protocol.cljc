@@ -82,11 +82,16 @@
     "Gather packed quantized table rows into a dense f32 output."))
 
 (defprotocol IDeviceSelection
-  "Optional device-native token selection. This boundary returns only token
-  indices to the host instead of transferring a full logits matrix."
+  "Optional device-native token selection. These boundaries return only token
+  indices or bounded candidate pairs to the host instead of transferring a
+  full logits matrix."
   (-argmax-rows [b logits-h rows cols]
     "Argmax each row of contiguous f32 `[rows,cols]` logits. Ties choose the
-    lowest column index. Async devices may return a Promise of indices."))
+    lowest column index. Async devices may return a Promise of indices.")
+  (-top-k-row [b logits-h rows cols row k previous-tokens repetition-penalty]
+    "Apply repetition penalty once to the unique previous-token columns of one
+    row, then return its best `[token logit]` pairs in descending order. The
+    logits row may be mutated. Async devices may return a Promise."))
 
 (defprotocol IDTypeTensorOps
   "Optional N-D compute operations over physical typed storage."

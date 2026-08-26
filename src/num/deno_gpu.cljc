@@ -353,6 +353,54 @@
                          (w/-destroy-buffer dev indices)
                          (throw error))))))
 
+       (-top-k-row [_ logits-h _rows cols row k previous-tokens repetition-penalty]
+         (let [previous-tokens (vec (distinct previous-tokens))]
+           (when (and (not= 1.0 repetition-penalty) (seq previous-tokens))
+             (let [tokens (w/-create-buffer dev (count previous-tokens) :storage)]
+               (w/-write-buffer dev tokens (wb/u32-tag previous-tokens))
+               (w/-dispatch dev (wb/get-pipeline dev pipes :repetition-penalty-row)
+                            [logits-h tokens
+                             (wb/uni dev (wb/u32-tag
+                                          [row cols (count previous-tokens) 0]))
+                             (wb/uni dev [(double repetition-penalty)])]
+                            [(wb/ceil-div (count previous-tokens) 64) 1 1])
+               (w/-destroy-buffer dev tokens)))
+           (let [candidate-count (* 2 k)
+                 candidates (w/-create-buffer dev candidate-count :storage)
+                 raw-device (.-dev dev)
+                 nbytes (* 4 candidate-count)
+                 staging (.createBuffer raw-device
+                                        #js {:size nbytes :usage readback-usage})]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :top-k-row)
+                          [logits-h candidates
+                           (wb/uni dev (wb/u32-tag [row cols k 0]))]
+                          [1 1 1])
+             (let [encoder (.createCommandEncoder raw-device)]
+               (.copyBufferToBuffer encoder candidates 0 staging 0 nbytes)
+               (.submit (.-queue raw-device) #js [(.finish encoder)]))
+             (-> (.mapAsync staging js/GPUMapMode.READ)
+                 (.then (fn [_]
+                          (let [flat (vec (js/Array.from
+                                          (js/Float32Array.
+                                           (.slice (.getMappedRange staging) 0))))
+                                out (mapv (fn [[token logit]]
+                                            [(long token) logit])
+                                          (partition 2 flat))]
+                            (.unmap staging)
+                            (.destroy staging)
+                            (w/-destroy-buffer dev candidates)
+                            (swap! (.-stats dev)
+                                   (fn [state]
+                                     (-> state
+                                         (update :selection-readbacks (fnil inc 0))
+                                         (update :selection-readback-bytes
+                                                 (fnil + 0) nbytes))))
+                            out)))
+                 (.catch (fn [error]
+                           (.destroy staging)
+                           (w/-destroy-buffer dev candidates)
+                           (throw error)))))))
+
        p/IQuantizedOps
        (-quantized-from-host [_ bytes _params]
          (let [words (wb/pack-bytes-u32 bytes)
