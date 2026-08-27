@@ -554,6 +554,180 @@ fn main(@builtin(local_invocation_id) lane: vec3<u32>) {
   }
 }")
 
+(def nucleus-sort-init-wgsl
+  "Copy one logits row into power-of-two padded sortable value/token buffers."
+  "
+struct Dims { row: u32, cols: u32, padded: u32, _pad0: u32 }
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> values: array<f32>;
+@group(0) @binding(2) var<storage, read_write> tokens: array<u32>;
+@group(0) @binding(3) var<uniform> dims: Dims;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= dims.padded) { return; }
+  if (gid.x < dims.cols) {
+    values[gid.x] = logits[dims.row * dims.cols + gid.x];
+    tokens[gid.x] = gid.x;
+  } else {
+    values[gid.x] = -3.402823466e38;
+    tokens[gid.x] = 0xffffffffu;
+  }
+}")
+
+(def nucleus-bitonic-step-wgsl
+  "One globally synchronized bitonic compare/swap stage. Repeated dispatches
+  produce stable descending `(logit, inverse-token-id)` order."
+  "
+struct Stage { padded: u32, span: u32, stride: u32, _pad0: u32 }
+@group(0) @binding(0) var<storage, read_write> values: array<f32>;
+@group(0) @binding(1) var<storage, read_write> tokens: array<u32>;
+@group(0) @binding(2) var<uniform> stage: Stage;
+
+fn better(av: f32, ai: u32, bv: f32, bi: u32) -> bool {
+  return av > bv || (av == bv && ai < bi);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let left = gid.x;
+  if (left >= stage.padded) { return; }
+  let right = left ^ stage.stride;
+  if (right <= left || right >= stage.padded) { return; }
+  let left_value = values[left];
+  let left_token = tokens[left];
+  let right_value = values[right];
+  let right_token = tokens[right];
+  let descending = (left & stage.span) == 0u;
+  let swap = select(better(left_value, left_token, right_value, right_token),
+                    better(right_value, right_token, left_value, left_token),
+                    descending);
+  if (swap) {
+    values[left] = right_value;
+    tokens[left] = right_token;
+    values[right] = left_value;
+    tokens[right] = left_token;
+  }
+}")
+
+(def sample-ranked-nucleus-wgsl
+  "Exact nucleus boundary and categorical selection over stable sorted logits.
+  Parallel contiguous chunks reduce softmax mass; only the boundary and selected
+  chunks scan individual tokens."
+  "
+struct Dims { cols: u32, padded: u32, _pad0: u32, _pad1: u32 }
+struct Params { temperature: f32, top_p: f32, random_value: f32, _pad0: f32 }
+@group(0) @binding(0) var<storage, read> values: array<f32>;
+@group(0) @binding(1) var<storage, read> tokens: array<u32>;
+@group(0) @binding(2) var<storage, read_write> selected: array<u32>;
+@group(0) @binding(3) var<uniform> dims: Dims;
+@group(0) @binding(4) var<uniform> params: Params;
+var<workgroup> reduce_values: array<f32, 256>;
+var<workgroup> chunk_weights: array<f32, 256>;
+var<workgroup> total: f32;
+var<workgroup> nucleus_lane: u32;
+var<workgroup> nucleus_prefix: f32;
+var<workgroup> nucleus_end: u32;
+var<workgroup> nucleus_weight: f32;
+var<workgroup> sample_lane: u32;
+var<workgroup> sample_prefix: f32;
+var<workgroup> sample_threshold: f32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lane: vec3<u32>) {
+  let chunk = (dims.cols + 255u) / 256u;
+  let begin = lane.x * chunk;
+  let end = min(dims.cols, begin + chunk);
+  let maximum = values[0u];
+  var local_sum = 0.0;
+  var i = begin;
+  loop {
+    if (i >= end) { break; }
+    local_sum = local_sum + exp((values[i] - maximum) / params.temperature);
+    i = i + 1u;
+  }
+  chunk_weights[lane.x] = local_sum;
+  reduce_values[lane.x] = local_sum;
+  workgroupBarrier();
+  var width = 128u;
+  loop {
+    if (width == 0u) { break; }
+    if (lane.x < width) {
+      reduce_values[lane.x] = reduce_values[lane.x] +
+                              reduce_values[lane.x + width];
+    }
+    workgroupBarrier();
+    width = width / 2u;
+  }
+  if (lane.x == 0u) {
+    total = reduce_values[0u];
+    let target_weight = params.top_p * total;
+    var cumulative = 0.0;
+    var lane_index = 0u;
+    nucleus_lane = 255u;
+    loop {
+      if (lane_index >= 256u) { break; }
+      let cumulative_next = cumulative + chunk_weights[lane_index];
+      if (cumulative_next >= target_weight || lane_index == 255u) {
+        nucleus_lane = lane_index;
+        nucleus_prefix = cumulative;
+        break;
+      }
+      cumulative = cumulative_next;
+      lane_index = lane_index + 1u;
+    }
+  }
+  workgroupBarrier();
+  if (lane.x == nucleus_lane) {
+    let target_weight = params.top_p * total;
+    var cumulative = nucleus_prefix;
+    var boundary = max(1u, end) - 1u;
+    i = begin;
+    loop {
+      if (i >= end) { break; }
+      cumulative = cumulative + exp((values[i] - maximum) / params.temperature);
+      boundary = i;
+      if (cumulative >= target_weight || i + 1u == end) { break; }
+      i = i + 1u;
+    }
+    nucleus_end = boundary;
+    nucleus_weight = cumulative;
+    chunk_weights[lane.x] = cumulative - nucleus_prefix;
+  }
+  workgroupBarrier();
+  if (lane.x == 0u) {
+    sample_threshold = params.random_value * nucleus_weight;
+    var cumulative = 0.0;
+    var lane_index = 0u;
+    sample_lane = nucleus_lane;
+    loop {
+      if (lane_index > nucleus_lane) { break; }
+      let cumulative_next = cumulative + chunk_weights[lane_index];
+      if (cumulative_next > sample_threshold || lane_index == nucleus_lane) {
+        sample_lane = lane_index;
+        sample_prefix = cumulative;
+        break;
+      }
+      cumulative = cumulative_next;
+      lane_index = lane_index + 1u;
+    }
+  }
+  workgroupBarrier();
+  if (lane.x == sample_lane) {
+    let limit = select(end, nucleus_end + 1u, sample_lane == nucleus_lane);
+    var cumulative = sample_prefix;
+    var chosen = max(1u, limit) - 1u;
+    i = begin;
+    loop {
+      if (i >= limit) { break; }
+      cumulative = cumulative + exp((values[i] - maximum) / params.temperature);
+      chosen = i;
+      if (cumulative > sample_threshold || i + 1u == limit) { break; }
+      i = i + 1u;
+    }
+    selected[0u] = tokens[chosen];
+  }
+}")
+
 (def speculative-rejection-row-wgsl
   "Exact full-distribution speculative accept/reject and residual sampling for
   one row. Contiguous vocabulary chunks reduce softmax and residual mass in
@@ -3299,6 +3473,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
    :top-k-row top-k-row-wgsl
    :sample-candidates sample-candidates-wgsl
    :sample-softmax-row sample-softmax-row-wgsl
+   :nucleus-sort-init nucleus-sort-init-wgsl
+   :nucleus-bitonic-step nucleus-bitonic-step-wgsl
+   :sample-ranked-nucleus sample-ranked-nucleus-wgsl
    :speculative-rejection-row speculative-rejection-row-wgsl
    :gemv   gemv-wgsl
    :gemm   gemm-tiled-wgsl

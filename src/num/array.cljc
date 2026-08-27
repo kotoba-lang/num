@@ -217,6 +217,39 @@
     (p/-sample-softmax-row backend (:handle a) rows cols row previous-tokens
                            repetition-penalty temperature random-value)))
 
+(defn sample-nucleus-row
+  "Apply repetition penalty, stable full-vocabulary logit ordering, and exact
+  nucleus sampling to one disposable row. This implements `top-k=nil` with
+  `0 < top-p < 1` for vocabularies up to 1,048,576; async backends return a
+  Promise."
+  [a row {:keys [previous-tokens repetition-penalty temperature top-p
+                 random-value]
+          :or {previous-tokens [] repetition-penalty 1.0 temperature 1.0
+               top-p 0.9 random-value 0.5}}]
+  (let [[rows cols :as shape] (:shape a)
+        backend (:backend a)
+        previous-tokens (vec (distinct previous-tokens))]
+    (when-not (and (= 2 (count shape)) (pos-int? rows) (pos-int? cols)
+                   (<= cols 1048576)
+                   (= :f32 (or (:dtype a) :f32))
+                   (int? row) (<= 0 row) (< row rows)
+                   (number? repetition-penalty) (<= 1.0 repetition-penalty)
+                   (number? temperature) (pos? temperature)
+                   (number? top-p) (< 0.0 top-p) (< top-p 1.0)
+                   (number? random-value) (<= 0.0 random-value)
+                   (< random-value 1.0)
+                   (every? #(and (int? %) (<= 0 %) (< % cols)) previous-tokens))
+      (throw (ex-info "sample-nucleus-row requires valid exact nucleus options"
+                      {:shape shape :dtype (:dtype a) :row row
+                       :temperature temperature :top-p top-p
+                       :repetition-penalty repetition-penalty
+                       :random-value random-value})))
+    (when-not (satisfies? p/IDeviceSelection backend)
+      (throw (ex-info "backend does not support exact device nucleus sampling"
+                      {:backend (p/-backend-name backend)})))
+    (p/-sample-nucleus-row backend (:handle a) rows cols row previous-tokens
+                           repetition-penalty temperature top-p random-value)))
+
 (defn like
   "An uninitialized NDArray with the same backend/shape as `a`."
   [a]
