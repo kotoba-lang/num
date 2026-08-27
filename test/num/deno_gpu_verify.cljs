@@ -328,6 +328,19 @@
                                             (Math/log 0.7)] [1 3])
                          0 {:temperature 1.0 :random-value 0.25}))
                    (fn [g] (= 1 g))]
+                  ["device exact nucleus sampling"
+                   (->p (arr/sample-nucleus-row
+                         (arr/from-vec gpu [(Math/log 0.1) (Math/log 0.2)
+                                            (Math/log 0.7)] [1 3])
+                         0 {:temperature 1.0 :top-p 0.8
+                            :random-value 0.8}))
+                   (fn [g] (= 1 g))]
+                  ["device exact nucleus stable tie"
+                   (->p (arr/sample-nucleus-row
+                         (arr/from-vec gpu [1.0 1.0 0.0] [1 3])
+                         0 {:temperature 1.0 :top-p 0.6
+                            :random-value 0.8}))
+                   (fn [g] (= 1 g))]
                   ["device speculative rejection"
                    (->p (arr/speculative-rejection-row
                          (arr/from-vec gpu [(Math/log 0.1) (Math/log 0.9)] [1 2])
@@ -406,9 +419,9 @@
                  (.then (fn [_]
                           (let [selection-after (dg/backend-stats gpu)]
                             (record! pass fail "bounded selection readback"
-                                     (and (= 7 (- (:selection-readbacks selection-after 0)
+                                     (and (= 9 (- (:selection-readbacks selection-after 0)
                                                   (:selection-readbacks selection-before 0)))
-                                          (= 1080 (- (:selection-readback-bytes selection-after 0)
+                                          (= 1088 (- (:selection-readback-bytes selection-after 0)
                                                   (:selection-readback-bytes selection-before 0))))))
                           (record! pass fail "temporary GPUBuffer lifetime"
                                    (verify-temporary-buffer-lifetime! gpu))

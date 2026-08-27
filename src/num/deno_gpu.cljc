@@ -76,6 +76,10 @@
              x (wb/ceil-div groups y)]
          [x y 1]))
 
+     (defn- next-power-of-two [n]
+       (loop [value 1]
+         (if (>= value n) value (recur (* 2 value)))))
+
      (defn- apply-repetition-penalty-row!
        [dev pipes logits-h row cols previous-tokens repetition-penalty]
        (let [previous-tokens (vec (distinct previous-tokens))]
@@ -486,6 +490,68 @@
                           token)))
                (.catch (fn [error]
                          (.destroy staging)
+                         (w/-destroy-buffer dev selected)
+                         (throw error))))))
+
+       (-sample-nucleus-row
+         [_ logits-h _rows cols row previous-tokens repetition-penalty
+          temperature top-p random-value]
+         (apply-repetition-penalty-row!
+          dev pipes logits-h row cols previous-tokens repetition-penalty)
+         (let [padded (next-power-of-two cols)
+               values (w/-create-buffer dev padded :storage)
+               tokens (w/-create-buffer dev padded :storage)
+               selected (w/-create-buffer dev 1 :storage)
+               raw-device (.-dev dev)
+               nbytes 4
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})
+               groups [(wb/ceil-div padded 256) 1 1]]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :nucleus-sort-init)
+                        [logits-h values tokens
+                         (wb/uni dev (wb/u32-tag [row cols padded 0]))]
+                        groups)
+           (loop [span 2]
+             (when (<= span padded)
+               (loop [stride (/ span 2)]
+                 (when (>= stride 1)
+                   (w/-dispatch dev
+                                (wb/get-pipeline dev pipes :nucleus-bitonic-step)
+                                [values tokens
+                                 (wb/uni dev (wb/u32-tag
+                                              [padded span stride 0]))]
+                                groups)
+                   (recur (/ stride 2))))
+               (recur (* span 2))))
+           (w/-dispatch dev (wb/get-pipeline dev pipes :sample-ranked-nucleus)
+                        [values tokens selected
+                         (wb/uni dev (wb/u32-tag [cols padded 0 0]))
+                         (wb/uni dev [(double temperature) (double top-p)
+                                      (double random-value) 0.0])]
+                        [1 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder selected 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [token (aget (js/Uint32Array.
+                                           (.slice (.getMappedRange staging) 0)) 0)]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev values)
+                          (w/-destroy-buffer dev tokens)
+                          (w/-destroy-buffer dev selected)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          token)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev values)
+                         (w/-destroy-buffer dev tokens)
                          (w/-destroy-buffer dev selected)
                          (throw error))))))
 
