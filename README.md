@@ -76,6 +76,31 @@ JVM/native only, never required.
 (a/->vec (nm/spmv b K x))               ;=> [3.0 3.0]   (sparse A·x)
 ```
 
+### Encrypted integer linear inference (JVM host backend)
+
+`num.paillier` evaluates a plaintext integer matrix over encrypted activations.
+The server receives a public key and randomized ciphertexts, computes
+`Enc(Wx+b)`, and returns ciphertexts that only the client can decrypt:
+
+```clojure
+(require '[num.paillier :as phe])
+(def keys (phe/generate-keypair))         ; 2048-bit production minimum
+(def pk (:public-key keys))
+(def encrypted-x (mapv #(phe/encrypt pk %) [3 -2]))
+(def result (phe/encrypted-matvec pk [[2 5]] encrypted-x [7]
+                                     {:input-bound 3}))
+(mapv #(phe/decrypt (:private-key keys) %) (:ciphertexts result))
+;;=> [3]                                  ; 2*3 + 5*(-2) + 7
+```
+
+This is genuine Paillier additive homomorphic encryption, but it is deliberately
+named **linear inference**, not FHE: ciphertext-ciphertext multiplication,
+Softmax, GELU, LayerNorm, and a complete encrypted Transformer are outside this
+backend. `:input-bound` is mandatory and num rejects any matrix row whose
+worst-case signed result could wrap the plaintext modulus. The portable `.cljc`
+core remains zero-dependency; Paillier uses the JVM's `BigInteger` and
+`SecureRandom` as an injected host path.
+
 ### Physical f16/bf16 storage
 
 `from-vec` and `zeros` accept an optional dtype, and `cast` materializes a new
