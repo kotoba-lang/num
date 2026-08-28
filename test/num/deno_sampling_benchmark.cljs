@@ -91,36 +91,48 @@
                (.then #(vector k8 k40 k256 full-softmax nucleus %)))))
         (.then
          (fn [[k8 k40 k256 full-softmax nucleus speculative]]
-           (let [after (gpu/backend-stats backend)
-                 result {:adapter (gpu/adapter-description request)
-                         :vocab vocab
-                         :top-k-8 k8 :top-k-40 k40 :top-k-256 k256
-                         :full-softmax full-softmax
-                         :nucleus nucleus
-                         :nucleus-reference-token nucleus-reference
-                         :speculative speculative
-                         :readbacks (- (:selection-readbacks after 0)
-                                       (:selection-readbacks baseline 0))
-                         :readback-bytes
-                         (- (:selection-readback-bytes after 0)
-                            (:selection-readback-bytes baseline 0))}]
-             (arr/release! logits)
-             (arr/release! draft)
-             (println (js/JSON.stringify (clj->js result)))
-             (when-not (= nucleus-reference (:token nucleus))
-               (throw (ex-info "device nucleus differs from host reference"
-                               result)))))))))
+           (-> (timed #(arr/speculative-rejection-rows
+                        logits logits [17 18 19 20]
+                        {:temperature 0.7 :acceptance-random 0.9
+                         :residual-random 0.51}))
+               (.then
+                (fn [mtp]
+                  (let [after (gpu/backend-stats backend)
+                        result {:adapter (gpu/adapter-description request)
+                                :vocab vocab
+                                :top-k-8 k8 :top-k-40 k40 :top-k-256 k256
+                                :full-softmax full-softmax
+                                :nucleus nucleus
+                                :nucleus-reference-token nucleus-reference
+                                :speculative speculative
+                                :mtp-prefix mtp
+                                :readbacks (- (:selection-readbacks after 0)
+                                              (:selection-readbacks baseline 0))
+                                :readback-bytes
+                                (- (:selection-readback-bytes after 0)
+                                   (:selection-readback-bytes baseline 0))}]
+                    (arr/release! logits)
+                    (arr/release! draft)
+                    (println (js/JSON.stringify (clj->js result)))
+                    (when-not (and (= nucleus-reference (:token nucleus))
+                                   (= 4 (get-in mtp [:value :drafted]))
+                                   (= 4 (get-in mtp [:value :accepted]))
+                                   (get-in mtp [:value :all-accepted?]))
+                      (throw (ex-info "device selection verification failed"
+                                      result))))))))))))
 
 (defn -main [& _]
   (let [vocab 262144 iterations 3
-        values (mapv #(Math/sin (* 0.017 %)) (range vocab))
-        draft-values (mapv #(Math/cos (* 0.013 %)) (range vocab))
-        nucleus-reference (host-nucleus values 0.7 0.9 0.51)]
+        row-values (mapv #(Math/sin (* 0.017 %)) (range vocab))
+        row-draft-values (mapv #(Math/cos (* 0.013 %)) (range vocab))
+        values (vec (mapcat identity (repeat 4 row-values)))
+        draft-values (vec (mapcat identity (repeat 4 row-draft-values)))
+        nucleus-reference (host-nucleus row-values 0.7 0.9 0.51)]
     (-> (gpu/request-device)
         (.then (fn [request]
                  (let [backend (gpu/backend request)
-                       logits (arr/from-vec backend values [1 vocab])
-                       draft (arr/from-vec backend draft-values [1 vocab])]
+                       logits (arr/from-vec backend values [4 vocab])
+                       draft (arr/from-vec backend draft-values [4 vocab])]
                    (run-benchmarks request backend logits draft vocab iterations
                                    (gpu/backend-stats backend)
                                    nucleus-reference))))
