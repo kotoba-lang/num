@@ -188,6 +188,66 @@
      backend (:handle target) (:handle draft) rows cols row draft-token
      temperature acceptance-random residual-random)))
 
+(defn speculative-rejection-rows
+  "Verify a bounded MTP proposal against aligned target/draft logit rows.
+
+  Verification stops at the first rejection and returns that row's target-minus-
+  draft residual token as the correction. Each attempted row remains device
+  resident and transfers only the existing 8-byte `{accepted?, token}` result.
+  `options` may be one shared sampling map or one map per proposal row.
+
+  Async device backends return a Promise; synchronous backends return the result
+  map directly. `:drafted` counts the complete proposal produced by the MTP head,
+  while `:accepted` counts its verified prefix."
+  [target draft draft-tokens options]
+  (let [[rows _ :as shape] (:shape target)
+        draft-tokens (vec draft-tokens)
+        drafted (count draft-tokens)
+        options* (if (map? options)
+                   (vec (repeat drafted options))
+                   (vec options))]
+    (when-not (and (= shape (:shape draft))
+                   (= 2 (count shape))
+                   (pos-int? rows)
+                   (pos? drafted)
+                   (<= drafted rows)
+                   (= drafted (count options*)))
+      (throw (ex-info "MTP rejection requires one option and logit row per draft token"
+                      {:target-shape shape :draft-shape (:shape draft)
+                       :drafted drafted :option-count (count options*)})))
+    #?(:clj
+       (loop [row 0 accepted 0 tokens []]
+         (if (= row drafted)
+           {:tokens tokens :drafted drafted :accepted accepted
+            :all-accepted? true}
+           (let [{:keys [accepted? token]}
+                 (speculative-rejection-row target draft row
+                                             (nth draft-tokens row)
+                                             (nth options* row))
+                 tokens (conj tokens token)]
+             (if accepted?
+               (recur (inc row) (inc accepted) tokens)
+               {:tokens tokens :drafted drafted :accepted accepted
+                :all-accepted? false}))))
+       :cljs
+       (letfn [(step [row accepted tokens]
+                 (if (= row drafted)
+                   (js/Promise.resolve
+                    {:tokens tokens :drafted drafted :accepted accepted
+                     :all-accepted? true})
+                   (-> (js/Promise.resolve
+                        (speculative-rejection-row target draft row
+                                                    (nth draft-tokens row)
+                                                    (nth options* row)))
+                       (.then
+                        (fn [{:keys [accepted? token]}]
+                          (let [tokens (conj tokens token)]
+                            (if accepted?
+                              (step (inc row) (inc accepted) tokens)
+                              {:tokens tokens :drafted drafted :accepted accepted
+                               :all-accepted? false})))))))]
+         (step 0 0 [])))))
+
 (defn sample-softmax-row
   "Apply repetition penalty and sample one disposable logits row from its full
   temperature-softmax distribution on device. This is the exact untruncated
