@@ -26,3 +26,34 @@
        :context-bytes context-bytes
        :required-bytes required
        :free-after-bytes (max 0 (- budget required))})))
+
+(defn split-backend-admission
+  "Admit a unified-memory CPU/accelerator placement using measured bytes.
+
+  `expert-page-reserve-bytes` is the file-page working set that must remain
+  available while accelerator weights are resident. This prevents a placement
+  from looking valid merely because mapped expert files are not counted as
+  anonymous allocations."
+  [{:keys [memory-bytes os-reserve-bytes headroom-bytes cpu-resident-bytes
+           accelerator-model-bytes accelerator-compute-bytes context-bytes
+           expert-page-reserve-bytes]}]
+  (let [values [memory-bytes os-reserve-bytes headroom-bytes cpu-resident-bytes
+                accelerator-model-bytes accelerator-compute-bytes context-bytes
+                expert-page-reserve-bytes]]
+    (when-not (every? #(and (integer? %) (not (neg? %))) values)
+      (throw (ex-info "split backend admission requires measured non-negative integer bytes"
+                      {:values values})))
+    (let [budget (max 0 (- memory-bytes os-reserve-bytes headroom-bytes))
+          required (+ cpu-resident-bytes accelerator-model-bytes
+                      accelerator-compute-bytes context-bytes
+                      expert-page-reserve-bytes)]
+      {:admitted? (<= required budget)
+       :memory-bytes memory-bytes
+       :budget-bytes budget
+       :required-bytes required
+       :cpu-resident-bytes cpu-resident-bytes
+       :accelerator-model-bytes accelerator-model-bytes
+       :accelerator-compute-bytes accelerator-compute-bytes
+       :context-bytes context-bytes
+       :expert-page-reserve-bytes expert-page-reserve-bytes
+       :free-after-bytes (max 0 (- budget required))})))
