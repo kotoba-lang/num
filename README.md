@@ -566,6 +566,12 @@ proposal acceptance, and positive-residual
 sampling with parallel contiguous vocabulary chunks, returning only an 8-byte
 decision.
 
+`num.expert-cache` is the portable policy core for Expert-aware NVMe
+streaming. It accounts resident bytes (not virtual reservations), performs
+deterministic LRU eviction over opaque `(layer, expert, projection)` keys, and
+reads router rows with their physical stride. I/O and direct buffers are host
+resources and therefore live in `kotoba-lang/torch`.
+
 At vocabulary 262,144, median warm selection times were: Apple M4 19.3/22.9/
 53.0 ms for k=8/40/256, 14.8 ms for full-softmax, 26.9 ms for exact nucleus,
 and 13.7 ms for speculative rejection; Intel Arc B70 15.2/18.0/51.6 ms,
