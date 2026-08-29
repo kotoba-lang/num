@@ -28,3 +28,17 @@
       (is (false? (:admitted? result)))
       (is (= 2 (:speculative-bytes result)))
       (is (= 13 (:required-bytes result))))))
+
+(deftest split-backend-keeps-expert-page-supply-in-the-budget
+  (let [gib 1073741824
+        result (residency/split-backend-admission
+                {:memory-bytes (* 16 gib)
+                 :os-reserve-bytes (* 3 gib)
+                 :headroom-bytes gib
+                 :cpu-resident-bytes gib
+                 :accelerator-model-bytes 8091860992
+                 :accelerator-compute-bytes 2196762624
+                 :context-bytes 67108864
+                 :expert-page-reserve-bytes (* 4 gib)})]
+    (is (false? (:admitted? result)))
+    (is (= (* 4 gib) (:expert-page-reserve-bytes result)))))
