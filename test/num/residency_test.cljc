@@ -19,3 +19,12 @@
                  (residency/admission
                   {:memory-bytes 10 :os-reserve-bytes 2 :headroom-bytes 1
                    :runtime-bytes 7 :context-bytes 1}))))))
+
+(deftest speculative-memory-is-not-hidden-in-headroom
+  (let [base {:memory-bytes 16 :os-reserve-bytes 3 :headroom-bytes 1
+              :runtime-bytes 8 :context-bytes 3}]
+    (is (:admitted? (residency/admission base)))
+    (let [result (residency/admission (assoc base :speculative-bytes 2))]
+      (is (false? (:admitted? result)))
+      (is (= 2 (:speculative-bytes result)))
+      (is (= 13 (:required-bytes result))))))
