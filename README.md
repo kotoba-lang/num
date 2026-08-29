@@ -43,6 +43,14 @@ This is the same injection pattern as `MemStore ‖ DatomicStore` and the `cae-s
 
 ## "Optimized for each GPU" — without three vendor kernels
 
+`num.device-profile` turns public PCI/architecture information into portable,
+measured execution hints for the current Murakumo accelerators: Arc Pro B70
+(SYCL + native MTP), Radeon 8060S/Strix Halo (Vulkan + two-slot throughput),
+and Jetson AGX Xavier (CUDA fallback). Callers choose `:latency`, `:throughput`,
+or `:fallback`; unknown devices fail closed to a single CPU slot. The profile is
+data, so a host benchmark can override it without placing driver calls in num's
+portable core.
+
 The **primary** GPU backend is **WGSL compute via WebGPU/wgpu**. You write a compute
 shader once (`num.wgsl`), and wgpu compiles it to each GPU's native ISA:
 
