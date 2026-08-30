@@ -452,6 +452,20 @@ clojure -M:deno-arrow-upload-verify
 deno run --allow-all target/deno-arrow-upload-verify.cjs
 ```
 
+The CPU path also has an explicit WebAssembly SIMD gate. Its linear memory owns
+the ingress bytes; Arrow borrows the values slice from that memory, then Num
+passes the slice's byte offset directly to a `v128.load` / `f32x4.mul` /
+`v128.store` kernel. The only copy is the named ingress write. There is no row
+materialization or Arrow-to-SIMD copy, and a scalar tail preserves columns whose
+row count is not divisible by four. This proves SIMD execution and backing
+identity; it does not claim a speedup over a particular JavaScript JIT:
+
+```bash
+wasm-tools parse integration/num/arrow_f32_simd.wat -o target/arrow-f32-simd.wasm
+clojure -M:deno-arrow-simd-verify
+deno run --allow-read target/deno-arrow-simd-verify.cjs
+```
+
 ### UNet Metal benchmark
 
 The benchmark forces final readback, so it measures completed GPU work plus the
