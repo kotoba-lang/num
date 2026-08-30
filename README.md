@@ -482,6 +482,14 @@ deno run --allow-read --allow-sys=loadavg,cpus \
   target/deno-arrow-simd-benchmark.cjs
 ```
 
+A qualified three-run record is checked in at
+[`docs/evidence/arrow-wasm-simd-2026-08-30.json`](docs/evidence/arrow-wasm-simd-2026-08-30.json).
+On its Apple M4 host, the explicit Wasm `f32x4` kernel completed this bounded
+262,147-element float32 scale workload 3.66–3.72× faster than scalar Wasm.
+All three runs used the same artifact and backing memory and remained below the
+load gate. This is a kernel-and-host result, not a general Num, build, network,
+protocol, or GPU speed claim.
+
 ### UNet Metal benchmark
 
 The benchmark forces final readback, so it measures completed GPU work plus the
