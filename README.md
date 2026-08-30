@@ -466,6 +466,22 @@ clojure -M:deno-arrow-simd-verify
 deno run --allow-read target/deno-arrow-simd-verify.cjs
 ```
 
+For a same-artifact comparison against scalar Wasm, the benchmark uses the same
+module, Arrow backing, float32 scale operation, element count, host, warm-up and
+correctness oracle. It alternates execution order and reports every sample plus
+the median. The timed region contains kernel calls only; the benchmark-only
+buffer reset is excluded. Results qualify only that measured kernel and host.
+The report records one-minute load and marks `publishable?` false when load
+exceeds the host's logical CPU count; a high-load ratio is evidence that the
+path runs, not a public performance claim:
+
+```bash
+wasm-tools parse integration/num/arrow_f32_simd.wat -o target/arrow-f32-simd.wasm
+clojure -M:deno-arrow-simd-benchmark
+deno run --allow-read --allow-sys=loadavg,cpus \
+  target/deno-arrow-simd-benchmark.cjs
+```
+
 ### UNet Metal benchmark
 
 The benchmark forces final readback, so it measures completed GPU work plus the
