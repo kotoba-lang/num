@@ -135,6 +135,14 @@
                       (update :live-buffers-by-size dissoc bytes)))))
          (.destroy buffer)))
 
+     (defn- record-transfer! [stats kind nbytes]
+       (swap! stats
+              (fn [state]
+                (-> state
+                    (update (keyword (str (name kind) "s")) (fnil inc 0))
+                    (update (keyword (str (name kind) "-bytes"))
+                            (fnil + 0) nbytes)))))
+
      (deftype DenoGpuDevice [dev stats]
        w/IGpuDevice
        (-create-buffer [_ n usage]
@@ -167,6 +175,7 @@
          (let [nbytes (max (* 4 (long n)) 4)
                staging (.createBuffer dev #js {:size nbytes :usage readback-usage})
                encoder (.createCommandEncoder dev)]
+           (record-transfer! stats :readback nbytes)
            (.copyBufferToBuffer encoder buf 0 staging 0 nbytes)
            (.submit (.-queue dev) #js [(.finish encoder)])
            (-> (.mapAsync staging js/GPUMapMode.READ)
@@ -229,6 +238,7 @@
          (let [nbytes (max (* 4 (quot (+ (long n) 1) 2)) 4)
                staging (.createBuffer dev #js {:size nbytes :usage readback-usage})
                encoder (.createCommandEncoder dev)]
+           (record-transfer! stats :readback nbytes)
            (.copyBufferToBuffer encoder buf 0 staging 0 nbytes)
            (.submit (.-queue dev) #js [(.finish encoder)])
            (-> (.mapAsync staging js/GPUMapMode.READ)
@@ -1283,6 +1293,11 @@
                         (let [padded (js/Uint8Array. (* 4 (Math/ceil (/ actual 4))))]
                           (.set padded bytes)
                           padded))]
+           (record-transfer! (.-stats (.-dev backend)) :raw-upload actual)
+           (when (not= actual (.-byteLength source))
+             (swap! (.-stats (.-dev backend))
+                    update :raw-upload-padding-bytes (fnil + 0)
+                    (- (.-byteLength source) actual)))
            (.writeBuffer (.-queue device) buffer 0 source)
            (assoc (arr/->NDArray backend buffer (vec shape)) :dtype dtype*))))
 
