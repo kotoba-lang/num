@@ -437,6 +437,21 @@ clojure -M:deno-raw-upload-verify
 deno run --allow-all target/deno-raw-upload-verify.cjs
 ```
 
+Arrow IPC has an optional end-to-end adapter in `integration/num/arrow_gpu.cljs`.
+It borrows an uncompressed, non-nullable float32 values buffer from
+`org-apache-arrow`, exposes a `Float32Array` over the same CPU `ArrayBuffer`, and
+passes the identical bytes to `upload-byte-view`. There is no row materialization
+or intermediate numeric vector. The CPU view is SIMD-ready but does not claim a
+particular host JIT vectorized it; the GPU ownership boundary still performs one
+measured `queue.writeBuffer`. Nullable columns fail closed until a masked kernel
+exists. The live gate proves one 16-byte upload, device execution, and one 4-byte
+scalar readback:
+
+```bash
+clojure -M:deno-arrow-upload-verify
+deno run --allow-all target/deno-arrow-upload-verify.cjs
+```
+
 ### UNet Metal benchmark
 
 The benchmark forces final readback, so it measures completed GPU work plus the
