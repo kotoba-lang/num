@@ -70,6 +70,18 @@
    :main-opts ["-m" "cljs.main"
                "-co" "{:optimizations :simple :target :nodejs :main num.deno-arrow-simd-verify :output-to \"target/deno-arrow-simd-verify.cjs\"}"
                "-c" "num.deno-arrow-simd-verify"]}
+  :deno-arrow-simd-benchmark
+  {:extra-paths ["test" "integration"]
+   :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}
+                io.github.kotoba-lang/columnar
+                {:git/url "https://github.com/kotoba-lang/columnar.git"
+                 :git/sha "38eb52714e25f16469622bbc2d460324353f07e6"}
+                io.github.kotoba-lang/org-apache-arrow
+                {:git/url "https://github.com/kotoba-lang/org-apache-arrow.git"
+                 :git/sha "91943063f8729d47d145385f6a08cc9caee6b316"}}
+   :main-opts ["-m" "cljs.main"
+               "-co" "{:optimizations :simple :target :nodejs :main num.deno-arrow-simd-benchmark :output-to \"target/deno-arrow-simd-benchmark.cjs\"}"
+               "-c" "num.deno-arrow-simd-benchmark"]}
   :deno-paged-kv-verify
   {:extra-paths ["test"]
    :extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}

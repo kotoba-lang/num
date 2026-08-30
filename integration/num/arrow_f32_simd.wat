@@ -39,4 +39,21 @@
           (f32.mul (f32.load (local.get $address)) (local.get $scale)))
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $tail-loop))))
+
+  ;; Same memory and operation as the vector kernel, deliberately expressed
+  ;; with scalar Wasm instructions to provide a like-for-like benchmark oracle.
+  (func (export "scale_f32_scalar")
+        (param $ptr i32) (param $length i32) (param $scale f32)
+    (local $i i32)
+    (local $address i32)
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (local.get $length)))
+        (local.set $address
+          (i32.add (local.get $ptr)
+                   (i32.shl (local.get $i) (i32.const 2))))
+        (f32.store (local.get $address)
+          (f32.mul (f32.load (local.get $address)) (local.get $scale)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop))))
 )
