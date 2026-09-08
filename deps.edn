@@ -10,7 +10,12 @@
  ;;   :rocm  → rocBLAS / hipSPARSE via Panama          (AMD, JVM-only fast path)
  ;; Those aliases are specs for now (they need the native SDKs); the core + CPU
  ;; reference backend below are real and tested.
- :deps {}
+ :deps {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       }
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner

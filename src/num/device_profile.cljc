@@ -3,7 +3,7 @@
 
   These maps contain no driver calls. Hosts supply public PCI/architecture/name
   data and may override any hint after a local benchmark."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def profiles
   {:intel-arc-pro-b70
@@ -37,7 +37,7 @@
     :num/host-prerequisites #{:max-performance-power-mode :locked-clocks}}})
 
 (defn- searchable [device]
-  (str/lower-case
+  (str/lower
    (str (if (map? device)
           (select-keys device [:name :vendor :vendor-id :device-id
                                :architecture :backend :machine])
