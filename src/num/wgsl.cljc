@@ -17,7 +17,7 @@
 
   The shaders here are the real, reviewable artifacts; the contract test
   (`num.contract`) is what proves a live WgslBackend ≡ the CPU reference."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; ---------------------------------------------------------------------------
 ;; Host port — the seam the browser / native host fills in (no native code here)
