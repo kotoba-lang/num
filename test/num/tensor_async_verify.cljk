@@ -10,7 +10,7 @@
   independently hand-derived, not re-derived here.
 
   Run under Deno:
-    clojure -M:tensor-async-verify && deno run --allow-all target/tensor-async-verify.cjs"
+    kbb -M:tensor-async-verify && deno run --allow-all target/tensor-async-verify.cjs"
   (:require [num.array :as arr]
             [num.contract :as contract]
             [num.cpu :as cpu]

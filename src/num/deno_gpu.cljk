@@ -35,7 +35,7 @@
       see `test/num/deno_gpu_verify.cljk` for the pattern.
 
   We tried the ClojureScript-native `^:async`/`js-await` special forms first —
-  confirmed NOT supported by this repo's plain `clojure -M -m cljs.main` compiler
+  confirmed NOT supported by this repo's plain `kbb -M -m cljs.main` compiler
   pipeline (ClojureScript 1.11.132, no shadow-cljs): they compile to calls on an
   undeclared var, not real `async`/`await` JS. Plain JS Promise `.then` interop
   (the pattern `kotoba-lang/host`'s `kami.backend.browser` already uses for its own

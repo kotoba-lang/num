@@ -16,7 +16,7 @@
   asserts) and only the GPU-side comparisons are deferred behind `.then`.
 
   Run under Deno (the only host with GPU access):
-    clojure -M:deno-verify
+    kbb -M:deno-verify
     deno run --allow-all target/deno-gpu-verify.cjs"
   (:require [num.array :as arr]
             [num.core :as nm]
