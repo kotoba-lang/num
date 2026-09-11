@@ -32,7 +32,7 @@
       return host scalars' contract, exactly the tension `num.wgsl-backend`'s own
       docstring already flagged as unresolved. Callers on Deno must `.then` (or
       `await` at the top-level script boundary, which Deno supports) these four;
-      see `test/num/deno_gpu_verify.cljs` for the pattern.
+      see `test/num/deno_gpu_verify.cljk` for the pattern.
 
   We tried the ClojureScript-native `^:async`/`js-await` special forms first —
   confirmed NOT supported by this repo's plain `clojure -M -m cljs.main` compiler

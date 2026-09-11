@@ -132,7 +132,7 @@
        (same scale `1/√d_head`, same numerically-stable subtract-max softmax).
        `num-heads=1` is verified to match `attention-async` exactly, the same
        relationship the sync versions have (see
-       `test/num/tensor_async_verify.cljs`)."
+       `test/num/tensor_async_verify.cljk`)."
        [Q K V num-heads]
        (let [[seqQ d-model] (:shape Q)
              [seqK _] (:shape K)

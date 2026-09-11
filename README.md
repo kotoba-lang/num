@@ -332,7 +332,7 @@ without leaving the device) is **Phase 2** work per ADR-2607051400, not this pas
   for N-D broadcast/batched-matmul (the ADR explicitly calls this out as Phase 2 net-new
   shader work); and proving `num.tensor` under ClojureScript via the `cljs-verify`
   harness (it's written in the same portable `.cljc` style — `Math/…`, `double-array`,
-  `aget`/`aset`, `ex-info` — as the rest of this repo, but `test/num/cljs_verify.cljs`
+  `aget`/`aset`, `ex-info` — as the rest of this repo, but `test/num/cljs_verify.cljk`
   currently only exercises `num.contract` against `num.cpu`, not `num.tensor`; that
   wiring wasn't extended in this pass).
 
@@ -445,7 +445,7 @@ clojure -M:deno-raw-upload-verify
 deno run --allow-all target/deno-raw-upload-verify.cjs
 ```
 
-Arrow IPC has an optional end-to-end adapter in `integration/num/arrow_gpu.cljs`.
+Arrow IPC has an optional end-to-end adapter in `integration/num/arrow_gpu.cljk`.
 It borrows an uncompressed, non-nullable float32 values buffer from
 `org-apache-arrow`, exposes a `Float32Array` over the same CPU `ArrayBuffer`, and
 passes the identical bytes to `upload-byte-view`. There is no row materialization

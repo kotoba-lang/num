@@ -3,7 +3,7 @@
   'training'). Deliberately NOT a general training framework — the honest
   minimal form of 'training capability': real, correct gradients (verified
   against numerical/finite-difference gradients, the standard autograd
-  correctness check — see test/num/autograd_test.cljc) for exactly the ops a
+  correctness check — see test/num/autograd_test.cljk) for exactly the ops a
   tiny linear/relu/linear/softmax(+mse-loss) network needs, matching
   torch-clj's own README example architecture. Most general tensor gradients
   remain host-materialized on GPU backends, but multi-head-attention has a fused
