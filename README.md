@@ -111,7 +111,7 @@ boundaries, not a claim of native f16 ALU throughput; BF16 GPU kernels and typed
 upsample/cat and BF16 GPU kernels remain open.
 
 ```sh
-clojure -M:deno-dtype-verify
+kbb -M:deno-dtype-verify
 deno run --allow-all target/deno-gpu-dtype-verify.cjs
 # Apple M4: physical bytes 8; Metal f16 6/6 passed
 ```
@@ -287,7 +287,7 @@ into another physical block, writes a divergent token, checks that result
 independently, and returns every tracked GPU buffer to baseline:
 
 ```sh
-clojure -M:deno-paged-kv-verify
+kbb -M:deno-paged-kv-verify
 deno run --allow-all target/deno-paged-kv-verify.cjs
 # non-contiguous paged GQA parity: passed
 # prefix COW block-copy parity: passed
@@ -344,7 +344,7 @@ no full F32 matrix is materialized. Verify it against the CPU oracle on the
 actual adapter:
 
 ```sh
-clojure -M:deno-q8-verify
+kbb -M:deno-q8-verify
 deno run --allow-all target/deno-q8-verify.cjs
 # Apple M4: expected [73.76000009 95.44000039]
 #           Metal    [73.75999451 95.43997955]
@@ -360,7 +360,7 @@ from the same four formats, and `as-matrix` creates a zero-copy tied output-head
 view over the exact same packed buffer.
 
 ```sh
-clojure -M:deno-quantized-verify && \
+kbb -M:deno-quantized-verify && \
   deno run --allow-all target/deno-quantized-verify.cjs
 # Apple M4: Q5_0 CPU/Metal parity: passed
 #           Q4_K CPU/Metal parity: passed
@@ -374,7 +374,7 @@ weight once for up to four activation rows. The reproducible 1024×1024 Apple M4
 benchmark forces readback for every iteration (completion, not submission):
 
 ```sh
-clojure -M:deno-quantized-benchmark && \
+kbb -M:deno-quantized-benchmark && \
   deno run --allow-all target/deno-quantized-benchmark.cjs
 # Q4_K 589,824 bytes vs dense f32 4,194,304 bytes (7.11x smaller)
 # decode cold: Q4_K 26.882 ms, dense 18.468 ms (compilation included)
@@ -417,7 +417,7 @@ read a value back to the host (`-copy-to-host`/`-reduce`/`-dot`/`-nrm2` — i.e.
 mapAsync`) and return a JS `Promise` instead of an immediate value — a deliberate,
 documented deviation from `IBackend`'s normal contract for this one host. Native
 ClojureScript `async`/`await` (`^:async`/`js-await`) was tried first and confirmed NOT
-supported by this repo's plain `clojure -M -m cljs.main` pipeline (no shadow-cljs); the
+supported by this repo's plain `kbb -M -m cljs.main` pipeline (no shadow-cljs); the
 backend uses plain JS Promise `.then` interop instead, the same style
 `kotoba-lang/host`'s `kami.backend.browser` already uses for its own browser GPU host
 bring-up.
@@ -426,7 +426,7 @@ bring-up.
 no `--unstable-webgpu` flag needed):
 
 ```bash
-clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
+kbb -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs
 ```
 
 Large checkpoint hosts can bypass per-element JavaScript number allocation with
@@ -441,7 +441,7 @@ same path for packed bfloat16 by reconstructing each IEEE f32 bit pattern on GPU
 The live raw-upload gate covers both physical formats and exact buffer cleanup:
 
 ```bash
-clojure -M:deno-raw-upload-verify
+kbb -M:deno-raw-upload-verify
 deno run --allow-all target/deno-raw-upload-verify.cjs
 ```
 
@@ -456,7 +456,7 @@ exists. The live gate proves one 16-byte upload, device execution, and one 4-byt
 scalar readback:
 
 ```bash
-clojure -M:deno-arrow-upload-verify
+kbb -M:deno-arrow-upload-verify
 deno run --allow-all target/deno-arrow-upload-verify.cjs
 ```
 
@@ -470,7 +470,7 @@ identity; it does not claim a speedup over a particular JavaScript JIT:
 
 ```bash
 wasm-tools parse integration/num/arrow_f32_simd.wat -o target/arrow-f32-simd.wasm
-clojure -M:deno-arrow-simd-verify
+kbb -M:deno-arrow-simd-verify
 deno run --allow-read target/deno-arrow-simd-verify.cjs
 ```
 
@@ -485,7 +485,7 @@ path runs, not a public performance claim:
 
 ```bash
 wasm-tools parse integration/num/arrow_f32_simd.wat -o target/arrow-f32-simd.wasm
-clojure -M:deno-arrow-simd-benchmark
+kbb -M:deno-arrow-simd-benchmark
 deno run --allow-read --allow-sys=loadavg,cpus \
   target/deno-arrow-simd-benchmark.cjs
 ```
@@ -507,7 +507,7 @@ device/backend and report every sample plus the median; this avoids presenting
 a single noisy run as a performance result:
 
 ```bash
-clojure -M:deno-benchmark
+kbb -M:deno-benchmark
 deno run --allow-all target/deno-gpu-benchmark.cjs
 
 # Full Stable-Diffusion-width 320→320 convolution at latent 64×64
@@ -578,10 +578,10 @@ vendor-native (`:cuda`/`:metal`/`:rocm`) fast-path backends — see
 `docs/adr/0001-architecture.md`.
 
 ```bash
-clojure -X:test                                  # CPU backend satisfies the full IBackend contract (JVM)
-clojure -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript
-clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs   # PROOF: live GPU ≡ CPU oracle, real Metal
-clojure -M:deno-attention-backward-verify && deno run --allow-all target/deno-attention-backward-verify.cjs # fused attention gradients on Metal
+kbb -X:test                                  # CPU backend satisfies the full IBackend contract (JVM)
+kbb -M:cljs && node target/cljs-verify.js     # PROOF: the same .cljc core runs under ClojureScript
+kbb -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs   # PROOF: live GPU ≡ CPU oracle, real Metal
+kbb -M:deno-attention-backward-verify && deno run --allow-all target/deno-attention-backward-verify.cjs # fused attention gradients on Metal
 ```
 
 **Portability is proven, not just claimed.** The `.cljc` core (CPU backend, array/CSR

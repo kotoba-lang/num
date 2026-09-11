@@ -81,7 +81,7 @@ backends are alternative `IBackend` impls behind aliases.
   `navigator.gpu`, plus `WgslBackendAsync` — an `IBackend` that dispatches `num.core`'s
   ops through it. Verified on real Apple M1 Max Metal, cross-checked against `num.cpu`'s
   oracle THROUGH `num.core`/`num.array` (not a standalone JS harness this time):
-  `clojure -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs` →
+  `kbb -M:deno-verify && deno run --allow-all target/deno-gpu-verify.cjs` →
   `Deno WgslBackendAsync ≡ CPU oracle: 14 passed, 0 failed`. Still remaining: a JVM
   Panama→wgpu-native `IGpuDevice` (blocking) so the *synchronous* `WgslBackend` can run
   the Clojure contract on-GPU from the JVM — the async/cljs half of this line item is
