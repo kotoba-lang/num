@@ -6,7 +6,7 @@
   linear/relu/linear/softmax/mse-loss network (torch-clj's own README
   architecture, plus a loss) gets its analytic gradient (num.autograd)
   checked element-by-element against a central-difference numerical estimate."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [num.array :as arr]
             [num.autograd :as ag]
             [num.cpu :as cpu]))

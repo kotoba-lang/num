@@ -1,5 +1,5 @@
 (ns num.expert-cache-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [num.expert-cache :as cache]))
 
 (deftest bounded-lru-is-byte-exact

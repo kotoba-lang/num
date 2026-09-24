@@ -1,5 +1,5 @@
 (ns num.device-profile-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [num.device-profile :as profile]))
 
 (deftest fleet-accelerators-are-classified-from-public-identities
