@@ -1,5 +1,5 @@
 (ns num.mtp-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [num.array :as arr]))
 
 (def target {:shape [4 8] :backend :device :dtype :f32})

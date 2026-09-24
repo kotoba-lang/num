@@ -1,5 +1,5 @@
 (ns num.quantized-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [kotoba.test :refer [deftest is]]
             [num.array :as arr]
             [num.contract :as contract]
             [num.core :as nm]

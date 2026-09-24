@@ -3,7 +3,7 @@
   repo's existing convention (`num.contract`/`num.cpu-test`): every op is checked
   against a hand-computed or independently-written reference value on the CPU
   oracle backend — never against NumPy (no such dependency exists or ever will)."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [num.array :as arr]
             [num.contract :as contract]
             [num.core :as nm]

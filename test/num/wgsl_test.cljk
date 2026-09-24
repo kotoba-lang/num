@@ -3,7 +3,7 @@
   matches the IBackend ops. The shaders' RUNTIME correctness on a GPU is verified
   separately on Apple M4 Metal by verify/metal_contract.js (the full contract);
   this test guards that the Clojure side is well-formed and complete on the JVM."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [num.wgsl :as w]
             [num.wgsl-backend :as wb]))
 

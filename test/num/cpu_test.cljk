@@ -1,7 +1,7 @@
 (ns num.cpu-test
   "The CPU reference backend must satisfy the whole IBackend contract — it is the
   oracle the GPU backends are checked against, so its correctness is load-bearing."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [num.array :as arr]
             [num.core :as nm]
             [num.sparse :as sp]

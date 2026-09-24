@@ -1,5 +1,5 @@
 (ns num.residency-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [num.residency :as residency]))
 
 (deftest exact-edge-admission
